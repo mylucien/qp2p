@@ -1,0 +1,43 @@
+[package]
+name = "qp2p"
+version = "0.1.0"
+edition = "2021"
+description = "QUIC P2P Edge Agent — signaling, hole-punching, CDN file distribution"
+authors = ["QUIC P2P Team"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+quinn = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dashmap = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+which = "6"
+ipnetwork = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+sha2 = "0.10"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+uuid = { version = "1", features = ["v4"] }
+tun = { version = "0.6", features = ["async"] }
+rand = "0.8"
+hex = "0.4"
+httpdate = "1.0"
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+
+[target.'cfg(windows)'.dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+

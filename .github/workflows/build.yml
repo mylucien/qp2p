@@ -1,0 +1,94 @@
+# qp2p — QUIC P2P Edge Agent 自动编译
+#
+# 每个提交自动构建三个平台的生产二进制：
+#   - Linux x86_64  — TUN 完整支持
+#   - Linux ARM64   — 树莓派等 ARM 设备
+#   - Windows MSVC  — WinTun 完整支持（需要系统安装 WinTun 驱动）
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: qp2p-linux-x86_64
+            ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: qp2p-linux-aarch64
+            ext: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: qp2p-windows-x86_64
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile deps (ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          mkdir -p ~/.cargo
+          echo "[target.aarch64-unknown-linux-gnu]" >> ~/.cargo/config.toml
+          echo "linker = \"aarch64-linux-gnu-gcc\"" >> ~/.cargo/config.toml
+
+      - name: Install system deps (Linux)
+        if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: strip "target/${{ matrix.target }}/release/qp2p"
+        shell: bash
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/qp2p${{ matrix.ext }}
+          compression-level: 0
+
+  release:
+    name: Release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            qp2p-linux-x86_64/qp2p
+            qp2p-linux-aarch64/qp2p
+            qp2p-windows-x86_64/qp2p.exe

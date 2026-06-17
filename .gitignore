@@ -1,0 +1,14 @@
+﻿target/
+*.exe
+*.dll
+*.pdb
+*.exp
+*.lib
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+config.toml
+edge_id
