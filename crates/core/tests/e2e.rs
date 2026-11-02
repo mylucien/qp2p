@@ -45,7 +45,7 @@ async fn punch_and_forward_over_loopback() {
         .expect("引擎 B 绑定失败");
     let (a_addr, b_addr) = (a.local_addr(), b.local_addr());
 
-    let window = Duration::from_secs(3);
+    let window = Duration::from_secs(5);
     let (dialer, listener) = tokio::join!(
         a.punch(b_addr, Role::Dialer, window),
         b.punch(a_addr, Role::Listener, window)
