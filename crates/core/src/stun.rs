@@ -5,7 +5,9 @@
 //! 否则拿到的映射与 QUIC 五元组无关（旧版正是在这里出的错）。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
+use rand::RngCore;
 use thiserror::Error;
 
 pub const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
@@ -31,6 +33,41 @@ pub enum StunError {
     BadAttribute,
     #[error("不支持的地址族：0x{0:02x}")]
     UnsupportedFamily(u8),
+    #[error("socket 操作失败：{0}")]
+    Io(String),
+    #[error("事务 ID 不匹配")]
+    WrongTransaction,
+}
+
+/// 在给定 socket 上做一次阻塞式 STUN 探测。
+///
+/// 必须传入 QUIC 将要使用的那个 socket，否则拿到的映射与数据面无关。
+pub fn probe_blocking(
+    socket: &std::net::UdpSocket,
+    server: SocketAddr,
+    timeout: Duration,
+) -> Result<SocketAddr, StunError> {
+    let mut txid = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut txid);
+
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| StunError::Io(e.to_string()))?;
+
+    socket
+        .send_to(&build_binding_request(txid), server)
+        .map_err(|e| StunError::Io(e.to_string()))?;
+
+    let mut buf = [0u8; 512];
+    let n = socket
+        .recv(&mut buf)
+        .map_err(|e| StunError::Io(e.to_string()))?;
+
+    let response = &buf[..n];
+    if response.len() >= HEADER_LEN && response[8..20] != txid {
+        return Err(StunError::WrongTransaction);
+    }
+    parse_binding_response(response)
 }
 
 /// 构造 Binding Request。txid 由调用方生成，必须与响应校验时一致。
