@@ -145,13 +145,13 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
 /// 一步到位：打洞 + 转发。
 pub async fn connect_and_forward(
     endpoint: &quinn::Endpoint,
-    peer: SocketAddr,
+    peers: &[SocketAddr],
     role: crate::peer::Role,
     listen: SocketAddr,
     target: SocketAddr,
 ) -> Result<Connection> {
     let start = tokio::time::Instant::now() + Duration::from_millis(300);
-    let conn = punch::execute(endpoint, peer, role, start, punch::DEFAULT_WINDOW)
+    let conn = punch::execute(endpoint, peers, role, start, punch::DEFAULT_WINDOW)
         .await
         .context("打洞失败")?;
     tracing::info!("[link] 直连已建立 rtt={:?}", conn.rtt());

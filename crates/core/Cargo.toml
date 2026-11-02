@@ -23,3 +23,4 @@ rustls.workspace = true
 rcgen.workspace = true
 socket2.workspace = true
 if-addrs.workspace = true
+reqwest.workspace = true

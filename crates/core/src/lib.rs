@@ -18,6 +18,7 @@ pub mod peer;
 pub mod socket;
 pub mod stun;
 pub mod tls;
+pub mod upnp;
 
 /// 信令与探针的协议版本，握手时交换。
 pub const PROTOCOL_VERSION: u16 = 1;

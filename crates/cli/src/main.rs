@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use qp2p_core::{link, Engine, Role};
@@ -22,7 +21,7 @@ qp2p — 私有打洞组网
 
 说明：
   --bind     本地 UDP 监听地址，默认 0.0.0.0:51820
-  --peer     对端 UDP 地址，必须填对端实际可达的 IP:端口
+  --peer     对端 UDP 地址，可重复；所有候选会并行打洞
   --dialer   本端主动发起 QUIC 握手（node_id 较小的一方）
   --listen   本机 TCP 监听地址，收到的连接转发到 --target
   --target   对端侧要访问的目标地址
@@ -126,6 +125,16 @@ impl Flags {
         raw.parse()
             .with_context(|| format!("--{key} 不是合法地址：{raw}"))
     }
+
+    fn addrs(&self, key: &str) -> Result<Vec<SocketAddr>> {
+        self.many(key)
+            .iter()
+            .map(|raw| {
+                raw.parse::<SocketAddr>()
+                    .with_context(|| format!("--{key} 不是合法地址：{raw}"))
+            })
+            .collect()
+    }
 }
 
 async fn cmd_doctor(args: &[String]) -> Result<()> {
@@ -151,6 +160,10 @@ async fn cmd_doctor(args: &[String]) -> Result<()> {
         Some(addr) => println!("udp  公网: {addr}"),
         None => println!("udp  公网: 未知（STUN 未配置或不可达）"),
     }
+    match engine.upnp() {
+        Some(addr) => println!("udp  UPnP: {addr}"),
+        None => println!("udp  UPnP: 不可用（路由器未开启或无 IGD）"),
+    }
     for candidate in engine.candidates() {
         println!("candidate {candidate}");
     }
@@ -159,16 +172,16 @@ async fn cmd_doctor(args: &[String]) -> Result<()> {
 
 async fn cmd_punch(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
-    let (engine, peer, role) = prepare(&flags).await?;
+    let (mut engine, peers, role) = prepare(&flags).await?;
 
     println!("本端 UDP: {}", engine.local_addr());
     for candidate in engine.candidates() {
         println!("candidate {candidate}");
     }
-    println!("对端 UDP: {peer}  角色: {role:?}");
+    println!("对端候选: {} 个  角色: {role:?}", peers.len());
 
     let conn = engine
-        .punch(peer, role, Duration::from_secs(2))
+        .punch_with_retry(role, || peers.clone(), 3)
         .await
         .context("打洞失败")?;
     println!(
@@ -191,16 +204,16 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
 
 async fn cmd_forward(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
-    let (engine, peer, role) = prepare(&flags).await?;
+    let (mut engine, peers, role) = prepare(&flags).await?;
     let listen = flags.addr("listen", None)?;
     let target = flags.addr("target", None)?;
 
     println!("本端 UDP: {}", engine.local_addr());
-    println!("对端 UDP: {peer}  角色: {role:?}");
+    println!("对端候选: {} 个  角色: {role:?}", peers.len());
     println!("映射: {listen} → {target}（经对端）");
 
     let conn = engine
-        .punch(peer, role, Duration::from_secs(2))
+        .punch_with_retry(role, || peers.clone(), 3)
         .await
         .context("打洞失败")?;
     println!("直连已建立 rtt={:?}", conn.rtt());
@@ -224,10 +237,13 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn prepare(flags: &Flags) -> Result<(Engine, SocketAddr, Role)> {
+async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
     let bind = flags.addr("bind", Some("0.0.0.0:51820"))?;
-    let peer = flags.addr("peer", None)?;
-    if peer.port() == 0 {
+    let peers = flags.addrs("peer")?;
+    if peers.is_empty() {
+        bail!("至少需要一个 --peer");
+    }
+    if peers.iter().any(|p| p.port() == 0) {
         bail!("--peer 端口不能为 0");
     }
     let role = if flags.flag("dialer") {
@@ -238,5 +254,5 @@ async fn prepare(flags: &Flags) -> Result<(Engine, SocketAddr, Role)> {
     let engine = Engine::bind(bind, &flags.many("stun"))
         .await
         .context("绑定 UDP 失败")?;
-    Ok((engine, peer, role))
+    Ok((engine, peers, role))
 }
