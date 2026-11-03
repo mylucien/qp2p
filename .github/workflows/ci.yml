@@ -37,6 +37,20 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  signal:
+    name: signal (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 内存后端 + 内置 SQLite 冒充 D1，两条存储路径一起验
+      - name: Smoke test
+        run: node signal/smoke.mjs
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
