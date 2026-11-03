@@ -29,6 +29,13 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// 保活包：3 字节魔数 + 类型，对端 quinn 会当作无效 QUIC 包丢弃。
 const KEEPALIVE_MAGIC: &[u8] = b"\x00QP2K";
+/// 打洞期间的开孔间隔。
+///
+/// QUIC 的 Initial 重传是指数退避（1s、2s、4s…），对端 NAT 刚开始收包时
+/// 可能正好落在两次重传之间；用同一个五元组额外每 200ms 发一个小包，
+/// 把"孔"持续顶开，而且这些包不参与握手，失败也不会拖慢状态机。
+const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const PROBE_MAGIC: &[u8] = b"\x00QP2H";
 
 pub struct Engine {
     endpoint: Option<quinn::Endpoint>,
@@ -132,6 +139,9 @@ impl Engine {
     }
 
     /// 对一组候选地址打洞；`timeout` 由角色决定。
+    ///
+    /// 打洞期间会额外用同一个 socket 每 200ms 往所有候选发一个小包开孔，
+    /// 不依赖 QUIC 的指数退避重传。
     pub async fn punch(
         &self,
         peers: &[SocketAddr],
@@ -141,7 +151,36 @@ impl Engine {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return Err(punch::PunchError::Dial("端点不可用".to_string()));
         };
-        punch::execute(endpoint, peers, role, timeout).await
+
+        let probe = self.spawn_probe(peers, timeout);
+        let result = punch::execute(endpoint, peers, role, timeout).await;
+        if let Some(task) = probe {
+            task.abort();
+        }
+        result
+    }
+
+    fn spawn_probe(
+        &self,
+        peers: &[SocketAddr],
+        total: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let socket = self.keepalive.clone()?;
+        let peers = peers.to_vec();
+        Some(tokio::spawn(async move {
+            let deadline = Instant::now() + total;
+            loop {
+                for peer in &peers {
+                    if let Err(e) = socket.send_to(PROBE_MAGIC, peer) {
+                        tracing::debug!("[engine] 开孔包发送失败 {peer}: {e}");
+                    }
+                }
+                if Instant::now() + PROBE_INTERVAL >= deadline {
+                    return;
+                }
+                tokio::time::sleep(PROBE_INTERVAL).await;
+            }
+        }))
     }
 
     /// 带重试的打洞：每轮开始前刷新自己的映射，并重新取对端候选。

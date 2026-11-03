@@ -60,6 +60,10 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS events_by_node ON events (network_id, node_id, id)`,
+  `CREATE TABLE IF NOT EXISTS nonces (
+    nonce      TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+  )`,
 ];
 
 // ---------------------------------------------------------------------------
@@ -260,12 +264,16 @@ async function joinOrRegister(request, env, url, needCandidates) {
   const network = auth.network;
   const now = Date.now();
 
-  // 签名覆盖 op / 网络 / node / 时间戳 / 候选：
-  // 没有它，同网络任何成员都能用别人的 node_id 把候选改成自己的地址（MITM）
-  const message = needCandidates
-    ? signPayload("register", network.network_id, nodeId, candidates.join(","), body.ts)
-    : signPayload("join", network.network_id, nodeId, body.ts);
-  const bad = await verifyNodeSignature({ pubkey, message, sig: body.sig, ts: body.ts, now });
+  // 签名覆盖整个请求体：改 candidates / tls_fp / name 任何一项都会让签名失效
+  const bad = await verifySignedRequest({
+    env,
+    op: needCandidates ? "register" : "join",
+    networkId: network.network_id,
+    body,
+    pubkey,
+    now,
+    trackReplay: true,
+  });
   if (bad) return err(403, "bad_signature", bad);
 
   const existing = await getNode(env, network.network_id, nodeId);
@@ -336,13 +344,14 @@ async function connect(request, env, url) {
   const self = await getNode(env, auth.network.network_id, from);
   if (!self) return err(404, "unknown_node", "发起方尚未注册");
 
-  const message = signPayload("connect", auth.network.network_id, from, target, body.ts);
-  const bad = await verifyNodeSignature({
+  const bad = await verifySignedRequest({
+    env,
+    op: "connect",
+    networkId: auth.network.network_id,
+    body,
     pubkey: self.pubkey,
-    message,
-    sig: body.sig,
-    ts: body.ts,
     now,
+    trackReplay: true,
   });
   if (bad) return err(403, "bad_signature", bad);
 
@@ -382,19 +391,28 @@ async function events(request, env, url) {
     return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
   }
   const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
-  const ts = url.searchParams.get("ts");
 
   const now = Date.now();
   const node = await getNode(env, auth.network.network_id, nodeId);
   if (!node) return err(404, "unknown_node", "先 register 再拉事件");
 
-  const message = signPayload("events", auth.network.network_id, nodeId, ts);
-  const bad = await verifyNodeSignature({
+  // GET 没有请求体：把参与签名的三个查询参数拼成同样的结构再算摘要。
+  // 轮询本身幂等，不做 nonce 消费，否则每次心跳都要多写一行。
+  const signedBody = {
+    node_id: nodeId,
+    since,
+    // ts/since 一律按数字进摘要：查询串里是字符串，不归一化就会和客户端算出的摘要对不上
+    ts: Number(url.searchParams.get("ts")),
+    nonce: url.searchParams.get("nonce"),
+  };
+  const bad = await verifySignedRequest({
+    env,
+    op: "events",
+    networkId: auth.network.network_id,
+    body: { ...signedBody, sig: url.searchParams.get("sig") },
     pubkey: node.pubkey,
-    message,
-    sig: url.searchParams.get("sig"),
-    ts,
     now,
+    trackReplay: false,
   });
   if (bad) return err(403, "bad_signature", bad);
 
@@ -439,8 +457,15 @@ async function leave(request, env, url) {
     return err(403, "node_id_mismatch", "leave 需要提供与 node_id 对应的 pubkey");
   }
 
-  const message = signPayload("leave", auth.network.network_id, nodeId, body.ts);
-  const bad = await verifyNodeSignature({ pubkey, message, sig: body.sig, ts: body.ts, now: Date.now() });
+  const bad = await verifySignedRequest({
+    env,
+    op: "leave",
+    networkId: auth.network.network_id,
+    body,
+    pubkey,
+    now: Date.now(),
+    trackReplay: true,
+  });
   if (bad) return err(403, "bad_signature", bad);
 
   await deleteNode(env, auth.network.network_id, nodeId);
@@ -504,7 +529,7 @@ async function tokenFor(networkId, adminSecret) {
 // 存储：D1 优先，未绑定时退回 isolate 内存
 // ---------------------------------------------------------------------------
 
-const memory = { networks: new Map(), nodes: new Map(), events: [], seq: 0 };
+const memory = { networks: new Map(), nodes: new Map(), events: [], nonces: new Map(), seq: 0 };
 const migrated = new WeakSet(); // 每个 D1 绑定只建一次表
 
 async function ready(env) {
@@ -821,29 +846,113 @@ function hex(bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// 请求签名：每个写操作都要节点私钥签名，令牌只证明"能进这个网络"
+// 请求签名：签名覆盖整个请求体（去掉 sig），再加时间戳与 nonce 防重放
 // ---------------------------------------------------------------------------
 
 const SIGN_PREFIX = "qp2p1";
 const TS_WINDOW_MS = 120_000;
+const NONCE_TTL_MS = 300_000;
 
 /**
- * 签名内容（用 `|` 连接，ts 固定在最后，客户端必须逐字一致）：
- *   qp2p1|join|<network>|<node_id>|<ts>
- *   qp2p1|register|<network>|<node_id>|<candidates 逗号连接>|<ts>
- *   qp2p1|connect|<network>|<from>|<target>|<ts>
- *   qp2p1|events|<network>|<node_id>|<ts>
- *   qp2p1|leave|<network>|<node_id>|<ts>
+ * 规范 JSON：键按字典序排序、无空白、非 ASCII 转义成 \uXXXX。
+ *
+ * 客户端必须逐字节复现这段序列化，然后把 sha256 放进签名串：
+ *   qp2p1|<op>|<network>|<ts>|<nonce>|<body digest>
+ *
+ * 之所以不手工挑字段：tls_fp、candidates、name 任何一个漏签，攻击者就能
+ * 拿一份合法报文改掉它重放（tls_fp 将来要用于证书钉扎，尤其不能漏）。
  */
-function signPayload(...parts) {
-  return [SIGN_PREFIX, ...parts.map((p) => String(p ?? ""))].join("|");
+function canonicalJson(value) {
+  if (value === null) return "null";
+  const type = typeof value;
+  if (type === "number") {
+    if (!Number.isFinite(value)) throw new Error("数字必须是有限值");
+    return String(value);
+  }
+  if (type === "boolean") return value ? "true" : "false";
+  if (type === "string") return quoteJson(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (type === "object") {
+    const keys = Object.keys(value)
+      .filter((k) => value[k] !== undefined)
+      .sort();
+    return `{${keys.map((k) => `${quoteJson(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+  }
+  throw new Error(`不支持的类型：${type}`);
 }
 
-async function verifyNodeSignature({ pubkey, message, sig, ts, now }) {
-  const stamp = Number(ts);
+function quoteJson(text) {
+  let out = '"';
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (code < 0x20 || code > 0x7e) {
+      if (code > 0xffff) {
+        const rest = code - 0x10000;
+        const hi = 0xd800 + (rest >> 10);
+        const lo = 0xdc00 + (rest & 0x3ff);
+        out += `\\u${hi.toString(16).padStart(4, "0")}\\u${lo.toString(16).padStart(4, "0")}`;
+      } else {
+        out += `\\u${code.toString(16).padStart(4, "0")}`;
+      }
+    } else out += ch;
+  }
+  return `${out}"`;
+}
+
+/** 去掉 sig 之后的请求体摘要。 */
+async function bodyDigest(body) {
+  const { sig: _sig, ...rest } = body ?? {};
+  return sha256Hex(canonicalJson(rest));
+}
+
+function signingMessage(op, networkId, ts, nonce, digest) {
+  return [SIGN_PREFIX, op, networkId, ts, nonce, digest].join("|");
+}
+
+/**
+ * 校验一次签名请求。返回错误说明，或 null 表示通过。
+ * `trackReplay` 为 true 时消费 nonce，重复提交会被拒。
+ */
+async function verifySignedRequest({ env, op, networkId, body, pubkey, now, trackReplay }) {
+  const stamp = Number(body?.ts);
   if (!Number.isFinite(stamp)) return "缺少 ts（毫秒时间戳）";
   if (Math.abs(now - stamp) > TS_WINDOW_MS) return "ts 超出 ±120 秒窗口";
 
+  const nonce = String(body?.nonce ?? "").toLowerCase();
+  if (!/^[0-9a-f]{16,64}$/.test(nonce)) return "nonce 必须是 16~64 位十六进制";
+
+  const digest = await bodyDigest(body);
+  const message = signingMessage(op, networkId, stamp, nonce, digest);
+  const mismatch = await verifySignature(pubkey, message, body?.sig);
+  if (mismatch) return mismatch;
+
+  if (trackReplay && !(await consumeNonce(env, `${networkId}:${nonce}`, now))) {
+    return "nonce 已用过（疑似重放）";
+  }
+  return null;
+}
+
+async function consumeNonce(env, key, now) {
+  if ((await ready(env)) === "memory") {
+    const seen = memory.nonces.get(key);
+    if (seen && now - seen < NONCE_TTL_MS) return false;
+    memory.nonces.set(key, now);
+    return true;
+  }
+  const { meta } = await env.DB.prepare(
+    "INSERT INTO nonces (nonce, created_at) VALUES (?, ?) ON CONFLICT(nonce) DO NOTHING",
+  )
+    .bind(key, now)
+    .run();
+  return (meta?.changes ?? 0) > 0;
+}
+
+async function verifySignature(pubkey, message, sig) {
   const text = String(sig ?? "").toLowerCase();
   if (!/^[0-9a-f]{128}$/.test(text)) return "sig 必须是 64 字节 Ed25519 签名的十六进制";
 
@@ -955,6 +1064,9 @@ async function sweep(env) {
     for (const [key, node] of memory.nodes) {
       if (node.last_seen < nodeCutoff) memory.nodes.delete(key);
     }
+    for (const [key, at] of memory.nonces) {
+      if (at < now - NONCE_TTL_MS) memory.nonces.delete(key);
+    }
     return 0;
   }
 
@@ -962,5 +1074,8 @@ async function sweep(env) {
     .bind(staleCutoff)
     .run();
   await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
+  await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
+    .bind(now - NONCE_TTL_MS)
+    .run();
   return meta?.changes ?? 0;
 }

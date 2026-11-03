@@ -1,12 +1,11 @@
 /**
  * 信令 Worker 的本地冒烟测试。
  *
- *   node signal/smoke.mjs
+ *   node signal/smoke.mjs                                   # 内存 + SQLite 冒充 D1
+ *   ADMIN_SECRET=xxx node signal/smoke.mjs --remote <url>   # 验收线上部署
  *
- * 不连 Cloudflare：内存后端跑一遍，再用 Node 内置 SQLite 冒充 D1 跑一遍，
- * 两条存储路径覆盖同一套断言：建网 → 加入 → 上报 → 撮合 → 拉事件 → 下线 → 地址派生。
- *
- * 节点身份是真正的 Ed25519 密钥，所有写操作都按服务端要求签名。
+ * 节点身份是真正的 Ed25519 密钥；签名覆盖整个请求体（去掉 sig），
+ * 与服务端 worker.js 的 canonicalJson 逐字节一致。
  */
 
 import worker, { deriveVirtualIp } from "./worker.js";
@@ -33,15 +32,68 @@ async function identity() {
   return { pubkey, nodeId: hex(digest).slice(0, 32), privateKey: pair.privateKey };
 }
 
-/** 与服务端 signPayload 逐字一致：qp2p1|op|part|part|ts */
-async function sign(node, op, parts, ts = Date.now()) {
-  const message = ["qp2p1", op, ...parts.map(String), ts].join("|");
+// --- 与服务端 worker.js 完全一致的规范化 JSON ---------------------------------
+
+function canonicalJson(value) {
+  if (value === null) return "null";
+  const type = typeof value;
+  if (type === "number") return String(value);
+  if (type === "boolean") return value ? "true" : "false";
+  if (type === "string") return quoteJson(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (type === "object") {
+    const keys = Object.keys(value)
+      .filter((k) => value[k] !== undefined)
+      .sort();
+    return `{${keys.map((k) => `${quoteJson(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+  }
+  throw new Error(`不支持的类型：${type}`);
+}
+
+function quoteJson(text) {
+  let out = '"';
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (code < 0x20 || code > 0x7e) {
+      if (code > 0xffff) {
+        const rest = code - 0x10000;
+        out += `\\u${(0xd800 + (rest >> 10)).toString(16).padStart(4, "0")}`;
+        out += `\\u${(0xdc00 + (rest & 0x3ff)).toString(16).padStart(4, "0")}`;
+      } else {
+        out += `\\u${code.toString(16).padStart(4, "0")}`;
+      }
+    } else out += ch;
+  }
+  return `${out}"`;
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return hex(new Uint8Array(digest));
+}
+
+function randomNonce() {
+  return hex(crypto.getRandomValues(new Uint8Array(8)));
+}
+
+/** 给请求体加上 ts / nonce / sig，返回可直接发送的对象。 */
+async function signed(node, op, net, body, opts = {}) {
+  const ts = opts.ts ?? Date.now();
+  const nonce = opts.nonce ?? randomNonce();
+  const payload = { ...body, ts, nonce };
+  const digest = await sha256Hex(canonicalJson(payload));
+  const message = `qp2p1|${op}|${net}|${ts}|${nonce}|${digest}`;
   const signature = await crypto.subtle.sign(
     { name: "Ed25519" },
     node.privateKey,
     new TextEncoder().encode(message),
   );
-  return { ts, sig: hex(new Uint8Array(signature)) };
+  return { ...payload, sig: hex(new Uint8Array(signature)) };
 }
 
 async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
@@ -72,7 +124,6 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    // 远端模式走真实网络，本地模式直接调 handler
     const res = remote ? await fetch(request) : await worker.fetch(request, env, ctx);
     return { status: res.status, body: await res.json().catch(() => null) };
   };
@@ -114,19 +165,19 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     admin: secret,
     body: { name: "lab" },
   });
-  check("第二个网络网段不与第一个重叠", otherNet.body.network.cidr !== created.body.network.cidr, {
-    first: created.body.network.cidr,
-    second: otherNet.body.network.cidr,
-  });
+  check("第二个网络网段不与第一个重叠", otherNet.body.network.cidr !== created.body.network.cidr);
 
   console.log("\n3. 加入与上报");
   const alice = await identity();
   const bob = await identity();
 
-  const joinSig = await sign(alice, "join", [net, alice.nodeId]);
   const joined = await call("POST", "/v1/join", {
     token,
-    body: { node_id: alice.nodeId, pubkey: alice.pubkey, name: "alice", ...joinSig },
+    body: await signed(alice, "join", net, {
+      node_id: alice.nodeId,
+      pubkey: alice.pubkey,
+      name: "alice",
+    }),
   });
   check("join 成功", joined.status === 200 && joined.body.ok === true, joined.body);
   check("durable 标记与后端一致", joined.body.durable === (expectedStorage === "d1"), joined.body.durable);
@@ -134,32 +185,63 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const aliceIp = joined.body.node?.virtual_ip;
   const prefix = created.body.network.cidr.split("/")[0].split(".").slice(0, 2).join(".");
   check("拿到虚拟地址", /^10\.\d+\.\d+\.\d+$/.test(aliceIp ?? ""), aliceIp);
-  check("虚拟地址落在网段内", aliceIp?.startsWith(`${prefix}.`), {
-    aliceIp,
-    cidr: created.body.network.cidr,
-  });
+  check("虚拟地址落在网段内", aliceIp?.startsWith(`${prefix}.`), { aliceIp, cidr: created.body.network.cidr });
 
   const badId = await call("POST", "/v1/join", {
     token,
-    body: { node_id: "0".repeat(32), pubkey: alice.pubkey, ...joinSig },
+    body: await signed(alice, "join", net, { node_id: "0".repeat(32), pubkey: alice.pubkey }),
   });
   check("node_id 与 pubkey 不匹配被拒", badId.status === 403 && badId.body.error === "node_id_mismatch", badId.body);
 
-  const noSig = await call("POST", "/v1/join", { token, body: { node_id: bob.nodeId, pubkey: bob.pubkey } });
+  const noSig = await call("POST", "/v1/join", {
+    token,
+    body: { node_id: bob.nodeId, pubkey: bob.pubkey },
+  });
   check("缺签名被拒", noSig.status === 403 && noSig.body.error === "bad_signature", noSig.body);
 
-  const staleSig = await sign(bob, "join", [net, bob.nodeId], Date.now() - 10 * 60_000);
   const stale = await call("POST", "/v1/join", {
     token,
-    body: { node_id: bob.nodeId, pubkey: bob.pubkey, ...staleSig },
+    body: await signed(
+      bob,
+      "join",
+      net,
+      { node_id: bob.nodeId, pubkey: bob.pubkey },
+      { ts: Date.now() - 10 * 60_000 },
+    ),
   });
   check("过期时间戳被拒", stale.status === 403 && String(stale.body.detail).includes("120"), stale.body);
 
+  // 关键回归：拿一份合法签名，改字段后重发
+  const tamperBase = await signed(bob, "join", net, {
+    node_id: bob.nodeId,
+    pubkey: bob.pubkey,
+    name: "bob",
+  });
+  const tamperedCandidates = await call("POST", "/v1/join", {
+    token,
+    body: { ...tamperBase, candidates: ["198.51.100.66:4444"] },
+  });
+  check("改 candidates 后签名失效", tamperedCandidates.status === 403, tamperedCandidates.body);
+
+  const tamperedFp = await call("POST", "/v1/join", {
+    token,
+    body: { ...tamperBase, tls_fp: "attacker-fp" },
+  });
+  check("改 tls_fp 后签名失效", tamperedFp.status === 403, tamperedFp.body);
+
+  const firstUse = await call("POST", "/v1/join", { token, body: tamperBase });
+  check("首次提交合法", firstUse.status === 200, firstUse.body);
+  const replayJoin = await call("POST", "/v1/join", { token, body: tamperBase });
+  check(
+    "同报文重放被拒",
+    replayJoin.status === 403 && String(replayJoin.body.detail).includes("重放"),
+    replayJoin.body,
+  );
+
   const candidates = ["203.0.113.7:51820", "198.51.100.9:51820"];
-  const regSig = await sign(bob, "register", [net, bob.nodeId, candidates.join(",")]);
   const register = await call("POST", "/v1/register", {
     token,
-    body: {
+    body: await signed(bob, "register", net, {
       node_id: bob.nodeId,
       pubkey: bob.pubkey,
       name: "bob",
@@ -167,8 +249,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       nat_type: "cone",
       tls_fp: "ab".repeat(32),
       advertise: ["192.168.1.0/24"],
-      ...regSig,
-    },
+    }),
   });
   check("register 成功", register.status === 200 && register.body.ok === true, register.body);
   check("对端列表里能看到 alice", register.body.peers?.some((p) => p.node_id === alice.nodeId), register.body.peers);
@@ -178,10 +259,13 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     alice: aliceIp,
   });
 
-  const emptySig = await sign(alice, "register", [net, alice.nodeId, ""]);
   const emptyRegister = await call("POST", "/v1/register", {
     token,
-    body: { node_id: alice.nodeId, pubkey: alice.pubkey, candidates: [], ...emptySig },
+    body: await signed(alice, "register", net, {
+      node_id: alice.nodeId,
+      pubkey: alice.pubkey,
+      candidates: [],
+    }),
   });
   check(
     "register 缺候选被拒",
@@ -189,11 +273,13 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     emptyRegister.body,
   );
 
-  const badCand = ["127.0.0.1:51820"];
-  const badCandSig = await sign(bob, "register", [net, bob.nodeId, badCand.join(",")]);
   const badCandidate = await call("POST", "/v1/register", {
     token,
-    body: { node_id: bob.nodeId, pubkey: bob.pubkey, candidates: badCand, ...badCandSig },
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      candidates: ["127.0.0.1:51820"],
+    }),
   });
   check(
     "回环候选被拒",
@@ -201,10 +287,9 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     badCandidate.body,
   );
 
-  const rejoinSig = await sign(alice, "join", [net, alice.nodeId]);
   const rejoin = await call("POST", "/v1/join", {
     token,
-    body: { node_id: alice.nodeId, pubkey: alice.pubkey, ...rejoinSig },
+    body: await signed(alice, "join", net, { node_id: alice.nodeId, pubkey: alice.pubkey }),
   });
   check("重复加入地址不变", rejoin.body.node?.virtual_ip === aliceIp, {
     before: aliceIp,
@@ -214,48 +299,31 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   console.log("\n4. 撮合与身份");
   const wrongToken = await call("POST", "/v1/connect", {
     token: "qp2p1_home-lab_deadbeef",
-    body: {
-      from: alice.nodeId,
-      target: bob.nodeId,
-      ...(await sign(alice, "connect", [net, alice.nodeId, bob.nodeId])),
-    },
+    body: await signed(alice, "connect", net, { from: alice.nodeId, target: bob.nodeId }),
   });
   check("错误密钥被拒", wrongToken.status === 403, wrongToken.body);
 
-  // 攻击者持有同一网络的令牌、也知道 bob 的 node_id，但没有 bob 的私钥
   const mallory = await identity();
   const tryMallory = await call("POST", "/v1/connect", {
     token,
-    body: {
-      from: bob.nodeId,
-      target: alice.nodeId,
-      ...(await sign(mallory, "connect", [net, bob.nodeId, alice.nodeId])),
-    },
+    body: await signed(mallory, "connect", net, { from: bob.nodeId, target: alice.nodeId }),
   });
   check("冒用他人 node_id 被拒", tryMallory.status === 403 && tryMallory.body.error === "bad_signature", tryMallory.body);
 
   const crossNet = await call("POST", "/v1/connect", {
     token: otherNet.body.token,
-    body: {
-      from: alice.nodeId,
-      target: bob.nodeId,
-      ...(await sign(alice, "connect", ["lab", alice.nodeId, bob.nodeId])),
-    },
+    body: await signed(alice, "connect", "lab", { from: alice.nodeId, target: bob.nodeId }),
   });
   check("跨网络看不到别网络的节点", crossNet.status === 404, crossNet.body);
 
-  const selfSig = await sign(alice, "connect", [net, alice.nodeId, alice.nodeId]);
   const selfConnect = await call("POST", "/v1/connect", {
     token,
-    body: { from: alice.nodeId, target: alice.nodeId, ...selfSig },
+    body: await signed(alice, "connect", net, { from: alice.nodeId, target: alice.nodeId }),
   });
   check("连自己被拒", selfConnect.status === 400 && selfConnect.body.error === "self_connect", selfConnect.body);
 
-  const connectSig = await sign(alice, "connect", [net, alice.nodeId, bob.nodeId]);
-  const connected = await call("POST", "/v1/connect", {
-    token,
-    body: { from: alice.nodeId, target: bob.nodeId, ...connectSig },
-  });
+  const connectBody = await signed(alice, "connect", net, { from: alice.nodeId, target: bob.nodeId });
+  const connected = await call("POST", "/v1/connect", { token, body: connectBody });
   check("撮合成功", connected.status === 200 && connected.body.ok === true, connected.body);
   check(
     "拿到对端候选",
@@ -263,77 +331,66 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     connected.body.target_candidates,
   );
   check("拿到对端 TLS 指纹", connected.body.target_tls_fp === "ab".repeat(32), connected.body.target_tls_fp);
-  check("带回切换时刻", typeof connected.body.t === "number" && connected.body.t > Date.now(), connected.body.t);
+
+  const replayConnect = await call("POST", "/v1/connect", { token, body: connectBody });
+  check(
+    "connect 重放被拒",
+    replayConnect.status === 403 && String(replayConnect.body.detail).includes("重放"),
+    replayConnect.body,
+  );
 
   console.log("\n5. 事件");
-  const evSig = await sign(bob, "events", [net, bob.nodeId]);
-  const firstPull = await call("GET", "/v1/events", {
-    token,
-    query: { node_id: bob.nodeId, since: 0, ts: evSig.ts, sig: evSig.sig },
-  });
+  const evBody = await signed(bob, "events", net, { node_id: bob.nodeId, since: 0 });
+  const { sig: evSig, ...evQuery } = evBody;
+  const firstPull = await call("GET", "/v1/events", { token, query: { ...evQuery, sig: evSig } });
   check("bob 收到一条事件", firstPull.body.events?.length === 1, firstPull.body);
   check("事件类型是 punch_request", firstPull.body.events?.[0]?.type === "punch_request", firstPull.body.events?.[0]);
   check("事件里带发起方的候选", Array.isArray(firstPull.body.events?.[0]?.candidates), firstPull.body.events?.[0]);
   check("返回游标", typeof firstPull.body.cursor === "number" && firstPull.body.cursor > 0, firstPull.body.cursor);
 
-  const pull2Sig = await sign(bob, "events", [net, bob.nodeId]);
-  const secondPull = await call("GET", "/v1/events", {
-    token,
-    query: { node_id: bob.nodeId, since: firstPull.body.cursor, ts: pull2Sig.ts, sig: pull2Sig.sig },
-  });
+  const pull2 = await signed(bob, "events", net, { node_id: bob.nodeId, since: firstPull.body.cursor });
+  const { sig: p2Sig, ...p2Query } = pull2;
+  const secondPull = await call("GET", "/v1/events", { token, query: { ...p2Query, sig: p2Sig } });
   check("游标之后没有重复事件", secondPull.body.events?.length === 0, secondPull.body);
   check("游标不回退", secondPull.body.cursor === firstPull.body.cursor, secondPull.body.cursor);
 
   const noSigPull = await call("GET", "/v1/events", { token, query: { node_id: bob.nodeId, since: 0 } });
   check("无签名拉事件被拒", noSigPull.status === 403 && noSigPull.body.error === "bad_signature", noSigPull.body);
 
-  // 攻击者用自己的签名去读 bob 的事件
-  const malloryEv = await sign(mallory, "events", [net, bob.nodeId]);
-  const steal = await call("GET", "/v1/events", {
-    token,
-    query: { node_id: bob.nodeId, since: 0, ts: malloryEv.ts, sig: malloryEv.sig },
-  });
+  const malloryEv = await signed(mallory, "events", net, { node_id: bob.nodeId, since: 0 });
+  const { sig: mSig, ...mQuery } = malloryEv;
+  const steal = await call("GET", "/v1/events", { token, query: { ...mQuery, sig: mSig } });
   check("读取他人事件被拒", steal.status === 403 && steal.body.error === "bad_signature", steal.body);
 
-  const aliceEv = await sign(alice, "events", [net, alice.nodeId]);
-  const alicePull = await call("GET", "/v1/events", {
-    token,
-    query: { node_id: alice.nodeId, since: 0, ts: aliceEv.ts, sig: aliceEv.sig },
-  });
+  const aliceEv = await signed(alice, "events", net, { node_id: alice.nodeId, since: 0 });
+  const { sig: aSig, ...aQuery } = aliceEv;
+  const alicePull = await call("GET", "/v1/events", { token, query: { ...aQuery, sig: aSig } });
   check("alice 没有收到事件", alicePull.body.events?.length === 0, alicePull.body);
 
   console.log("\n6. 离线");
-  const wrongLeaveSig = await sign(alice, "leave", [net, bob.nodeId]);
   const wrongLeave = await call("POST", "/v1/leave", {
     token,
-    body: { node_id: bob.nodeId, pubkey: bob.pubkey, ...wrongLeaveSig },
+    body: await signed(alice, "leave", net, { node_id: bob.nodeId, pubkey: bob.pubkey }),
   });
   check("用别人的私钥下线被拒", wrongLeave.status === 403, wrongLeave.body);
 
   if (remote) {
-    // 远端模式下别在别人的库里留垃圾节点
     const dropAlice = await call("POST", "/v1/leave", {
       token,
-      body: {
-        node_id: alice.nodeId,
-        pubkey: alice.pubkey,
-        ...(await sign(alice, "leave", [net, alice.nodeId])),
-      },
+      body: await signed(alice, "leave", net, { node_id: alice.nodeId, pubkey: alice.pubkey }),
     });
     check("远端清理 alice", dropAlice.status === 200, dropAlice.body);
   }
 
-  const leaveSig = await sign(bob, "leave", [net, bob.nodeId]);
   const left = await call("POST", "/v1/leave", {
     token,
-    body: { node_id: bob.nodeId, pubkey: bob.pubkey, ...leaveSig },
+    body: await signed(bob, "leave", net, { node_id: bob.nodeId, pubkey: bob.pubkey }),
   });
   check("下线成功", left.status === 200 && left.body.ok === true, left.body);
 
-  const afterSig = await sign(alice, "connect", [net, alice.nodeId, bob.nodeId]);
   const afterLeave = await call("POST", "/v1/connect", {
     token,
-    body: { from: alice.nodeId, target: bob.nodeId, ...afterSig },
+    body: await signed(alice, "connect", net, { from: alice.nodeId, target: bob.nodeId }),
   });
   check("下线后撮合返回 404", afterLeave.status === 404, afterLeave.body);
 

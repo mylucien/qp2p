@@ -175,12 +175,19 @@ async fn open_flow(conn: &Connection, target: SocketAddr) -> Result<(SendStream,
     }
 }
 
+/// 半关闭后的兜底时长：一端关了写端、另一端再也不发数据时，流不该无限挂着。
+const HALF_CLOSE_IDLE: Duration = Duration::from_secs(60);
+
 /// 双向搬运数据。
 ///
 /// 用 `try_join!` 而不是 `select!`：TCP 是半关闭的，客户端 `shutdown(Write)`
 /// 之后往往还等着响应，此时上行结束不能把下行也丢掉。只有真正出错才提前收尾。
+///
+/// 上行结束后启动一个空闲计时器：对端如果一直不发数据也不关流，就主动收尾，
+/// 否则这条流会一直占着连接直到整条连接关闭。
 async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    let (up_done_tx, up_done_rx) = tokio::sync::oneshot::channel();
 
     let up = async {
         let mut buf = vec![0u8; COPY_BUF];
@@ -192,6 +199,7 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
             send.write_all(&buf[..n]).await?;
         }
         let _ = send.finish();
+        let _ = up_done_tx.send(());
         Ok::<(), anyhow::Error>(())
     };
 
@@ -207,8 +215,16 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
         Ok::<(), anyhow::Error>(())
     };
 
-    tokio::try_join!(up, down)?;
-    Ok(())
+    let both = async { tokio::try_join!(up, down).map(|_| ()) };
+    let idle = async {
+        let _ = up_done_rx.await;
+        tokio::time::sleep(HALF_CLOSE_IDLE).await;
+    };
+
+    tokio::select! {
+        result = both => result,
+        _ = idle => bail!("半关闭后 {HALF_CLOSE_IDLE:?} 无数据，主动收尾"),
+    }
 }
 
 #[cfg(test)]

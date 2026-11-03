@@ -73,19 +73,24 @@ curl -X POST https://<你的域名>/v1/admin/networks \
 如果不签名，他就能用 `from=<受害者>` 提交请求，把受害者的候选改成自己的地址
 （在 TLS 还没有对端认证的当下，这就是中间人）。
 
-所以 **join / register / connect / events / leave 全部要求节点私钥签名**：
+所以 **join / register / connect / events / leave 全部要求节点私钥签名**，
+而且签名覆盖**整个请求体**，不是手挑几个字段：
 
 ```
-qp2p1|join|<network>|<node_id>|<ts>
-qp2p1|register|<network>|<node_id>|<candidates,逗号连接>|<ts>
-qp2p1|connect|<network>|<from>|<target>|<ts>
-qp2p1|events|<network>|<node_id>|<ts>
-qp2p1|leave|<network>|<node_id>|<ts>
+body      = 请求 JSON 去掉 sig
+canonical = 键排序、无空白、非 ASCII 转义成 \uXXXX 的 JSON
+digest    = sha256_hex(canonical)
+message   = qp2p1|<op>|<network>|<ts>|<nonce>|<digest>
+sig       = hex(ed25519_sign(私钥, utf8(message)))
 ```
 
-- `sig` = `hex(ed25519_sign(私钥, utf8(上面这行)))`，POST 放请求体，GET 放查询串
-- `ts` 是毫秒时间戳，服务端只接受 ±120 秒内的，防止重放
-- register 的签名覆盖候选列表，改一个地址签名就失效
+- `ts` 毫秒时间戳，服务端只接受 ±120 秒内
+- `nonce` 16~64 位十六进制，同一网络内一次性使用；写操作会消费它，重复提交直接 403
+- 轮询（`/v1/events`）不消费 nonce，因为它本身幂等，否则每次心跳都要多写一行
+
+这样 `candidates`、`tls_fp`、`name` 任何一项被改，摘要就变，签名立刻失效。
+Rust 侧 `crates/core/src/signal/canonical.rs` 有一份同规则实现，和 JS 共用一组
+测试向量（含固定种子下的确定性签名），任何一边改了序列化都会在 CI 里失败。
 
 `pubkey` 是 32 字节 Ed25519 公钥的十六进制。手算 node_id：
 

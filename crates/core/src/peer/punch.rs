@@ -20,6 +20,8 @@ use crate::tls::SERVER_NAME;
 
 /// 单次握手等待上限，超时就再发一轮。
 const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+/// 单次尝试的上限。留短一点，免得一个卡死的候选把整轮重试拖到超时。
+const ATTEMPT_CAP: Duration = Duration::from_secs(4);
 /// listener 发探针的间隔（只为自己这侧开孔）。
 const PROBE_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -132,7 +134,9 @@ async fn attempt_once(
         .connect(peer, SERVER_NAME)
         .map_err(|e| format!("{peer}: 发起连接失败 {e}"))?;
 
-    let conn = match tokio::time::timeout_at(deadline, connecting).await {
+    // 单个候选最多等 ATTEMPT_CAP，失败就进入下一轮，不拖住其他候选
+    let attempt_deadline = deadline.min(Instant::now() + ATTEMPT_CAP);
+    let conn = match tokio::time::timeout_at(attempt_deadline, connecting).await {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => return Err(format!("{peer}: 握手失败 {e}")),
         Err(_) => return Err(format!("{peer}: 握手超时")),
