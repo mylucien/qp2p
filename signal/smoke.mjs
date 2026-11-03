@@ -9,37 +9,12 @@
  * 节点身份是真正的 Ed25519 密钥，所有写操作都按服务端要求签名。
  */
 
-import { DatabaseSync } from "node:sqlite";
-
 import worker, { deriveVirtualIp } from "./worker.js";
+import { fakeD1 } from "./fake-d1.mjs";
 
 const ADMIN_SECRET = "smoke-secret";
 const ctx = { waitUntil: () => {} };
 const totals = { passed: 0, failed: 0 };
-
-/** 把 node:sqlite 包成 D1 的 prepare/bind/run/first/all 接口。 */
-function fakeD1() {
-  const db = new DatabaseSync(":memory:");
-  return {
-    prepare(sql) {
-      const statement = db.prepare(sql);
-      let params = [];
-      const api = {
-        bind: (...args) => {
-          params = args.map((a) => (typeof a === "boolean" ? Number(a) : a));
-          return api;
-        },
-        run: () => {
-          const result = statement.run(...params);
-          return { success: true, meta: { changes: Number(result.changes ?? 0) } };
-        },
-        first: () => statement.get(...params) ?? null,
-        all: () => ({ results: statement.all(...params) }),
-      };
-      return api;
-    },
-  };
-}
 
 function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -69,9 +44,12 @@ async function sign(node, op, parts, ts = Date.now()) {
   return { ts, sig: hex(new Uint8Array(signature)) };
 }
 
-async function runSuite(label, env, expectedStorage, clientIp) {
+async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   let passed = 0;
   let failed = 0;
+  const remote = opts.remote ?? null;
+  const secret = opts.secret ?? ADMIN_SECRET;
+  const base = remote ? remote.replace(/\/+$/, "") : "https://qp2p.test";
 
   const check = (name, ok, extra) => {
     if (ok) {
@@ -84,7 +62,7 @@ async function runSuite(label, env, expectedStorage, clientIp) {
   };
 
   const call = async (method, path, { token, admin, body, query } = {}) => {
-    const url = new URL(`https://qp2p.test${path}`);
+    const url = new URL(`${base}${path}`);
     for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
     const headers = { "content-type": "application/json", "cf-connecting-ip": clientIp };
     if (token) headers.authorization = `Bearer ${token}`;
@@ -94,7 +72,8 @@ async function runSuite(label, env, expectedStorage, clientIp) {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    const res = await worker.fetch(request, env, ctx);
+    // 远端模式走真实网络，本地模式直接调 handler
+    const res = remote ? await fetch(request) : await worker.fetch(request, env, ctx);
     return { status: res.status, body: await res.json().catch(() => null) };
   };
 
@@ -110,7 +89,7 @@ async function runSuite(label, env, expectedStorage, clientIp) {
   check("缺少 admin secret 被拒", noSecret.status === 401, noSecret.body);
 
   const created = await call("POST", "/v1/admin/networks", {
-    admin: ADMIN_SECRET,
+    admin: secret,
     body: { name: "Home Lab" },
   });
   check("建网成功", created.status === 200 && created.body.ok === true, created.body);
@@ -125,14 +104,14 @@ async function runSuite(label, env, expectedStorage, clientIp) {
   check("令牌格式正确", String(token).startsWith("qp2p1_home-lab_"), token);
 
   const again = await call("POST", "/v1/admin/networks", {
-    admin: ADMIN_SECRET,
+    admin: secret,
     body: { name: "home lab" },
   });
   check("重复建网返回同一把密钥", again.body.token === token, again.body.token);
   check("重复建网网段不变", again.body.network.cidr === created.body.network.cidr, again.body.network);
 
   const otherNet = await call("POST", "/v1/admin/networks", {
-    admin: ADMIN_SECRET,
+    admin: secret,
     body: { name: "lab" },
   });
   check("第二个网络网段不与第一个重叠", otherNet.body.network.cidr !== created.body.network.cidr, {
@@ -331,6 +310,19 @@ async function runSuite(label, env, expectedStorage, clientIp) {
   });
   check("用别人的私钥下线被拒", wrongLeave.status === 403, wrongLeave.body);
 
+  if (remote) {
+    // 远端模式下别在别人的库里留垃圾节点
+    const dropAlice = await call("POST", "/v1/leave", {
+      token,
+      body: {
+        node_id: alice.nodeId,
+        pubkey: alice.pubkey,
+        ...(await sign(alice, "leave", [net, alice.nodeId])),
+      },
+    });
+    check("远端清理 alice", dropAlice.status === 200, dropAlice.body);
+  }
+
   const leaveSig = await sign(bob, "leave", [net, bob.nodeId]);
   const left = await call("POST", "/v1/leave", {
     token,
@@ -362,8 +354,23 @@ async function runSuite(label, env, expectedStorage, clientIp) {
   totals.failed += failed;
 }
 
-await runSuite("内存后端", { ADMIN_SECRET }, "memory", "198.18.0.1");
-await runSuite("D1 后端", { ADMIN_SECRET, DB: fakeD1() }, "d1", "198.18.0.2");
+const remoteFlag = process.argv.indexOf("--remote");
+const remoteUrl = remoteFlag > 0 ? process.argv[remoteFlag + 1] : null;
+
+if (remoteUrl) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) {
+    console.error("远端模式需要 ADMIN_SECRET 环境变量");
+    process.exit(2);
+  }
+  await runSuite(`远端 ${remoteUrl}`, { ADMIN_SECRET: secret }, "d1", "198.18.0.3", {
+    remote: remoteUrl,
+    secret,
+  });
+} else {
+  await runSuite("内存后端", { ADMIN_SECRET }, "memory", "198.18.0.1");
+  await runSuite("D1 后端", { ADMIN_SECRET, DB: fakeD1() }, "d1", "198.18.0.2");
+}
 
 console.log(`\n结果：${totals.passed} 通过，${totals.failed} 失败\n`);
 process.exit(totals.failed === 0 ? 0 : 1);

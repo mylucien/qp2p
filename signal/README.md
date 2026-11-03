@@ -136,11 +136,24 @@ node -e 'crypto.subtle.digest("SHA-256", Buffer.from(process.argv[1],"hex")).the
 ## 本地测试
 
 ```bash
-node signal/smoke.mjs
+node signal/smoke.mjs                              # 内存 + SQLite 冒充 D1，两条路径各 47 项
+node signal/dev-server.mjs                         # 起在 127.0.0.1:8787，可直接 curl
+ADMIN_SECRET=dev node signal/dev-server.mjs 9000   # 换端口
 ```
 
-不需要 D1、不连 Cloudflare：走内存后端，覆盖建网 → 加入 → 上报 → 撮合 → 拉事件 →
-下线 → 地址派生向量，共 39 项断言。
+`dev-server.mjs` 把 `worker.js` 的 fetch handler 挂到真 HTTP 服务上，存储用 Node 内置
+SQLite 冒充 D1（重启即清空）。改完 Worker 想用 curl 试一下，用它比部署到线上快得多。
+
+## 验收线上部署
+
+同一套断言可以直接打远端，确认部署的是新代码、D1 通、签名生效：
+
+```bash
+ADMIN_SECRET=你的密钥 node signal/smoke.mjs --remote https://你的域名
+```
+
+跑完会打印每一项的 ok/FAIL。它会建两个测试网络（`home-lab`、`lab`），
+注册两个随机身份的节点并在结束时清理，不会留下垃圾数据。
 
 ## 还没做的
 
