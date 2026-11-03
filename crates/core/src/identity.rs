@@ -4,7 +4,9 @@
 //! 重启换 URL 就换身份。这里改为从密钥派生，稳定且可验证。
 
 use std::fmt;
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -13,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 /// node_id 的十六进制字符数（取 SHA-256 前 16 字节）。
 pub const NODE_ID_HEX_LEN: usize = 32;
+
+/// 落盘文件名。
+const IDENTITY_FILE: &str = "identity.key";
 
 /// 节点标识：`hex(sha256(pubkey))[..32]`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -75,6 +80,35 @@ impl Identity {
         self.signing.to_bytes()
     }
 
+    /// 从数据目录加载身份；没有就生成一份并写回去。
+    ///
+    /// `None` 表示不落盘——每次启动都是新身份，只适合测试。
+    /// 落盘之后 `node_id` 才稳定，`--peer-id` 之类的钉扎也才有意义。
+    pub fn load_or_create(dir: Option<&Path>) -> anyhow::Result<Self> {
+        let Some(dir) = dir else {
+            return Ok(Self::generate());
+        };
+
+        fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("创建数据目录失败 {}: {e}", dir.display()))?;
+
+        let path = dir.join(IDENTITY_FILE);
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("读取身份文件失败 {}: {e}", path.display()))?;
+            let bytes = hex::decode(text.trim())
+                .map_err(|e| anyhow::anyhow!("身份文件不是合法十六进制: {e}"))?;
+            let seed: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("身份文件长度必须是 32 字节"))?;
+            return Ok(Self::from_seed(&seed));
+        }
+
+        let identity = Self::generate();
+        write_secret(&path, hex::encode(identity.to_seed()).as_bytes())?;
+        Ok(identity)
+    }
+
     pub fn public_key(&self) -> [u8; 32] {
         self.signing.verifying_key().to_bytes()
     }
@@ -103,6 +137,18 @@ impl fmt::Debug for Identity {
             .field("node_id", &self.node_id().to_string())
             .finish()
     }
+}
+
+/// 写私密文件：内容只有自己能读。
+fn write_secret(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
+    fs::write(path, bytes)
+        .map_err(|e| anyhow::anyhow!("写入身份文件失败 {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// 由 node_id 派生虚拟地址。
@@ -138,6 +184,19 @@ pub fn derive_virtual_ip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_identity_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("qp2p-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = Identity::load_or_create(Some(&dir)).expect("首次创建");
+        let second = Identity::load_or_create(Some(&dir)).expect("重新加载");
+        assert_eq!(first.node_id(), second.node_id());
+        assert_eq!(first.public_key(), second.public_key());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn identity_is_stable_across_restarts() {

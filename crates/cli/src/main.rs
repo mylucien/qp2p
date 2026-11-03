@@ -27,8 +27,10 @@ qp2p — 私有打洞组网
   --target   对端要去连的地址（由对端发起 TCP 连接，不是本机连它）
   --serve    本机允许对端访问的地址，可重复；不填则拒绝一切入站
              （通常填对端的 --target，两边要对称）
-  --peer-id  要求对端必须是指定的 node_id（64 位十六进制前缀，32 字符）
+  --peer-id  要求对端必须是指定的 node_id（32 位十六进制）
              不填则只验签、不限定具体身份
+  --peer-fp  要求对端 TLS 证书指纹一致（64 位十六进制），不符时握手就失败
+  --data-dir 身份与证书的存放目录，默认 ~/.qp2p；同一目录重启后 node_id 不变
   --allow-target  --serve 的别名，保留兼容
   --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
@@ -159,7 +161,9 @@ async fn cmd_doctor(args: &[String]) -> Result<()> {
         println!("stun: {}", stun.join(", "));
     }
 
-    let engine = Engine::bind(bind, &stun).await.context("绑定失败")?;
+    let engine = Engine::bind_in(bind, &stun, data_dir(&flags)?.as_deref())
+        .await
+        .context("绑定失败")?;
     println!("node_id: {}", engine.node_id());
     println!("pubkey : {}", engine.public_key_hex());
     println!("udp  local: {}", engine.local_addr());
@@ -183,6 +187,7 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
 
     println!("本端 UDP: {}", engine.local_addr());
     println!("本端 node_id: {}", engine.node_id());
+    println!("本端 tls_fp : {}", engine.tls_fp());
     for candidate in engine.candidates() {
         println!("candidate {candidate}");
     }
@@ -220,6 +225,7 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
 
     println!("本端 UDP: {}", engine.local_addr());
     println!("本端 node_id: {}", engine.node_id());
+    println!("本端 tls_fp : {}", engine.tls_fp());
     println!("对端候选: {} 个  角色: {role:?}", peers.len());
     println!("映射: {listen} → {target}（连由对端发起）");
 
@@ -281,7 +287,7 @@ async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
     } else {
         Role::Listener
     };
-    let mut engine = Engine::bind(bind, &flags.many("stun"))
+    let mut engine = Engine::bind_in(bind, &flags.many("stun"), data_dir(flags)?.as_deref())
         .await
         .context("绑定 UDP 失败")?;
 
@@ -292,5 +298,20 @@ async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
         engine.expect_peer(Some(id));
     }
 
+    if let Some(fp) = flags.get("peer-fp") {
+        engine
+            .expect_peer_fp(Some(fp))
+            .with_context(|| format!("--peer-fp 不合法：{fp}"))?;
+    }
+
     Ok((engine, peers, role))
+}
+
+/// 身份目录：默认 `~/.qp2p`，可用 `--data-dir` 覆盖。
+fn data_dir(flags: &Flags) -> Result<Option<std::path::PathBuf>> {
+    if let Some(raw) = flags.get("data-dir") {
+        return Ok(Some(std::path::PathBuf::from(raw)));
+    }
+    let base = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    Ok(base.map(|p| std::path::PathBuf::from(p).join(".qp2p")))
 }

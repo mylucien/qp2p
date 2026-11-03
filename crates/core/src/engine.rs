@@ -8,10 +8,11 @@
 //! - **失败期保活**：重试间隔里往已知地址发小包，防止 NAT 映射被回收
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use quinn::Connection;
 use tokio::time::Instant;
 
@@ -19,6 +20,8 @@ use crate::candidate::Candidate;
 use crate::identity::{Identity, NodeId};
 use crate::peer::{punch, Role};
 use crate::socket;
+use crate::tls::TlsIdentity;
+use crate::upnp;
 
 /// dialer 单轮打洞时长：够覆盖对端启动晚几秒的情况。
 const DIAL_ATTEMPT: Duration = Duration::from_secs(10);
@@ -51,12 +54,33 @@ pub struct Engine {
     identity: Identity,
     /// 期望的对端 node_id；None 表示"验签但不校验具体是谁"。
     expected_peer: Option<NodeId>,
+    /// 证书身份：落盘之后指纹在重启间不变，对端才能钉扎
+    tls: TlsIdentity,
+    /// 钉扎对端证书的指纹；刷新端点后要重新应用
+    pin_fp: Option<[u8; 32]>,
+    /// UPnP 映射句柄，退出/刷新时负责删除
+    mapping: Option<upnp::Mapping>,
+    renewer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
-    /// 绑定端口、STUN、UPnP、创建端点。
+    /// 绑定端口、STUN、UPnP、创建端点；身份每次随机（只适合测试）。
     pub async fn bind(bind_addr: SocketAddr, stun_servers: &[String]) -> Result<Self> {
-        let bound = socket::bind(bind_addr, stun_servers).await?;
+        Self::bind_in(bind_addr, stun_servers, None).await
+    }
+
+    /// 同上，但身份与证书落在 `data_dir` 里：重启后 `node_id` 和 `tls_fp` 不变。
+    pub async fn bind_in(
+        bind_addr: SocketAddr,
+        stun_servers: &[String],
+        data_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let identity = crate::identity::Identity::load_or_create(data_dir)?;
+        let tls = TlsIdentity::load_or_create(data_dir)?;
+        let bound = socket::bind(bind_addr, stun_servers, &tls).await?;
+        let mapping = bound.mapping.clone();
+        let renewer = start_upnp_renewer(mapping.clone());
+
         Ok(Self {
             endpoint: Some(bound.endpoint),
             bind_addr: bound.bind_addr,
@@ -66,9 +90,40 @@ impl Engine {
             upnp: bound.upnp,
             candidates: bound.candidates,
             keepalive: Some(bound.keepalive),
-            identity: Identity::generate(),
+            identity,
             expected_peer: None,
+            pin_fp: None,
+            tls,
+            mapping,
+            renewer,
         })
+    }
+
+    /// 证书指纹（sha256 hex）。稳定之后可以直接钉扎对端。
+    pub fn tls_fp(&self) -> String {
+        self.tls.fingerprint()
+    }
+
+    /// 钉扎对端证书指纹：不符时 QUIC 握手就失败，不进入认证阶段。
+    pub fn expect_peer_fp(&mut self, fp: Option<&str>) -> Result<()> {
+        let pin = match fp {
+            None => None,
+            Some(text) => {
+                let bytes = hex::decode(text.trim()).context("指纹不是合法十六进制")?;
+                let array: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("指纹必须是 32 字节（64 位十六进制）"))?;
+                Some(array)
+            }
+        };
+        self.pin_fp = pin;
+        let config = crate::tls::client_config(pin)?;
+        // quinn 的 set_default_client_config 需要 &mut Endpoint，取出来改再放回
+        if let Some(mut endpoint) = self.endpoint.take() {
+            endpoint.set_default_client_config(config);
+            self.endpoint = Some(endpoint);
+        }
+        Ok(())
     }
 
     /// 本节点标识（`hex(sha256(pubkey))[..32]`）。
@@ -116,6 +171,18 @@ impl Engine {
     /// 失败时端点保持关闭并返回错误，调用方下一轮会拿到"端点不可用"，
     /// 不会 panic。只应在没有活跃连接时调用。
     pub async fn renew(&mut self) -> Result<()> {
+        // 旧映射先撤掉：换了端口之后它指向的是一个已经没人监听的端口
+        if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        if let Some(old) = self.mapping.take() {
+            tokio::spawn(async move {
+                if let Err(e) = old.delete().await {
+                    tracing::debug!("[engine] 删除旧 UPnP 映射失败: {e}");
+                }
+            });
+        }
+
         if let Some(endpoint) = self.endpoint.take() {
             endpoint.close(0u32.into(), b"renew");
             let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
@@ -129,7 +196,7 @@ impl Engine {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(120)).await;
             }
-            match socket::bind(self.bind_addr, &self.stun).await {
+            match socket::bind(self.bind_addr, &self.stun, &self.tls).await {
                 Ok(bound) => {
                     self.install(bound);
                     return Ok(());
@@ -140,7 +207,7 @@ impl Engine {
 
         // 原端口一时半会儿释放不了（Windows 常见），换临时端口也比用旧映射强
         let fallback = SocketAddr::new(self.bind_addr.ip(), 0);
-        match socket::bind(fallback, &self.stun).await {
+        match socket::bind(fallback, &self.stun, &self.tls).await {
             Ok(bound) => {
                 tracing::warn!(
                     "[engine] 原端口 {} 不可用，刷新后改用 {}",
@@ -155,7 +222,17 @@ impl Engine {
     }
 
     fn install(&mut self, bound: socket::Bound) {
-        self.endpoint = Some(bound.endpoint);
+        self.mapping = bound.mapping.clone();
+        self.renewer = start_upnp_renewer(self.mapping.clone());
+
+        // 新端点的默认客户端配置是"不钉扎"，这里把用户的钉扎重新贴回去
+        let mut endpoint = bound.endpoint;
+        if self.pin_fp.is_some() {
+            if let Ok(config) = crate::tls::client_config(self.pin_fp) {
+                endpoint.set_default_client_config(config);
+            }
+        }
+        self.endpoint = Some(endpoint);
         self.bind_addr = bound.bind_addr;
         self.local_addr = bound.local_addr;
         self.srflx = bound.srflx;
@@ -294,4 +371,39 @@ impl Engine {
             }
         }
     }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        // 退出时把路由器上的映射删掉，别占着端口表
+        if let Some(mapping) = self.mapping.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = mapping.delete().await;
+                });
+            }
+        }
+    }
+}
+
+/// 租约过半就续一次；永久映射（租约 0）不需要。
+fn start_upnp_renewer(mapping: Option<upnp::Mapping>) -> Option<tokio::task::JoinHandle<()>> {
+    let mapping = mapping?;
+    if mapping.lease() == 0 {
+        return None;
+    }
+    let interval = Duration::from_secs(u64::from(mapping.lease() / 2).max(60));
+
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match mapping.renew().await {
+                Ok(()) => tracing::debug!("[engine] UPnP 映射已续租"),
+                Err(e) => tracing::warn!("[engine] UPnP 续租失败: {e}"),
+            }
+        }
+    }))
 }

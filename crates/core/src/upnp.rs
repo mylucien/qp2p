@@ -11,8 +11,66 @@ use anyhow::{bail, Context, Result};
 const SSDP_ADDR: &str = "239.255.255.250:1900";
 const SEARCH_TARGET: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 
-/// 申请一个 UDP 端口映射，返回对外地址。
-pub async fn map_udp_port(local_ip: Ipv4Addr, port: u16, timeout: Duration) -> Result<SocketAddr> {
+/// 一次成功的端口映射。
+///
+/// 保留续租和删除所需的上下文：不少路由器 3600 秒就把映射回收，
+/// 不续租的话打洞会在运行一小时后突然失效，而且用户完全看不出原因。
+#[derive(Clone)]
+pub struct Mapping {
+    client: reqwest::Client,
+    control_url: String,
+    service: String,
+    local_ip: Ipv4Addr,
+    port: u16,
+    external: SocketAddr,
+    lease: u32,
+}
+
+impl Mapping {
+    pub fn external(&self) -> SocketAddr {
+        self.external
+    }
+
+    /// 实际生效的租约（秒）；0 表示永久映射，不需要续租。
+    pub fn lease(&self) -> u32 {
+        self.lease
+    }
+
+    /// 续租。租约到期前调用，路由器会重新计时。
+    pub async fn renew(&self) -> Result<()> {
+        add_mapping_with_lease(
+            &self.client,
+            &self.control_url,
+            &self.service,
+            self.local_ip,
+            self.port,
+            self.lease,
+        )
+        .await
+    }
+
+    /// 删除映射，退出时调用，别把路由器的端口表占着。
+    pub async fn delete(&self) -> Result<()> {
+        let body = format!(
+            "<NewRemoteHost></NewRemoteHost>\
+             <NewExternalPort>{}</NewExternalPort>\
+             <NewProtocol>UDP</NewProtocol>",
+            self.port
+        );
+        soap(
+            &self.client,
+            &self.control_url,
+            &self.service,
+            "DeletePortMapping",
+            &body,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// 申请一个 UDP 端口映射。
+pub async fn map_udp_port(local_ip: Ipv4Addr, port: u16, timeout: Duration) -> Result<Mapping> {
     let location = tokio::task::spawn_blocking(move || discover(timeout))
         .await
         .context("SSDP 任务失败")??;
@@ -43,9 +101,17 @@ pub async fn map_udp_port(local_ip: Ipv4Addr, port: u16, timeout: Duration) -> R
         bail!("controlURL 主机与 LOCATION 不一致: {control_url}");
     }
     let external_ip = get_external_ip(&client, &control_url, &service).await?;
-    add_mapping(&client, &control_url, &service, local_ip, port).await?;
+    let lease = add_mapping(&client, &control_url, &service, local_ip, port).await?;
 
-    Ok(SocketAddr::new(external_ip.into(), port))
+    Ok(Mapping {
+        client,
+        control_url,
+        service,
+        local_ip,
+        port,
+        external: SocketAddr::new(external_ip.into(), port),
+        lease,
+    })
 }
 
 /// SSDP 发现：发 M-SEARCH，取第一个响应的 LOCATION。
@@ -181,20 +247,24 @@ async fn get_external_ip(
         .with_context(|| format!("公网地址格式非法: {value}"))
 }
 
+/// 建映射，返回实际生效的租约。
 async fn add_mapping(
     client: &reqwest::Client,
     control_url: &str,
     service: &str,
     local_ip: Ipv4Addr,
     port: u16,
-) -> Result<()> {
+) -> Result<u32> {
+    const LEASE: u32 = 3600;
     // 有些路由器不支持非零租约，失败后用 0（永久）再试一次
-    if let Err(e) = add_mapping_with_lease(client, control_url, service, local_ip, port, 3600).await
-    {
-        tracing::debug!("[upnp] 非零租约失败，改用永久映射: {e}");
-        add_mapping_with_lease(client, control_url, service, local_ip, port, 0).await?;
+    match add_mapping_with_lease(client, control_url, service, local_ip, port, LEASE).await {
+        Ok(()) => Ok(LEASE),
+        Err(e) => {
+            tracing::debug!("[upnp] 非零租约失败，改用永久映射: {e}");
+            add_mapping_with_lease(client, control_url, service, local_ip, port, 0).await?;
+            Ok(0)
+        }
     }
-    Ok(())
 }
 
 async fn add_mapping_with_lease(

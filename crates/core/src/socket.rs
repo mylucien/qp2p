@@ -4,11 +4,13 @@
 //! 旧版用另一个随机端口的 socket 探测再替换端口，NAT 映射按五元组算，
 //! 两者毫无关系。
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rand::RngCore;
 
 use crate::candidate::{normalize, Candidate, CandidateKind};
 use crate::stun;
@@ -22,13 +24,22 @@ pub struct Bound {
     pub local_addr: SocketAddr,
     pub srflx: Option<SocketAddr>,
     pub upnp: Option<SocketAddr>,
+    /// UPnP 映射句柄：Engine 负责续租，退出时删除
+    pub mapping: Option<upnp::Mapping>,
     pub candidates: Vec<Candidate>,
     /// 与 quinn 共享同一个 UDP socket 的额外句柄，只用于发保活包
     pub keepalive: Arc<std::net::UdpSocket>,
 }
 
 /// 绑定并初始化端点。
-pub async fn bind(bind_addr: SocketAddr, stun_servers: &[String]) -> Result<Bound> {
+///
+/// `tls` 决定服务端出示哪张证书：同一份 `TlsIdentity` 重启后指纹不变，
+/// 对端才能钉扎。
+pub async fn bind(
+    bind_addr: SocketAddr,
+    stun_servers: &[String],
+    tls: &crate::tls::TlsIdentity,
+) -> Result<Bound> {
     let socket = bind_socket(bind_addr)?;
     socket
         .set_nonblocking(false)
@@ -41,7 +52,8 @@ pub async fn bind(bind_addr: SocketAddr, stun_servers: &[String]) -> Result<Boun
     let srflx = probe_stun(&socket, stun_servers, Duration::from_secs(3)).await;
 
     // 2) UPnP：失败只是少一个候选
-    let upnp_mapping = try_upnp(local_addr, Duration::from_secs(2)).await;
+    let mapping = try_upnp(local_addr, Duration::from_secs(2)).await;
+    let upnp_mapping = mapping.as_ref().map(upnp::Mapping::external);
 
     socket
         .set_nonblocking(true)
@@ -56,8 +68,8 @@ pub async fn bind(bind_addr: SocketAddr, stun_servers: &[String]) -> Result<Boun
     }
     let candidates = normalize(candidates);
 
-    let server_config = crate::tls::server_config()?;
-    let client_config = crate::tls::client_config()?;
+    let server_config = tls.server_config()?;
+    let client_config = crate::tls::client_config(None)?;
 
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -74,6 +86,7 @@ pub async fn bind(bind_addr: SocketAddr, stun_servers: &[String]) -> Result<Boun
         local_addr,
         srflx,
         upnp: upnp_mapping,
+        mapping,
         candidates,
         keepalive,
     })
@@ -92,7 +105,10 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-/// 依次尝试配置里的 STUN 服务器（支持域名），拿第一个成功的结果。
+/// 同时向所有 STUN 服务器发请求，谁先回用谁。
+///
+/// 串行版的问题是首包要等上一个超时（3 秒）才轮到下一个，
+/// 多出口 / CGNAT 下还经常只有其中一台能观测到可用的映射。
 async fn probe_stun(
     socket: &std::net::UdpSocket,
     servers: &[String],
@@ -101,30 +117,86 @@ async fn probe_stun(
     let socket = socket.try_clone().ok()?;
     let servers: Vec<String> = servers.to_vec();
 
-    tokio::task::spawn_blocking(move || {
-        for server in servers {
-            let addrs = match resolve(&server) {
-                Some(addrs) => addrs,
-                None => {
-                    tracing::warn!("[socket] STUN 地址无法解析: {server}");
-                    continue;
+    tokio::task::spawn_blocking(move || probe_stun_blocking(&socket, &servers, timeout))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn probe_stun_blocking(
+    socket: &std::net::UdpSocket,
+    servers: &[String],
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    // txid -> (服务器名, 期望来源)，用来把响应和请求对上
+    let mut pending: HashMap<[u8; 12], (String, SocketAddr)> = HashMap::new();
+
+    for server in servers {
+        let Some(addrs) = resolve(server) else {
+            tracing::warn!("[socket] STUN 地址无法解析: {server}");
+            continue;
+        };
+        for addr in addrs {
+            let mut txid = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut txid);
+            match socket.send_to(&stun::build_binding_request(txid), addr) {
+                Ok(_) => {
+                    pending.insert(txid, (server.clone(), addr));
                 }
-            };
-            for addr in addrs {
-                match stun::probe_blocking(&socket, addr, timeout) {
-                    Ok(mapped) => {
-                        tracing::info!("[socket] STUN {server} 观测到公网映射 {mapped}");
-                        return Some(mapped);
-                    }
-                    Err(e) => tracing::info!("[socket] STUN {server} ({addr}) 探测失败: {e}"),
-                }
+                Err(e) => tracing::info!("[socket] STUN {server} ({addr}) 发送失败: {e}"),
             }
         }
-        None
-    })
-    .await
-    .ok()
-    .flatten()
+    }
+
+    if pending.is_empty() {
+        return None;
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 512];
+
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if socket.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+
+        let (n, from) = match socket.recv_from(&mut buf) {
+            Ok(pair) => pair,
+            Err(_) => break, // 超时
+        };
+        let response = &buf[..n];
+        if !stun::is_stun(response) || response.len() < stun::HEADER_LEN {
+            continue;
+        }
+
+        let Ok(txid) = <[u8; 12]>::try_from(&response[8..20]) else {
+            continue;
+        };
+        let Some((server, expected)) = pending.get(&txid) else {
+            // 不是我们这次发的请求（可能是上一次探测的迟到包）
+            continue;
+        };
+        if from != *expected {
+            tracing::info!("[socket] STUN {server} 响应来源不符: {from}");
+            continue;
+        }
+        let server = server.clone();
+        pending.remove(&txid);
+
+        match stun::parse_binding_response(response) {
+            Ok(mapped) => {
+                tracing::info!("[socket] STUN {server} 观测到公网映射 {mapped}");
+                return Some(mapped);
+            }
+            Err(e) => tracing::info!("[socket] STUN {server} 响应解析失败: {e}"),
+        }
+    }
+
+    None
 }
 
 /// `host:port` 解析，支持域名。
@@ -139,7 +211,7 @@ fn resolve(server: &str) -> Option<Vec<SocketAddr>> {
     }
 }
 
-async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<upnp::Mapping> {
     // 绑 0.0.0.0 时不能把 0.0.0.0 当内网地址发给路由器
     let local_ip = match local_addr.ip() {
         IpAddr::V4(v4) if !v4.is_unspecified() => v4,
@@ -153,9 +225,13 @@ async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<SocketAdd
     };
 
     match upnp::map_udp_port(local_ip, local_addr.port(), timeout).await {
-        Ok(addr) => {
-            tracing::info!("[socket] UPnP 映射成功 {addr}");
-            Some(addr)
+        Ok(mapping) => {
+            tracing::info!(
+                "[socket] UPnP 映射成功 {}（租约 {} 秒）",
+                mapping.external(),
+                mapping.lease()
+            );
+            Some(mapping)
         }
         Err(e) => {
             tracing::info!("[socket] UPnP 不可用（继续打洞）: {e}");

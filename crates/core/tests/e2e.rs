@@ -369,3 +369,70 @@ async fn wrong_expected_identity_is_rejected() {
         "失败原因应指向认证，而不是超时：{err}"
     );
 }
+
+/// 同一数据目录重新绑定，身份与证书指纹都不变——钉扎的前提。
+#[tokio::test]
+async fn persistent_identity_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("qp2p-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let first = Engine::bind_in("127.0.0.1:0".parse().unwrap(), &[], Some(&dir))
+        .await
+        .expect("首次绑定");
+    let (id, fp) = (first.node_id(), first.tls_fp());
+    drop(first);
+
+    let second = Engine::bind_in("127.0.0.1:0".parse().unwrap(), &[], Some(&dir))
+        .await
+        .expect("再次绑定");
+    assert_eq!(second.node_id(), id, "重启后 node_id 必须不变");
+    assert_eq!(second.tls_fp(), fp, "重启后证书指纹必须不变");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 钉扎对了能连，钉扎错了握手就失败（比认证失败更早）。
+#[tokio::test]
+async fn pinned_fingerprint_controls_handshake() {
+    let mut a = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let b = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let other = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+
+    // 先钉错：必须失败
+    a.expect_peer_fp(Some(&other.tls_fp())).expect("设置指纹");
+    let a_peers = [b.local_addr()];
+    let b_peers = [a.local_addr()];
+    let window = Duration::from_secs(3);
+    let (dialer, _listener) = tokio::join!(
+        a.punch(&a_peers, Role::Dialer, window),
+        b.punch(&b_peers, Role::Listener, window)
+    );
+    assert!(dialer.is_err(), "指纹不符时必须连不上");
+
+    // 再钉对：重新建一对端点
+    let mut a2 = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let b2 = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    a2.expect_peer_fp(Some(&b2.tls_fp())).expect("设置指纹");
+    let a2_peers = [b2.local_addr()];
+    let b2_peers = [a2.local_addr()];
+    let (dialer2, listener2) = tokio::join!(
+        a2.punch(&a2_peers, Role::Dialer, Duration::from_secs(10)),
+        b2.punch(&b2_peers, Role::Listener, Duration::from_secs(10))
+    );
+    assert!(dialer2.is_ok(), "指纹一致时应能连通: {:?}", dialer2.err());
+    assert!(
+        listener2.is_ok(),
+        "指纹一致时应能连通: {:?}",
+        listener2.err()
+    );
+}
