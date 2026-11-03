@@ -25,40 +25,42 @@ const MAX_NODES = 256; // 每个网络的上限
 const MAX_CANDIDATES = 16;
 const MAX_EVENTS = 50;
 const EVENT_TTL_MS = 300_000;
+const NODE_TTL_MS = 600_000; // 10 分钟没心跳就删，否则僵尸节点会占满 MAX_NODES
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 240; // 每 IP 每分钟请求数，防止误用把 D1 额度打满
 const SWEEP_INTERVAL_MS = 60_000;
 
-const DDL = `
-CREATE TABLE IF NOT EXISTS networks (
-  network_id TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  cidr       TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS nodes (
-  network_id TEXT NOT NULL,
-  node_id    TEXT NOT NULL,
-  name       TEXT NOT NULL,
-  pubkey     TEXT NOT NULL,
-  tls_fp     TEXT NOT NULL,
-  virtual_ip TEXT NOT NULL,
-  nat_type   TEXT NOT NULL,
-  advertise  TEXT NOT NULL,
-  candidates TEXT NOT NULL,
-  last_seen  INTEGER NOT NULL,
-  PRIMARY KEY (network_id, node_id)
-);
-CREATE TABLE IF NOT EXISTS events (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  network_id TEXT NOT NULL,
-  node_id    TEXT NOT NULL,
-  type       TEXT NOT NULL,
-  payload    TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS events_by_node ON events (network_id, node_id, id);
-`;
+// 逐条执行：D1 的 exec() 对多行语句的行为不同版本不一致，不赌它
+const DDL_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS networks (
+    network_id TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    cidr       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS nodes (
+    network_id TEXT NOT NULL,
+    node_id    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    pubkey     TEXT NOT NULL,
+    tls_fp     TEXT NOT NULL,
+    virtual_ip TEXT NOT NULL,
+    nat_type   TEXT NOT NULL,
+    advertise  TEXT NOT NULL,
+    candidates TEXT NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    PRIMARY KEY (network_id, node_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id TEXT NOT NULL,
+    node_id    TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS events_by_node ON events (network_id, node_id, id)`,
+];
 
 // ---------------------------------------------------------------------------
 // 入口
@@ -76,6 +78,9 @@ export default {
 
     if (url.pathname !== "/v1/health" && limited(request)) {
       return err(429, "rate_limited", `每 IP 每分钟最多 ${RATE_MAX} 次请求`);
+    }
+    if (url.pathname === "/v1/health" && limited(request, 60)) {
+      return err(429, "rate_limited", "health 每分钟最多 60 次");
     }
 
     let res;
@@ -149,11 +154,18 @@ async function health(request, env) {
   };
 
   if (storage === "d1") {
-    try {
-      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes").first();
-      out.nodes = Number(row?.n ?? 0);
-    } catch {
-      out.nodes = null;
+    // 计数走 60 秒缓存：health 免鉴权，不能让它变成免费的 D1 读放大器
+    const now = Date.now();
+    if (!healthCache.at || now - healthCache.at > 60_000) {
+      try {
+        const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes").first();
+        healthCache = { at: now, nodes: Number(row?.n ?? 0) };
+      } catch {
+        healthCache = { at: now, nodes: null };
+      }
+    }
+    out.nodes = healthCache.nodes;
+    if (healthCache.nodes === null) {
       out.ok = false;
       out.error = "schema_not_ready";
     }
@@ -238,17 +250,38 @@ async function joinOrRegister(request, env, url, needCandidates) {
   }
 
   const candidates = parseCandidates(body.candidates);
-  if (candidates === null) return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
+  if (candidates === null) {
+    return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
+  }
   if (needCandidates && candidates.length === 0) {
     return err(400, "missing_candidates", "register 至少需要一个候选地址");
   }
 
   const network = auth.network;
   const now = Date.now();
+
+  // 签名覆盖 op / 网络 / node / 时间戳 / 候选：
+  // 没有它，同网络任何成员都能用别人的 node_id 把候选改成自己的地址（MITM）
+  const message = needCandidates
+    ? signPayload("register", network.network_id, nodeId, candidates.join(","), body.ts)
+    : signPayload("join", network.network_id, nodeId, body.ts);
+  const bad = await verifyNodeSignature({ pubkey, message, sig: body.sig, ts: body.ts, now });
+  if (bad) return err(403, "bad_signature", bad);
+
   const existing = await getNode(env, network.network_id, nodeId);
   if (!existing) {
-    const count = await countNodes(env, network.network_id);
-    if (count >= MAX_NODES) return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点`);
+    const peersNow = await listNodes(env, network.network_id);
+    if (peersNow.length >= MAX_NODES) {
+      // 满了先淘汰最久没心跳的离线节点，否则僵尸节点会把网络永久占死
+      const victim = peersNow
+        .filter((n) => now - n.last_seen > OFFLINE_MS)
+        .sort((a, b) => a.last_seen - b.last_seen)[0];
+      if (!victim) {
+        return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);
+      }
+      await deleteNode(env, network.network_id, victim.node_id);
+      console.warn(`[signal] 淘汰僵尸节点 ${victim.node_id}`);
+    }
   }
 
   const others = await listNodes(env, network.network_id);
@@ -303,6 +336,16 @@ async function connect(request, env, url) {
   const self = await getNode(env, auth.network.network_id, from);
   if (!self) return err(404, "unknown_node", "发起方尚未注册");
 
+  const message = signPayload("connect", auth.network.network_id, from, target, body.ts);
+  const bad = await verifyNodeSignature({
+    pubkey: self.pubkey,
+    message,
+    sig: body.sig,
+    ts: body.ts,
+    now,
+  });
+  if (bad) return err(403, "bad_signature", bad);
+
   const peer = await getNode(env, auth.network.network_id, target);
   if (!peer) return err(404, "target_not_found", "对端不在这个网络里");
   if (now - peer.last_seen > OFFLINE_MS) return err(410, "target_offline", "对端心跳已超时");
@@ -310,14 +353,6 @@ async function connect(request, env, url) {
   const peerCandidates = JSON.parse(peer.candidates || "[]");
   if (peerCandidates.length === 0) {
     return err(409, "target_no_candidates", "对端还没有上报候选地址");
-  }
-
-  // 顺手刷新发起方的候选与心跳，省掉一次 register
-  const fresh = parseCandidates(body.candidates);
-  if (fresh && fresh.length > 0) {
-    self.candidates = JSON.stringify(fresh);
-    self.last_seen = now;
-    await putNode(env, self);
   }
 
   const t = now + 500;
@@ -347,17 +382,31 @@ async function events(request, env, url) {
     return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
   }
   const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
+  const ts = url.searchParams.get("ts");
 
   const now = Date.now();
   const node = await getNode(env, auth.network.network_id, nodeId);
   if (!node) return err(404, "unknown_node", "先 register 再拉事件");
+
+  const message = signPayload("events", auth.network.network_id, nodeId, ts);
+  const bad = await verifyNodeSignature({
+    pubkey: node.pubkey,
+    message,
+    sig: url.searchParams.get("sig"),
+    ts,
+    now,
+  });
+  if (bad) return err(403, "bad_signature", bad);
 
   // 轮询即心跳，但按 HEARTBEAT_MS 节流，避免把 D1 写额度烧在心跳上
   if (now - node.last_seen >= HEARTBEAT_MS) {
     await touchNode(env, auth.network.network_id, nodeId, now);
   }
 
-  const rows = await pullEvents(env, auth.network.network_id, nodeId, since, MAX_EVENTS);
+  // 首次拉取（since=0）只给最近 30 秒的事件：更早的 punch_request 已经没有意义，
+  // 交给客户端处理不如在这里就挡掉
+  const minCreatedAt = since === 0 ? now - 30_000 : 0;
+  const rows = await pullEvents(env, auth.network.network_id, nodeId, since, MAX_EVENTS, minCreatedAt);
   const cursor = rows.length > 0 ? rows[rows.length - 1].id : since;
 
   return json({
@@ -384,11 +433,15 @@ async function leave(request, env, url) {
     return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
   }
 
-  // 只能离开自己：凭 pubkey 派生关系校验身份
+  // 只能下线自己：要求 pubkey 与 node_id 匹配，且用这把私钥签了这次请求
   const pubkey = String(body.pubkey ?? "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(pubkey) || (await sha256Hex(hexToBytes(pubkey))).slice(0, 32) !== nodeId) {
     return err(403, "node_id_mismatch", "leave 需要提供与 node_id 对应的 pubkey");
   }
+
+  const message = signPayload("leave", auth.network.network_id, nodeId, body.ts);
+  const bad = await verifyNodeSignature({ pubkey, message, sig: body.sig, ts: body.ts, now: Date.now() });
+  if (bad) return err(403, "bad_signature", bad);
 
   await deleteNode(env, auth.network.network_id, nodeId);
   return json({ ok: true });
@@ -457,7 +510,9 @@ const migrated = new WeakSet(); // 每个 D1 绑定只建一次表
 async function ready(env) {
   if (!env.DB) return "memory";
   if (!migrated.has(env.DB)) {
-    await env.DB.exec(DDL);
+    for (const sql of DDL_STATEMENTS) {
+      await env.DB.prepare(sql).run();
+    }
     migrated.add(env.DB);
   }
   return "d1";
@@ -551,16 +606,6 @@ async function listNodes(env, networkId) {
   return results ?? [];
 }
 
-async function countNodes(env, networkId) {
-  if ((await ready(env)) === "memory") {
-    return [...memory.nodes.values()].filter((n) => n.network_id === networkId).length;
-  }
-  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes WHERE network_id = ?")
-    .bind(networkId)
-    .first();
-  return Number(row?.n ?? 0);
-}
-
 async function pushEvent(env, networkId, nodeId, type, payload) {
   const now = Date.now();
   if ((await ready(env)) === "memory") {
@@ -582,16 +627,24 @@ async function pushEvent(env, networkId, nodeId, type, payload) {
     .run();
 }
 
-async function pullEvents(env, networkId, nodeId, since, limit) {
+async function pullEvents(env, networkId, nodeId, since, limit, minCreatedAt = 0) {
   if ((await ready(env)) === "memory") {
     return memory.events
-      .filter((e) => e.network_id === networkId && e.node_id === nodeId && e.id > since)
+      .filter(
+        (e) =>
+          e.network_id === networkId &&
+          e.node_id === nodeId &&
+          e.id > since &&
+          e.created_at >= minCreatedAt,
+      )
       .slice(0, limit);
   }
   const { results } = await env.DB.prepare(
-    "SELECT id, type, payload FROM events WHERE network_id = ? AND node_id = ? AND id > ? ORDER BY id LIMIT ?",
+    `SELECT id, type, payload FROM events
+      WHERE network_id = ? AND node_id = ? AND id > ? AND created_at >= ?
+      ORDER BY id LIMIT ?`,
   )
-    .bind(networkId, nodeId, since, limit)
+    .bind(networkId, nodeId, since, minCreatedAt, limit)
     .all();
   return results ?? [];
 }
@@ -693,9 +746,20 @@ function parseCandidates(raw) {
     const port = Number(portText);
     if (port < 1 || port > 65535) return null;
     if (ip.split(".").some((part) => Number(part) > 255 || part === "")) return null;
+    if (!isDialable(ip)) return null;
     if (!out.includes(text)) out.push(text);
   }
   return out;
+}
+
+/// 只接受能当"对端地址"的 IP：回环、0.0.0.0、链路本地、组播/保留段一律拒绝。
+/// 否则任意成员都能登记第三方地址，让其他节点往那里持续发 QUIC 包。
+function isDialable(ip) {
+  const [a, b] = ip.split(".").map(Number);
+  if (a === 0 || a === 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a >= 224) return false;
+  return true;
 }
 
 function normalizeCidr(text) {
@@ -756,6 +820,49 @@ function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---------------------------------------------------------------------------
+// 请求签名：每个写操作都要节点私钥签名，令牌只证明"能进这个网络"
+// ---------------------------------------------------------------------------
+
+const SIGN_PREFIX = "qp2p1";
+const TS_WINDOW_MS = 120_000;
+
+/**
+ * 签名内容（用 `|` 连接，ts 固定在最后，客户端必须逐字一致）：
+ *   qp2p1|join|<network>|<node_id>|<ts>
+ *   qp2p1|register|<network>|<node_id>|<candidates 逗号连接>|<ts>
+ *   qp2p1|connect|<network>|<from>|<target>|<ts>
+ *   qp2p1|events|<network>|<node_id>|<ts>
+ *   qp2p1|leave|<network>|<node_id>|<ts>
+ */
+function signPayload(...parts) {
+  return [SIGN_PREFIX, ...parts.map((p) => String(p ?? ""))].join("|");
+}
+
+async function verifyNodeSignature({ pubkey, message, sig, ts, now }) {
+  const stamp = Number(ts);
+  if (!Number.isFinite(stamp)) return "缺少 ts（毫秒时间戳）";
+  if (Math.abs(now - stamp) > TS_WINDOW_MS) return "ts 超出 ±120 秒窗口";
+
+  const text = String(sig ?? "").toLowerCase();
+  if (!/^[0-9a-f]{128}$/.test(text)) return "sig 必须是 64 字节 Ed25519 签名的十六进制";
+
+  try {
+    const key = await crypto.subtle.importKey("raw", hexToBytes(pubkey), { name: "Ed25519" }, false, [
+      "verify",
+    ]);
+    const ok = await crypto.subtle.verify(
+      { name: "Ed25519" },
+      key,
+      hexToBytes(text),
+      new TextEncoder().encode(message),
+    );
+    return ok ? null : "签名不匹配";
+  } catch (e) {
+    return `无法校验签名：${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 function hexToBytes(text) {
   const out = new Uint8Array(text.length / 2);
   for (let i = 0; i < out.length; i += 1) out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
@@ -795,19 +902,20 @@ function timingSafeEqual(a, b) {
   return diff === 0;
 }
 
-const rate = new Map(); // ip -> { start, count }
+const rate = new Map(); // "ip|上限" -> { start, count }
 
-function limited(request) {
+function limited(request, max = RATE_MAX) {
   const ip = request.headers.get("cf-connecting-ip") ?? "local";
+  const bucket = `${ip}|${max}`;
   const now = Date.now();
-  const slot = rate.get(ip);
+  const slot = rate.get(bucket);
   if (!slot || now - slot.start > RATE_WINDOW_MS) {
     if (rate.size > 4096) rate.clear();
-    rate.set(ip, { start: now, count: 1 });
+    rate.set(bucket, { start: now, count: 1 });
     return false;
   }
   slot.count += 1;
-  return slot.count > RATE_MAX;
+  return slot.count > max;
 }
 
 const CORS = {
@@ -830,14 +938,29 @@ function err(status, code, detail) {
   return json({ ok: false, error: code, ...(detail ? { detail } : {}) }, status);
 }
 
-// 事件表清理：按间隔触发，避免每个请求都写一次
+// 事件与僵尸节点的清理：按间隔触发，避免每个请求都写一次
 const sweeper = { last: 0 };
+let healthCache = { at: 0, nodes: null };
+
 async function sweep(env) {
-  if (!env.DB) return 0;
-  if (Date.now() - sweeper.last < SWEEP_INTERVAL_MS) return 0;
-  sweeper.last = Date.now();
+  const now = Date.now();
+  if (now - sweeper.last < SWEEP_INTERVAL_MS) return 0;
+  sweeper.last = now;
+
+  const staleCutoff = now - EVENT_TTL_MS;
+  const nodeCutoff = now - NODE_TTL_MS;
+
+  if (!env.DB) {
+    memory.events = memory.events.filter((e) => e.created_at >= staleCutoff);
+    for (const [key, node] of memory.nodes) {
+      if (node.last_seen < nodeCutoff) memory.nodes.delete(key);
+    }
+    return 0;
+  }
+
   const { meta } = await env.DB.prepare("DELETE FROM events WHERE created_at < ?")
-    .bind(Date.now() - EVENT_TTL_MS)
+    .bind(staleCutoff)
     .run();
+  await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
   return meta?.changes ?? 0;
 }

@@ -19,6 +19,11 @@ const KIND_TCP: u8 = 1;
 const HEADER_LEN: usize = 7;
 const COPY_BUF: usize = 16 * 1024;
 
+/// 连目标要快于发起方的等待（5s），否则发起方先报超时，错误信息会误导。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 读目标头部也要有上限：恶意或半死的对端可以只开流不发头。
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 状态码：0 成功，其余为拒绝原因。
 const STATUS_OK: u8 = 0;
 const STATUS_DENIED: u8 = 1;
@@ -48,14 +53,26 @@ fn decode_target(header: &[u8; HEADER_LEN]) -> Result<SocketAddr> {
 ///
 /// `allowed` 是允许访问的目标白名单；为空表示拒绝一切（宁可不通，也不当代理）。
 pub async fn serve_flows(conn: Connection, allowed: Arc<Vec<SocketAddr>>) -> Result<()> {
+    tracing::info!(
+        "[link] 接流已启动 peer={} 白名单 {} 条",
+        conn.remote_address(),
+        allowed.len()
+    );
     loop {
-        let (send, recv) = conn.accept_bi().await.context("接受双向流失败")?;
-        let allowed = allowed.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_incoming_flow(send, recv, &allowed).await {
-                tracing::debug!("[link] 流处理结束: {e}");
+        match conn.accept_bi().await {
+            Ok((send, recv)) => {
+                let allowed = allowed.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_incoming_flow(send, recv, &allowed).await {
+                        tracing::debug!("[link] 流处理结束: {e}");
+                    }
+                });
             }
-        });
+            Err(e) => {
+                tracing::warn!("[link] 接流循环退出: {e}");
+                return Err(e).context("接受双向流失败");
+            }
+        }
     }
 }
 
@@ -65,8 +82,9 @@ async fn handle_incoming_flow(
     allowed: &[SocketAddr],
 ) -> Result<()> {
     let mut header = [0u8; HEADER_LEN];
-    recv.read_exact(&mut header)
+    tokio::time::timeout(HEADER_TIMEOUT, recv.read_exact(&mut header))
         .await
+        .context("读取目标头部超时")?
         .context("读取目标头部失败")?;
     let target = decode_target(&header)?;
 
@@ -77,10 +95,16 @@ async fn handle_incoming_flow(
         return Ok(());
     }
 
-    let tcp = match TcpStream::connect(target).await {
-        Ok(tcp) => tcp,
-        Err(e) => {
+    let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => {
             tracing::warn!("[link] 连接目标 {target} 失败: {e}");
+            let _ = send.write_all(&[STATUS_CONNECT_FAILED]).await;
+            let _ = send.finish();
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::warn!("[link] 连接目标 {target} 超时");
             let _ = send.write_all(&[STATUS_CONNECT_FAILED]).await;
             let _ = send.finish();
             return Ok(());
@@ -151,7 +175,10 @@ async fn open_flow(conn: &Connection, target: SocketAddr) -> Result<(SendStream,
     }
 }
 
-/// 双向搬运数据；任一方向结束就收尾，避免另一端挂住占名额。
+/// 双向搬运数据。
+///
+/// 用 `try_join!` 而不是 `select!`：TCP 是半关闭的，客户端 `shutdown(Write)`
+/// 之后往往还等着响应，此时上行结束不能把下行也丢掉。只有真正出错才提前收尾。
 async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
@@ -180,16 +207,8 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
         Ok::<(), anyhow::Error>(())
     };
 
-    tokio::pin!(up);
-    tokio::pin!(down);
-
-    let result = tokio::select! {
-        r = &mut up => r,
-        r = &mut down => r,
-    };
-
-    // 不需要显式 abort：两个 future 在这里被 drop，写端会随之关闭
-    result
+    tokio::try_join!(up, down)?;
+    Ok(())
 }
 
 #[cfg(test)]

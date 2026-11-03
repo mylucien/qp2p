@@ -23,9 +23,11 @@ qp2p — 私有打洞组网
   --bind     本地 UDP 监听地址，默认 0.0.0.0:51820
   --peer     对端 UDP 地址，可重复；所有候选会并行打洞
   --dialer   本端主动发起 QUIC 握手（node_id 较小的一方）
-  --listen   本机 TCP 监听地址，收到的连接转发到 --target
-  --target   对端侧要访问的目标地址（同时加入本端白名单）
-  --allow-target  额外允许对端访问的目标，可重复
+  --listen   本机 TCP 监听地址，收到的连接经隧道送到对端的 --target
+  --target   对端要去连的地址（由对端发起 TCP 连接，不是本机连它）
+  --serve    本机允许对端访问的地址，可重复；不填则拒绝一切入站
+             （通常填对端的 --target，两边要对称）
+  --allow-target  --serve 的别名，保留兼容
   --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
 
@@ -213,7 +215,20 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
 
     println!("本端 UDP: {}", engine.local_addr());
     println!("对端候选: {} 个  角色: {role:?}", peers.len());
-    println!("映射: {listen} → {target}（经对端）");
+    println!("映射: {listen} → {target}（连由对端发起）");
+
+    // 白名单是本端愿意替对端连的地址，不能拿自己的 --target 顶替：
+    // --target 是对端要连的地址，方向正好相反，两边 target 不同时必然全被拒。
+    let mut allow = flags.addrs("serve")?;
+    allow.extend(flags.addrs("allow-target")?);
+    allow.sort();
+    allow.dedup();
+    if allow.is_empty() {
+        println!("警告：未配置 --serve，本端会拒绝对端的一切入站请求");
+    } else {
+        let text: Vec<String> = allow.iter().map(ToString::to_string).collect();
+        println!("允许对端访问: {}", text.join(", "));
+    }
 
     let conn = engine
         .punch_with_retry(role, || peers.clone(), 2)
@@ -221,9 +236,6 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
         .context("打洞失败")?;
     println!("直连已建立 rtt={:?}", conn.rtt());
 
-    // 白名单只允许配置过的目标，避免被当成访问内网的开放代理
-    let mut allow = flags.addrs("allow-target")?;
-    allow.push(target);
     let allowed = std::sync::Arc::new(allow);
 
     let serve_conn = conn.clone();

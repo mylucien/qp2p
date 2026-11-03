@@ -65,16 +65,32 @@ curl -X POST https://<你的域名>/v1/admin/networks \
 服务端拿到令牌就地重算一遍比对即可，数据库里**不存任何密钥**。
 副作用是换 `ADMIN_SECRET` 等于全网重新发牌——这正是想要的行为。
 
-### 身份绑定
+### 身份与签名
 
 `node_id` 必须等于 `sha256(pubkey)[..32]`，否则 403。
-这样持有令牌的成员无法用别人的 `node_id` 覆盖其记录，也无法替别人下线。
-（更强的做法是让节点对请求签名，现在还没做，见文末。）
+
+但只有这个还不够：持有令牌的成员在 `peers` 里能看到别人的 `node_id`，
+如果不签名，他就能用 `from=<受害者>` 提交请求，把受害者的候选改成自己的地址
+（在 TLS 还没有对端认证的当下，这就是中间人）。
+
+所以 **join / register / connect / events / leave 全部要求节点私钥签名**：
+
+```
+qp2p1|join|<network>|<node_id>|<ts>
+qp2p1|register|<network>|<node_id>|<candidates,逗号连接>|<ts>
+qp2p1|connect|<network>|<from>|<target>|<ts>
+qp2p1|events|<network>|<node_id>|<ts>
+qp2p1|leave|<network>|<node_id>|<ts>
+```
+
+- `sig` = `hex(ed25519_sign(私钥, utf8(上面这行)))`，POST 放请求体，GET 放查询串
+- `ts` 是毫秒时间戳，服务端只接受 ±120 秒内的，防止重放
+- register 的签名覆盖候选列表，改一个地址签名就失效
 
 `pubkey` 是 32 字节 Ed25519 公钥的十六进制。手算 node_id：
 
 ```bash
-node -e 'crypto.subtle.digest("SHA-256", Buffer.from("'"$(cat pubkey.hex)'"","hex")).then(d=>console.log(Buffer.from(d).toString("hex").slice(0,32)))'
+node -e 'crypto.subtle.digest("SHA-256", Buffer.from(process.argv[1],"hex")).then(d=>console.log(Buffer.from(d).toString("hex").slice(0,32)))' <pubkey hex>
 ```
 
 ## 虚拟地址
@@ -108,7 +124,14 @@ node -e 'crypto.subtle.digest("SHA-256", Buffer.from("'"$(cat pubkey.hex)'"","he
 按 60 秒拉一次算，单 Worker 大约能带 **60~70 个节点**；
 30 秒拉一次大约 30~35 个。要带更多，就得换回有长连接的版本（那需要 Durable Object）。
 
-限流：每 IP 每分钟 240 次请求，超了直接 429。这是防误用，不是防攻击。
+限流：每 IP 每分钟 240 次请求（`/v1/health` 单独 60 次），超了直接 429。
+`/v1/health` 里的节点数是 60 秒缓存，不会变成免费的 D1 读放大器。
+
+僵尸节点：超过 **10 分钟**没有心跳的节点会被后台清理；网络满（256）时优先淘汰
+最久没心跳的离线节点，而不是直接拒绝新节点。
+
+首次拉事件（`since=0`）只返回最近 30 秒的 `punch_request`——更早的连接请求已经过期，
+交给客户端判断不如在服务端就挡掉。
 
 ## 本地测试
 
@@ -121,8 +144,10 @@ node signal/smoke.mjs
 
 ## 还没做的
 
-- **请求签名**：现在只校验 `node_id` 来自 `pubkey`，没校验请求确实由私钥持有人发出。
-  拿到令牌的人可以冒充**自己**的 node_id（但不能冒充别人的）。
+- **候选地址只挡了明显不可用的**（回环、0.0.0.0、链路本地、组播/保留段），
+  没做"这个 IP 属于不属于该成员"的校验——内网地址依然可以登记。
 - **服务端不下发时间对齐信息**：`server_ms` 有了，客户端还没用它做时钟估计。
 - **网络删除 / 成员踢除**：没有管理接口，只能换 `ADMIN_SECRET` 全网重来。
 - **审计**：没有连接日志。
+- **D1 的 UNIQUE 约束**没加，`assignIp` 在极端并发下仍可能撞地址（概率极低，
+  影响是两台机器同址）。
