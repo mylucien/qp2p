@@ -1,10 +1,13 @@
 //! 数据面：一条 QUIC 连接上的流复用。
 //!
 //! 每个 TCP 流映射成一条双向 QUIC 流，头部 7 字节声明目标地址：
-//! `[kind:u8][ip:4][port:2]`。这对应 DESIGN D7，只是 P3 阶段先做
-//! L4 端口映射，L3（TUN）在 P5 接入时复用同一套帧。
+//! `[kind:u8][ip:4][port:2]`，随后对端回 1 字节状态码，再开始搬数据。
+//!
+//! 安全边界：接受端只连**白名单里**的目标。否则任何能完成握手的人都能
+//! 把它当成访问内网/云元数据的开放代理。
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -12,24 +15,24 @@ use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::peer::punch;
-
 const KIND_TCP: u8 = 1;
 const HEADER_LEN: usize = 7;
 const COPY_BUF: usize = 16 * 1024;
 
-fn encode_target(addr: SocketAddr) -> [u8; HEADER_LEN] {
+/// 状态码：0 成功，其余为拒绝原因。
+const STATUS_OK: u8 = 0;
+const STATUS_DENIED: u8 = 1;
+const STATUS_CONNECT_FAILED: u8 = 2;
+
+fn encode_target(addr: SocketAddr) -> Result<[u8; HEADER_LEN]> {
+    let IpAddr::V4(v4) = addr.ip() else {
+        bail!("暂不支持 IPv6 目标：{addr}");
+    };
     let mut header = [0u8; HEADER_LEN];
     header[0] = KIND_TCP;
-    match addr.ip() {
-        std::net::IpAddr::V4(v4) => header[1..5].copy_from_slice(&v4.octets()),
-        std::net::IpAddr::V6(_) => {
-            // P3 只支持 IPv4 目标；IPv6 在 TUN 阶段一并处理
-            header[1..5].copy_from_slice(&[0, 0, 0, 0]);
-        }
-    }
+    header[1..5].copy_from_slice(&v4.octets());
     header[5..7].copy_from_slice(&addr.port().to_be_bytes());
-    header
+    Ok(header)
 }
 
 fn decode_target(header: &[u8; HEADER_LEN]) -> Result<SocketAddr> {
@@ -41,29 +44,50 @@ fn decode_target(header: &[u8; HEADER_LEN]) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip.into(), port))
 }
 
-/// 在被叫端接受来自对端的流，并连接本地目标。
-pub async fn serve_flows(conn: Connection) -> Result<()> {
+/// 在被叫端接受来自对端的流。
+///
+/// `allowed` 是允许访问的目标白名单；为空表示拒绝一切（宁可不通，也不当代理）。
+pub async fn serve_flows(conn: Connection, allowed: Arc<Vec<SocketAddr>>) -> Result<()> {
     loop {
         let (send, recv) = conn.accept_bi().await.context("接受双向流失败")?;
+        let allowed = allowed.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming_flow(send, recv).await {
+            if let Err(e) = handle_incoming_flow(send, recv, &allowed).await {
                 tracing::debug!("[link] 流处理结束: {e}");
             }
         });
     }
 }
 
-async fn handle_incoming_flow(send: SendStream, mut recv: RecvStream) -> Result<()> {
+async fn handle_incoming_flow(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    allowed: &[SocketAddr],
+) -> Result<()> {
     let mut header = [0u8; HEADER_LEN];
     recv.read_exact(&mut header)
         .await
         .context("读取目标头部失败")?;
     let target = decode_target(&header)?;
 
-    let tcp = TcpStream::connect(target)
-        .await
-        .with_context(|| format!("连接目标 {target} 失败"))?;
+    if !allowed.contains(&target) {
+        tracing::warn!("[link] 拒绝未授权目标 {target}");
+        let _ = send.write_all(&[STATUS_DENIED]).await;
+        let _ = send.finish();
+        return Ok(());
+    }
 
+    let tcp = match TcpStream::connect(target).await {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            tracing::warn!("[link] 连接目标 {target} 失败: {e}");
+            let _ = send.write_all(&[STATUS_CONNECT_FAILED]).await;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    send.write_all(&[STATUS_OK]).await.context("写状态码失败")?;
     pump(tcp, send, recv).await
 }
 
@@ -79,7 +103,15 @@ pub async fn forward_listen(
     tracing::info!("[link] 端口映射 {listen} → {target}");
 
     loop {
-        let (tcp, from) = listener.accept().await.context("接受本地连接失败")?;
+        let (tcp, from) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // 临时错误（EMFILE 等）不应该让整个转发退出
+                tracing::warn!("[link] accept 失败，继续: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let conn = conn.clone();
         tokio::spawn(async move {
             match open_flow(&conn, target).await {
@@ -96,17 +128,30 @@ pub async fn forward_listen(
 }
 
 async fn open_flow(conn: &Connection, target: SocketAddr) -> Result<(SendStream, RecvStream)> {
-    let (mut send, recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
         .await
         .context("打开流超时")?
         .context("打开流失败")?;
-    send.write_all(&encode_target(target))
+
+    send.write_all(&encode_target(target)?)
         .await
         .context("写入目标头部失败")?;
-    Ok((send, recv))
+
+    let mut status = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut status))
+        .await
+        .context("等待对端状态超时")?
+        .context("读取对端状态失败")?;
+
+    match status[0] {
+        STATUS_OK => Ok((send, recv)),
+        STATUS_DENIED => bail!("对端拒绝该目标 {target}"),
+        STATUS_CONNECT_FAILED => bail!("对端连接 {target} 失败"),
+        other => bail!("未知状态码 {other}"),
+    }
 }
 
-/// 双向搬运数据，任一方向结束就收尾。
+/// 双向搬运数据；任一方向结束就收尾，避免另一端挂住占名额。
 async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
@@ -126,8 +171,7 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
     let down = async {
         let mut buf = vec![0u8; COPY_BUF];
         loop {
-            let n = recv.read(&mut buf).await?;
-            match n {
+            match recv.read(&mut buf).await? {
                 Some(0) | None => break,
                 Some(n) => tcp_w.write_all(&buf[..n]).await?,
             }
@@ -136,43 +180,16 @@ async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Res
         Ok::<(), anyhow::Error>(())
     };
 
-    let (a, b) = tokio::join!(up, down);
-    a?;
-    b?;
-    Ok(())
-}
+    tokio::pin!(up);
+    tokio::pin!(down);
 
-/// 一步到位：打洞 + 转发。
-pub async fn connect_and_forward(
-    endpoint: &quinn::Endpoint,
-    peers: &[SocketAddr],
-    role: crate::peer::Role,
-    listen: SocketAddr,
-    target: SocketAddr,
-) -> Result<Connection> {
-    let start = tokio::time::Instant::now() + Duration::from_millis(300);
-    let conn = punch::execute(endpoint, peers, role, start, punch::DEFAULT_WINDOW)
-        .await
-        .context("打洞失败")?;
-    tracing::info!("[link] 直连已建立 rtt={:?}", conn.rtt());
+    let result = tokio::select! {
+        r = &mut up => r,
+        r = &mut down => r,
+    };
 
-    if matches!(role, crate::peer::Role::Listener) {
-        let conn_clone = conn.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_flows(conn_clone).await {
-                tracing::warn!("[link] 流服务退出: {e}");
-            }
-        });
-    }
-
-    let conn_for_forward = conn.clone();
-    tokio::spawn(async move {
-        if let Err(e) = forward_listen(conn_for_forward, listen, target).await {
-            tracing::warn!("[link] 转发退出: {e}");
-        }
-    });
-
-    Ok(conn)
+    // 不需要显式 abort：两个 future 在这里被 drop，写端会随之关闭
+    result
 }
 
 #[cfg(test)]
@@ -182,14 +199,20 @@ mod tests {
     #[test]
     fn header_roundtrip() {
         let addr: SocketAddr = "10.64.1.7:8080".parse().unwrap();
-        let header = encode_target(addr);
+        let header = encode_target(addr).unwrap();
         assert_eq!(header[0], KIND_TCP);
         assert_eq!(decode_target(&header).unwrap(), addr);
     }
 
     #[test]
+    fn rejects_ipv6_target() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        assert!(encode_target(addr).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_kind() {
-        let mut header = encode_target("10.64.1.7:80".parse().unwrap());
+        let mut header = encode_target("10.64.1.7:80".parse().unwrap()).unwrap();
         header[0] = 9;
         assert!(decode_target(&header).is_err());
     }

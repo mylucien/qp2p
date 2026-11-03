@@ -16,7 +16,7 @@ pub const SERVER_NAME: &str = "qp2p.local";
 
 fn transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_concurrent_bidi_streams(256u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
     transport

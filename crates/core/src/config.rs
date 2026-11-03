@@ -43,7 +43,7 @@ pub struct Config {
     pub forwards: Vec<Forward>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Network {
     pub id: String,
     pub token: String,
@@ -55,6 +55,19 @@ pub struct Network {
     /// 只出不进
     #[serde(default)]
     pub deny_inbound: bool,
+}
+
+/// 手写 Debug：token 里的 secret 绝不能进日志。
+impl std::fmt::Debug for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Network")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("route", &self.route)
+            .field("advertise", &self.advertise)
+            .field("deny_inbound", &self.deny_inbound)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]

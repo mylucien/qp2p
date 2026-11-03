@@ -9,24 +9,27 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-/// 候选地址来源。枚举顺序即优先级：内网 > STUN 映射 > UPnP 映射。
+/// 候选地址来源。枚举顺序即优先级：内网 > UPnP 映射 > STUN 映射。
+///
+/// UPnP 排在 srflx 前面，因为它是一个**确定存在**的端口转发；
+/// srflx 只是某个 NAT 给我们看到的映射，能否被对端打进来还要看过滤行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CandidateKind {
     /// 本机网卡地址，同一局域网内可直接用
     Host,
-    /// STUN 观测到的公网映射
-    Srflx,
     /// UPnP / NAT-PMP 主动申请的端口映射
     Upnp,
+    /// STUN 观测到的公网映射
+    Srflx,
 }
 
 impl CandidateKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Host => "host",
-            Self::Srflx => "srflx",
             Self::Upnp => "upnp",
+            Self::Srflx => "srflx",
         }
     }
 }
@@ -180,8 +183,8 @@ mod tests {
             vec![
                 CandidateKind::Host,
                 CandidateKind::Host,
-                CandidateKind::Srflx,
-                CandidateKind::Upnp
+                CandidateKind::Upnp,
+                CandidateKind::Srflx
             ]
         );
         assert_eq!(out[0].addr.ip().to_string(), "192.168.1.10");

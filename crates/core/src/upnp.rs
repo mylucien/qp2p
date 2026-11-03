@@ -17,8 +17,15 @@ pub async fn map_udp_port(local_ip: Ipv4Addr, port: u16, timeout: Duration) -> R
         .await
         .context("SSDP 任务失败")??;
 
+    // 只和局域网网关打交道：LOCATION 指向公网说明这不是可信的 IGD 响应
+    let location_host = host_of(&location).context("LOCATION 缺少主机名")?;
+    if !is_private_host(&location_host) {
+        bail!("拒绝非内网的 LOCATION: {location}");
+    }
+
     let client = reqwest::Client::builder()
         .timeout(timeout)
+        .no_proxy()
         .build()
         .context("构建 HTTP 客户端失败")?;
 
@@ -32,6 +39,9 @@ pub async fn map_udp_port(local_ip: Ipv4Addr, port: u16, timeout: Duration) -> R
         .context("读取设备描述失败")?;
 
     let (control_url, service) = parse_control(&xml, &location)?;
+    if host_of(&control_url).as_deref() != Some(location_host.as_str()) {
+        bail!("controlURL 主机与 LOCATION 不一致: {control_url}");
+    }
     let external_ip = get_external_ip(&client, &control_url, &service).await?;
     add_mapping(&client, &control_url, &service, local_ip, port).await?;
 
@@ -54,16 +64,38 @@ fn discover(timeout: Duration) -> Result<String> {
 
     let mut buf = [0u8; 2048];
     let n = socket.recv(&mut buf).context("没有收到 SSDP 响应")?;
-    let text = String::from_utf8_lossy(&buf[..n]);
+    let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
 
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("location:") {
-            let start = line.len() - rest.len();
-            return Ok(line[start..].trim().to_string());
+    // 只接受 InternetGatewayDevice 的响应，避免把无关设备当网关
+    if !text.contains("internetgatewaydevice") {
+        bail!("SSDP 响应不是 IGD");
+    }
+
+    let original = String::from_utf8_lossy(&buf[..n]);
+    for line in original.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim().eq_ignore_ascii_case("location") {
+                return Ok(value.trim().to_string());
+            }
         }
     }
     bail!("SSDP 响应中没有 LOCATION")
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let host_port = rest.split('/').next()?;
+    Some(host_port.split(':').next()?.to_string())
+}
+
+fn is_private_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<Ipv4Addr>() {
+        Ok(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        Err(_) => false,
+    }
 }
 
 /// 从设备描述里挑出 WAN*Connection 服务的 controlURL。
@@ -156,6 +188,23 @@ async fn add_mapping(
     local_ip: Ipv4Addr,
     port: u16,
 ) -> Result<()> {
+    // 有些路由器不支持非零租约，失败后用 0（永久）再试一次
+    if let Err(e) = add_mapping_with_lease(client, control_url, service, local_ip, port, 3600).await
+    {
+        tracing::debug!("[upnp] 非零租约失败，改用永久映射: {e}");
+        add_mapping_with_lease(client, control_url, service, local_ip, port, 0).await?;
+    }
+    Ok(())
+}
+
+async fn add_mapping_with_lease(
+    client: &reqwest::Client,
+    control_url: &str,
+    service: &str,
+    local_ip: Ipv4Addr,
+    port: u16,
+    lease: u32,
+) -> Result<()> {
     let body = format!(
         "<NewRemoteHost></NewRemoteHost>\
          <NewExternalPort>{port}</NewExternalPort>\
@@ -164,7 +213,7 @@ async fn add_mapping(
          <NewInternalClient>{local_ip}</NewInternalClient>\
          <NewEnabled>1</NewEnabled>\
          <NewPortMappingDescription>qp2p</NewPortMappingDescription>\
-         <NewLeaseDuration>3600</NewLeaseDuration>"
+         <NewLeaseDuration>{lease}</NewLeaseDuration>"
     );
     soap(client, control_url, service, "AddPortMapping", &body).await?;
     Ok(())

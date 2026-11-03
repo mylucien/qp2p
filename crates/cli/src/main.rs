@@ -24,8 +24,9 @@ qp2p — 私有打洞组网
   --peer     对端 UDP 地址，可重复；所有候选会并行打洞
   --dialer   本端主动发起 QUIC 握手（node_id 较小的一方）
   --listen   本机 TCP 监听地址，收到的连接转发到 --target
-  --target   对端侧要访问的目标地址
-  --stun     可重复；用同一个 UDP socket 探测公网映射
+  --target   对端侧要访问的目标地址（同时加入本端白名单）
+  --allow-target  额外允许对端访问的目标，可重复
+  --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
 
 fn main() -> ExitCode {
@@ -181,7 +182,7 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
     println!("对端候选: {} 个  角色: {role:?}", peers.len());
 
     let conn = engine
-        .punch_with_retry(role, || peers.clone(), 3)
+        .punch_with_retry(role, || peers.clone(), 2)
         .await
         .context("打洞失败")?;
     println!(
@@ -190,15 +191,17 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
         conn.remote_address()
     );
 
-    if role == Role::Listener {
-        let conn_for_flows = conn.clone();
-        tokio::spawn(async move {
-            let _ = link::serve_flows(conn_for_flows).await;
-        });
-    }
+    // 两端都接流：单向只让 listener 接会导致反方向流量永远挂住
+    let allowed = std::sync::Arc::new(Vec::new());
+    let serve_conn = conn.clone();
+    tokio::spawn(async move {
+        let _ = link::serve_flows(serve_conn, allowed).await;
+    });
 
-    tokio::signal::ctrl_c().await.context("等待中断信号失败")?;
-    println!("收到中断，退出");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => println!("收到中断，退出"),
+        reason = conn.closed() => println!("连接已关闭（{reason}），退出"),
+    }
     Ok(())
 }
 
@@ -213,26 +216,35 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
     println!("映射: {listen} → {target}（经对端）");
 
     let conn = engine
-        .punch_with_retry(role, || peers.clone(), 3)
+        .punch_with_retry(role, || peers.clone(), 2)
         .await
         .context("打洞失败")?;
     println!("直连已建立 rtt={:?}", conn.rtt());
 
-    if role == Role::Listener {
-        let conn_for_flows = conn.clone();
-        tokio::spawn(async move {
-            let _ = link::serve_flows(conn_for_flows).await;
-        });
-    }
+    // 白名单只允许配置过的目标，避免被当成访问内网的开放代理
+    let mut allow = flags.addrs("allow-target")?;
+    allow.push(target);
+    let allowed = std::sync::Arc::new(allow);
+
+    let serve_conn = conn.clone();
+    let serve_allowed = allowed.clone();
+    tokio::spawn(async move {
+        let _ = link::serve_flows(serve_conn, serve_allowed).await;
+    });
 
     let forward_conn = conn.clone();
-    let forward =
+    let mut forward =
         tokio::spawn(async move { link::forward_listen(forward_conn, listen, target).await });
     println!("开始转发，Ctrl+C 退出");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("收到中断，退出"),
-        res = forward => println!("转发任务结束：{res:?}"),
+        reason = conn.closed() => println!("连接已关闭（{reason}），退出"),
+        res = &mut forward => match res {
+            Ok(Ok(())) => println!("转发任务结束"),
+            Ok(Err(e)) => println!("转发任务失败：{e:#}"),
+            Err(e) => println!("转发任务异常：{e}"),
+        },
     }
     Ok(())
 }

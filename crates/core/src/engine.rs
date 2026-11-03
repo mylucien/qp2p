@@ -2,10 +2,10 @@
 //!
 //! 外壳（CLI / 桌面 / Android）都只和这一层打交道。
 //!
-//! 三项提升成功率的能力都在这里：
-//! - **并行候选**：一次打洞喂进整组候选地址
-//! - **重试前刷新**：每轮重试重建端点、重新 STUN，避免用过期映射
-//! - **失败期间保活**：重试间隔里往已知地址发小包，让 NAT 映射不过期
+//! 三条与成功率相关的策略：
+//! - **不依赖启动对齐**：dialer 短超时、listener 长守候，先起后起都能连上
+//! - **重试前刷新**：重建端点、重新 STUN，避免拿过期映射硬打
+//! - **失败期保活**：重试间隔里往已知地址发小包，防止 NAT 映射被回收
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,11 +16,15 @@ use quinn::Connection;
 use tokio::time::Instant;
 
 use crate::candidate::Candidate;
-use crate::peer::{backoff_ms, punch, Role};
+use crate::peer::{punch, Role};
 use crate::socket;
 
-/// 打洞前给对端的准备时间：双方都要先拿到对端地址。
-const ALIGN_DELAY: Duration = Duration::from_millis(300);
+/// dialer 单轮打洞时长：够覆盖对端启动晚几秒的情况。
+const DIAL_ATTEMPT: Duration = Duration::from_secs(10);
+/// listener 单轮守候时长：先启动的一方要能等到后启动的一方。
+const LISTEN_ATTEMPT: Duration = Duration::from_secs(35);
+/// 两轮之间的间隔。
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// 失败期间的保活间隔。家用 NAT 的 UDP 映射常见 30s~120s 回收。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// 保活包：3 字节魔数 + 类型，对端 quinn 会当作无效 QUIC 包丢弃。
@@ -34,7 +38,6 @@ pub struct Engine {
     srflx: Option<SocketAddr>,
     upnp: Option<SocketAddr>,
     candidates: Vec<Candidate>,
-    /// 复制自 quinn 的同一个 UDP socket；renw 前必须释放，否则端口一直被占
     keepalive: Option<Arc<std::net::UdpSocket>>,
 }
 
@@ -54,8 +57,8 @@ impl Engine {
         })
     }
 
-    pub fn endpoint(&self) -> &quinn::Endpoint {
-        self.endpoint.as_ref().expect("endpoint 未初始化")
+    pub fn endpoint(&self) -> Option<&quinn::Endpoint> {
+        self.endpoint.as_ref()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -76,8 +79,8 @@ impl Engine {
 
     /// 关闭当前端点，在同一个端口上重建，并重新做 STUN / UPnP。
     ///
-    /// 用于重试：NAT 映射可能已经变了，拿着旧候选再打只是浪费窗口。
-    /// 只应在没有活跃连接时调用。
+    /// 失败时端点保持关闭并返回错误，调用方下一轮会拿到"端点不可用"，
+    /// 不会 panic。只应在没有活跃连接时调用。
     pub async fn renew(&mut self) -> Result<()> {
         if let Some(endpoint) = self.endpoint.take() {
             endpoint.close(0u32.into(), b"renew");
@@ -128,15 +131,17 @@ impl Engine {
         tracing::info!("[engine] 端点已刷新 addr={}", self.local_addr);
     }
 
-    /// 对一组候选地址打洞。
+    /// 对一组候选地址打洞；`timeout` 由角色决定。
     pub async fn punch(
         &self,
         peers: &[SocketAddr],
         role: Role,
-        window: Duration,
+        timeout: Duration,
     ) -> Result<Connection, punch::PunchError> {
-        let start = Instant::now() + ALIGN_DELAY;
-        punch::execute(self.endpoint(), peers, role, start, window).await
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return Err(punch::PunchError::Dial("端点不可用".to_string()));
+        };
+        punch::execute(endpoint, peers, role, timeout).await
     }
 
     /// 带重试的打洞：每轮开始前刷新自己的映射，并重新取对端候选。
@@ -152,15 +157,19 @@ impl Engine {
         F: FnMut() -> Vec<SocketAddr>,
     {
         let attempts = attempts.max(1);
-        let mut last = punch::PunchError::Timeout;
+        let mut last = punch::PunchError::Timeout(Duration::ZERO);
+        let timeout = match role {
+            Role::Dialer => DIAL_ATTEMPT,
+            Role::Listener => LISTEN_ATTEMPT,
+        };
 
         for attempt in 0..attempts {
             if attempt > 0 {
-                let wait = Duration::from_millis(backoff_ms(attempt - 1));
                 let known = peers();
-                self.sleep_with_keepalive(wait, &known).await;
+                self.sleep_with_keepalive(RETRY_DELAY, &known).await;
                 if let Err(e) = self.renew().await {
-                    tracing::warn!("[engine] 端点刷新失败，继续用旧端点: {e}");
+                    tracing::warn!("[engine] 端点刷新失败，将放弃后续重试: {e}");
+                    return Err(punch::PunchError::Dial(format!("端点刷新失败: {e}")));
                 }
             }
 
@@ -170,12 +179,13 @@ impl Engine {
                 continue;
             }
             tracing::info!(
-                "[engine] 第 {} 轮打洞，候选 {} 个",
+                "[engine] 第 {} 轮打洞，候选 {} 个，最长 {:?}",
                 attempt + 1,
-                known.len()
+                known.len(),
+                timeout
             );
 
-            match self.punch(&known, role, punch::DEFAULT_WINDOW).await {
+            match self.punch(&known, role, timeout).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     tracing::warn!("[engine] 第 {} 轮失败: {e}", attempt + 1);
@@ -198,20 +208,14 @@ impl Engine {
             let chunk = (deadline - now).min(KEEPALIVE_INTERVAL);
             tokio::time::sleep(chunk).await;
 
+            let Some(socket) = &self.keepalive else {
+                return;
+            };
             for peer in peers {
-                match &self.keepalive {
-                    Some(socket) => {
-                        if let Err(e) = socket.send_to(KEEPALIVE_MAGIC, peer) {
-                            tracing::debug!("[engine] 保活失败 {peer}: {e}");
-                        }
-                    }
-                    None => return,
+                if let Err(e) = socket.send_to(KEEPALIVE_MAGIC, peer) {
+                    tracing::debug!("[engine] 保活失败 {peer}: {e}");
                 }
             }
         }
-    }
-
-    pub async fn wait_idle(&self) {
-        self.endpoint().wait_idle().await;
     }
 }

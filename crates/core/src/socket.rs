@@ -92,30 +92,32 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-/// 依次尝试配置里的 STUN 服务器，拿第一个成功的结果。
+/// 依次尝试配置里的 STUN 服务器（支持域名），拿第一个成功的结果。
 async fn probe_stun(
     socket: &std::net::UdpSocket,
     servers: &[String],
     timeout: Duration,
 ) -> Option<SocketAddr> {
     let socket = socket.try_clone().ok()?;
-
-    let mut addrs = Vec::new();
-    for server in servers {
-        match server.parse::<SocketAddr>() {
-            Ok(addr) => addrs.push(addr),
-            Err(_) => tracing::warn!("[socket] STUN 地址格式无效: {server}"),
-        }
-    }
+    let servers: Vec<String> = servers.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        for server in addrs {
-            match stun::probe_blocking(&socket, server, timeout) {
-                Ok(addr) => {
-                    tracing::info!("[socket] STUN {server} 观测到公网映射 {addr}");
-                    return Some(addr);
+        for server in servers {
+            let addrs = match resolve(&server) {
+                Some(addrs) => addrs,
+                None => {
+                    tracing::warn!("[socket] STUN 地址无法解析: {server}");
+                    continue;
                 }
-                Err(e) => tracing::info!("[socket] STUN {server} 探测失败: {e}"),
+            };
+            for addr in addrs {
+                match stun::probe_blocking(&socket, addr, timeout) {
+                    Ok(mapped) => {
+                        tracing::info!("[socket] STUN {server} 观测到公网映射 {mapped}");
+                        return Some(mapped);
+                    }
+                    Err(e) => tracing::info!("[socket] STUN {server} ({addr}) 探测失败: {e}"),
+                }
             }
         }
         None
@@ -125,10 +127,31 @@ async fn probe_stun(
     .flatten()
 }
 
+/// `host:port` 解析，支持域名。
+fn resolve(server: &str) -> Option<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    match server.to_socket_addrs() {
+        Ok(addrs) => {
+            let list: Vec<SocketAddr> = addrs.collect();
+            (!list.is_empty()).then_some(list)
+        }
+        Err(_) => None,
+    }
+}
+
 async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
-    let IpAddr::V4(local_ip) = local_addr.ip() else {
-        return None;
+    // 绑 0.0.0.0 时不能把 0.0.0.0 当内网地址发给路由器
+    let local_ip = match local_addr.ip() {
+        IpAddr::V4(v4) if !v4.is_unspecified() => v4,
+        _ => match primary_ipv4() {
+            Some(ip) => ip,
+            None => {
+                tracing::info!("[socket] 拿不到本机出口地址，跳过 UPnP");
+                return None;
+            }
+        },
     };
+
     match upnp::map_udp_port(local_ip, local_addr.port(), timeout).await {
         Ok(addr) => {
             tracing::info!("[socket] UPnP 映射成功 {addr}");
@@ -142,6 +165,9 @@ async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<SocketAdd
 }
 
 /// 枚举本机网卡地址作为内网候选。
+///
+/// 过滤掉链路本地地址和虚拟网卡（docker / Hyper-V / VMware 等）：
+/// 这些地址通告出去只会让别人打到错误的设备。
 fn host_candidates(local_addr: SocketAddr, requested: SocketAddr) -> Vec<Candidate> {
     let mut out = Vec::new();
     if !requested.ip().is_unspecified() {
@@ -150,10 +176,13 @@ fn host_candidates(local_addr: SocketAddr, requested: SocketAddr) -> Vec<Candida
 
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for iface in interfaces {
-            if iface.is_loopback() {
+            if iface.is_loopback() || is_virtual_interface(&iface.name) {
                 continue;
             }
             if let IpAddr::V4(v4) = iface.ip() {
+                if v4.is_link_local() || v4.is_unspecified() {
+                    continue;
+                }
                 out.push(Candidate::new(
                     CandidateKind::Host,
                     SocketAddr::new(IpAddr::V4(v4), local_addr.port()),
@@ -162,6 +191,23 @@ fn host_candidates(local_addr: SocketAddr, requested: SocketAddr) -> Vec<Candida
         }
     }
     out
+}
+
+fn is_virtual_interface(name: &str) -> bool {
+    const VIRTUAL: [&str; 10] = [
+        "docker",
+        "veth",
+        "br-",
+        "vmnet",
+        "vboxnet",
+        "vethernet",
+        "hyper-v",
+        "tailscale",
+        "utun",
+        "tun",
+    ];
+    let lower = name.to_ascii_lowercase();
+    VIRTUAL.iter().any(|prefix| lower.contains(prefix))
 }
 
 /// 取本机出口 IPv4（不发包，只让内核选路）。
