@@ -15,7 +15,7 @@
 | P4 | CLI：`punch` / `forward` / `doctor` | ✅（控制接口与信令客户端未接） |
 | P5 | Linux TUN + 路由下发 | ⬜ |
 | P6–P8 | Windows / Android 前端 | ⬜ |
-| P9 | 信令 Worker（多租户 + DO + WS） | 🟡 代码完成，未部署联调 |
+| P9 | 信令 Worker（单文件 + D1） | 🟡 代码与本地测试完成，未部署联调 |
 
 ## 快速开始（当前可用）
 
@@ -62,7 +62,15 @@ qp2p forward --bind 0.0.0.0:51820 --peer 192.168.1.10:51820 --dialer \
 - 只有 UPnP，没有 NAT-PMP / PCP；UPnP 映射不续租、退出不删除
 - 只有 L4 端口映射，没有 TUN（P5）
 - 没有 NAT 模拟器，跨 NAT 场景只能在真实网络验证
-- 信令 Worker 尚未处理 DO 休眠丢状态、身份可伪造等问题
+- 信令 Worker 用轮询而不是推送（否则需要 Durable Object），被动方知道连接请求会晚 20~60 秒
+
+## 信令服务
+
+`signal/worker.js` 是**单文件**，粘进 Cloudflare Dashboard 点 Deploy 就能用，
+不需要 wrangler、不需要构建、不需要 Durable Object；绑一个 D1 作为存储，表会自动创建。
+
+详细部署步骤、接口、额度估算见 [signal/README.md](signal/README.md)，
+本地冒烟测试 `node signal/smoke.mjs`（不需要云环境）。
 
 ## 构建与测试
 
@@ -101,7 +109,7 @@ crates/core      协议核心（无前端依赖）
   identity.rs    Ed25519 身份、node_id、虚拟地址派生
   config.rs      TOML 配置与校验
 crates/cli       命令行前端（punch / forward / doctor）
-signal           Cloudflare Worker 信令面（多租户 + Durable Object）
+signal           单文件 Cloudflare Worker 信令面 + 本地冒烟测试
 ```
 
 ## 平台计划

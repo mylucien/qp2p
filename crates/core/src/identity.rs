@@ -203,4 +203,32 @@ mod tests {
         let b = derive_virtual_ip(&Identity::generate().node_id(), net, 16, 0);
         assert_ne!(a, b);
     }
+
+    /// 与 signal/worker.js 的 deriveVirtualIp 共用一组向量，两边算法一旦跑偏就会被抓出来。
+    #[test]
+    fn virtual_ip_matches_signaling_vectors() {
+        let net = Ipv4Addr::new(10, 64, 0, 0);
+        let cases = [
+            (
+                "0123456789abcdef0123456789abcdef",
+                ["10.64.158.142", "10.64.193.155", "10.64.30.74"],
+            ),
+            (
+                "ffffffffffffffffffffffffffffffff",
+                ["10.64.159.126", "10.64.129.186", "10.64.197.198"],
+            ),
+            (
+                "3f9a1b2c3d4e5f60718293a4b5c6d7e8",
+                ["10.64.128.239", "10.64.71.59", "10.64.251.83"],
+            ),
+        ];
+
+        for (id, expected) in cases {
+            let node = NodeId::parse(id).expect("合法 node_id");
+            for (salt, want) in [0u32, 1, 7].iter().zip(expected) {
+                let got = derive_virtual_ip(&node, net, 16, *salt).to_string();
+                assert_eq!(got, want, "node={id} salt={salt}");
+            }
+        }
+    }
 }
