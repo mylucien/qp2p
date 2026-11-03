@@ -27,6 +27,8 @@ qp2p — 私有打洞组网
   --target   对端要去连的地址（由对端发起 TCP 连接，不是本机连它）
   --serve    本机允许对端访问的地址，可重复；不填则拒绝一切入站
              （通常填对端的 --target，两边要对称）
+  --peer-id  要求对端必须是指定的 node_id（64 位十六进制前缀，32 字符）
+             不填则只验签、不限定具体身份
   --allow-target  --serve 的别名，保留兼容
   --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
@@ -158,6 +160,8 @@ async fn cmd_doctor(args: &[String]) -> Result<()> {
     }
 
     let engine = Engine::bind(bind, &stun).await.context("绑定失败")?;
+    println!("node_id: {}", engine.node_id());
+    println!("pubkey : {}", engine.public_key_hex());
     println!("udp  local: {}", engine.local_addr());
     match engine.srflx() {
         Some(addr) => println!("udp  公网: {addr}"),
@@ -178,6 +182,7 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
     let (mut engine, peers, role) = prepare(&flags).await?;
 
     println!("本端 UDP: {}", engine.local_addr());
+    println!("本端 node_id: {}", engine.node_id());
     for candidate in engine.candidates() {
         println!("candidate {candidate}");
     }
@@ -214,6 +219,7 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
     let target = flags.addr("target", None)?;
 
     println!("本端 UDP: {}", engine.local_addr());
+    println!("本端 node_id: {}", engine.node_id());
     println!("对端候选: {} 个  角色: {role:?}", peers.len());
     println!("映射: {listen} → {target}（连由对端发起）");
 
@@ -275,8 +281,16 @@ async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
     } else {
         Role::Listener
     };
-    let engine = Engine::bind(bind, &flags.many("stun"))
+    let mut engine = Engine::bind(bind, &flags.many("stun"))
         .await
         .context("绑定 UDP 失败")?;
+
+    // 打洞成功后双方会交换身份并互相验签；给了 --peer-id 就要求必须是它
+    if let Some(raw) = flags.get("peer-id") {
+        let id = qp2p_core::identity::NodeId::parse(raw)
+            .with_context(|| format!("--peer-id 格式不对（要 32 位十六进制）：{raw}"))?;
+        engine.expect_peer(Some(id));
+    }
+
     Ok((engine, peers, role))
 }

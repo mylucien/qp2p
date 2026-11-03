@@ -313,3 +313,59 @@ async fn renew_keeps_engine_usable() {
     assert!(dialer.is_ok(), "刷新后打洞失败: {:?}", dialer.err());
     assert!(listener.is_ok(), "刷新后打洞失败: {:?}", listener.err());
 }
+
+/// 双方都知道对方 node_id 时，认证通过，连接可用。
+#[tokio::test]
+async fn peer_authentication_succeeds_with_matching_ids() {
+    let mut a = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let mut b = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+
+    let (ida, idb) = (a.node_id(), b.node_id());
+    a.expect_peer(Some(idb.clone()));
+    b.expect_peer(Some(ida));
+
+    let a_peers = [b.local_addr()];
+    let b_peers = [a.local_addr()];
+    let window = Duration::from_secs(10);
+    let (dialer, listener) = tokio::join!(
+        a.punch(&a_peers, Role::Dialer, window),
+        b.punch(&b_peers, Role::Listener, window)
+    );
+    assert!(dialer.is_ok(), "认证对齐时应能连通: {:?}", dialer.err());
+    assert!(listener.is_ok(), "认证对齐时应能连通: {:?}", listener.err());
+}
+
+/// 期望的身份对不上时必须拒绝——这正是"能握手不等于能通信"的分界。
+#[tokio::test]
+async fn wrong_expected_identity_is_rejected() {
+    let mut a = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let b = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+
+    // 冒充者：给一个和 b 不同的 identity
+    let impostor = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    a.expect_peer(Some(impostor.node_id()));
+
+    let a_peers = [b.local_addr()];
+    let b_peers = [a.local_addr()];
+    let window = Duration::from_secs(4);
+    let (dialer, _listener) = tokio::join!(
+        a.punch(&a_peers, Role::Dialer, window),
+        b.punch(&b_peers, Role::Listener, window)
+    );
+
+    let err = dialer.expect_err("对端身份不符时必须失败");
+    assert!(
+        format!("{err}").contains("认证"),
+        "失败原因应指向认证，而不是超时：{err}"
+    );
+}

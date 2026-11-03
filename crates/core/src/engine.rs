@@ -16,6 +16,7 @@ use quinn::Connection;
 use tokio::time::Instant;
 
 use crate::candidate::Candidate;
+use crate::identity::{Identity, NodeId};
 use crate::peer::{punch, Role};
 use crate::socket;
 
@@ -46,6 +47,10 @@ pub struct Engine {
     upnp: Option<SocketAddr>,
     candidates: Vec<Candidate>,
     keepalive: Option<Arc<std::net::UdpSocket>>,
+    /// 本节点身份。打洞成功后的对端认证用它签名。
+    identity: Identity,
+    /// 期望的对端 node_id；None 表示"验签但不校验具体是谁"。
+    expected_peer: Option<NodeId>,
 }
 
 impl Engine {
@@ -61,7 +66,29 @@ impl Engine {
             upnp: bound.upnp,
             candidates: bound.candidates,
             keepalive: Some(bound.keepalive),
+            identity: Identity::generate(),
+            expected_peer: None,
         })
+    }
+
+    /// 本节点标识（`hex(sha256(pubkey))[..32]`）。
+    pub fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+
+    /// 本节点的公钥指纹，可用于人工核对。
+    pub fn public_key(&self) -> [u8; 32] {
+        self.identity.public_key()
+    }
+
+    /// 公钥的十六进制形式（64 字符），方便打印和人工比对。
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.public_key())
+    }
+
+    /// 要求对端必须是这个 node_id；不设置则只验签、不限身份。
+    pub fn expect_peer(&mut self, peer: Option<NodeId>) {
+        self.expected_peer = peer;
     }
 
     pub fn endpoint(&self) -> Option<&quinn::Endpoint> {
@@ -152,8 +179,13 @@ impl Engine {
             return Err(punch::PunchError::Dial("端点不可用".to_string()));
         };
 
+        let handles = punch::AuthHandles {
+            identity: self.identity.clone(),
+            expected: self.expected_peer.clone(),
+        };
+
         let probe = self.spawn_probe(peers, timeout);
-        let result = punch::execute(endpoint, peers, role, timeout).await;
+        let result = punch::execute(endpoint, peers, role, timeout, Some(handles)).await;
         if let Some(task) = probe {
             task.abort();
         }
@@ -226,6 +258,11 @@ impl Engine {
 
             match self.punch(&known, role, timeout).await {
                 Ok(conn) => return Ok(conn),
+                // 身份不对不是网络问题：刷新端点、换个时刻重试都不会变
+                Err(e @ punch::PunchError::Auth(_)) => {
+                    tracing::warn!("[engine] 第 {} 轮失败: {e}", attempt + 1);
+                    return Err(e);
+                }
                 Err(e) => {
                     tracing::warn!("[engine] 第 {} 轮失败: {e}", attempt + 1);
                     last = e;

@@ -15,7 +15,8 @@ use quinn::{Connection, Endpoint};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::peer::Role;
+use crate::identity::{Identity, NodeId};
+use crate::peer::{auth, Role};
 use crate::tls::SERVER_NAME;
 
 /// 单次握手等待上限，超时就再发一轮。
@@ -41,6 +42,19 @@ pub enum PunchError {
     Timeout(Duration),
     #[error("连接失败：{0}")]
     Dial(String),
+    /// 身份不对：重试没有意义，调用方应当直接停下
+    #[error("对端认证失败：{0}")]
+    Auth(String),
+}
+
+/// 连接建立后要做的一次对端认证。
+///
+/// QUIC 这一层没有证书校验，能完成握手不等于对面是谁；
+/// 真正决定"这条连接能不能用"的是这里的签名交换。
+#[derive(Clone)]
+pub struct AuthHandles {
+    pub identity: Identity,
+    pub expected: Option<NodeId>,
 }
 
 /// 在给定时间内尝试建立直连。
@@ -52,13 +66,58 @@ pub async fn execute(
     candidates: &[SocketAddr],
     role: Role,
     timeout: Duration,
+    auth: Option<AuthHandles>,
 ) -> Result<Connection, PunchError> {
     if candidates.is_empty() {
         return Err(PunchError::NoCandidates);
     }
     match role {
-        Role::Dialer => dial_all(endpoint, candidates, timeout).await,
-        Role::Listener => listen_with_probes(endpoint, candidates, timeout).await,
+        Role::Dialer => dial_all(endpoint, candidates, timeout, auth).await,
+        Role::Listener => listen_with_probes(endpoint, candidates, timeout, auth).await,
+    }
+}
+
+/// 单次尝试的失败原因。
+///
+/// 区分"网络不通"和"对面身份不对"：前者值得换个时刻再试，
+/// 后者是确定的结论——重试只会一直失败，而且会把有用的信息盖成"超时"。
+enum AttemptError {
+    Transient(String),
+    Auth(String),
+}
+
+impl AttemptError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Transient(m) | Self::Auth(m) => m,
+        }
+    }
+}
+
+/// 双方交换身份并互相验签；失败就关掉这条连接，当作一次失败的尝试。
+async fn verify_peer(
+    conn: &Connection,
+    handles: &Option<AuthHandles>,
+    dialer: bool,
+) -> Result<(), String> {
+    let Some(handles) = handles else {
+        return Ok(());
+    };
+    let identity = &handles.identity;
+    let expected = handles.expected.as_ref();
+
+    let result = if dialer {
+        auth::authenticate_dialer(conn, identity, expected).await
+    } else {
+        auth::authenticate_listener(conn, identity, expected).await
+    };
+
+    match result {
+        Ok(peer) => {
+            tracing::info!("[punch] 对端认证通过 peer={}", peer.node_id);
+            Ok(())
+        }
+        Err(e) => Err(format!("对端认证失败: {e:#}")),
     }
 }
 
@@ -66,6 +125,7 @@ async fn dial_all(
     endpoint: &Endpoint,
     candidates: &[SocketAddr],
     timeout: Duration,
+    auth: Option<AuthHandles>,
 ) -> Result<Connection, PunchError> {
     // dialer 不接收入站，但必须排空 accept 队列，否则对端探针会堆积
     let drain = endpoint.clone();
@@ -87,11 +147,12 @@ async fn dial_all(
         // 每个候选只发一条连接，让 QUIC 自己重传 Initial；
         // 以前每 150ms 新建一条，10 秒就是几百次握手，还会让两端各自
         // 选中不同的连接（已复现：一端拿到连接后立刻被对端关掉）。
-        let mut attempts: JoinSet<Result<Connection, String>> = JoinSet::new();
+        let mut attempts: JoinSet<Result<Connection, AttemptError>> = JoinSet::new();
         for addr in candidates {
             let endpoint = endpoint.clone();
             let addr = *addr;
-            attempts.spawn(async move { attempt_once(&endpoint, addr, deadline).await });
+            let auth = auth.clone();
+            attempts.spawn(async move { attempt_once(&endpoint, addr, deadline, auth).await });
         }
 
         let mut winner = None;
@@ -101,7 +162,13 @@ async fn dial_all(
                     winner = Some(conn);
                     break;
                 }
-                Ok(Err(e)) => last_error = e,
+                Ok(Err(AttemptError::Auth(msg))) => {
+                    // 身份不对不是网络抖动，重试没有意义，立刻收尾并把原因说清楚
+                    attempts.abort_all();
+                    drain_task.abort();
+                    return Err(PunchError::Auth(msg));
+                }
+                Ok(Err(e)) => last_error = e.message().to_string(),
                 Err(e) => last_error = e.to_string(),
             }
         }
@@ -129,25 +196,33 @@ async fn attempt_once(
     endpoint: &Endpoint,
     peer: SocketAddr,
     deadline: Instant,
-) -> Result<Connection, String> {
+    auth: Option<AuthHandles>,
+) -> Result<Connection, AttemptError> {
     let connecting = endpoint
         .connect(peer, SERVER_NAME)
-        .map_err(|e| format!("{peer}: 发起连接失败 {e}"))?;
+        .map_err(|e| AttemptError::Transient(format!("{peer}: 发起连接失败 {e}")))?;
 
     // 单个候选最多等 ATTEMPT_CAP，失败就进入下一轮，不拖住其他候选
     let attempt_deadline = deadline.min(Instant::now() + ATTEMPT_CAP);
     let conn = match tokio::time::timeout_at(attempt_deadline, connecting).await {
         Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => return Err(format!("{peer}: 握手失败 {e}")),
-        Err(_) => return Err(format!("{peer}: 握手超时")),
+        Ok(Err(e)) => return Err(AttemptError::Transient(format!("{peer}: 握手失败 {e}"))),
+        Err(_) => return Err(AttemptError::Transient(format!("{peer}: 握手超时"))),
     };
 
-    if confirm_as_dialer(&conn).await {
-        Ok(conn)
-    } else {
+    if !confirm_as_dialer(&conn).await {
         conn.close(0u32.into(), b"unconfirmed");
-        Err(format!("{peer}: 建连确认失败（对端没回 ACK）"))
+        return Err(AttemptError::Transient(format!(
+            "{peer}: 建连确认失败（对端没回 ACK）"
+        )));
     }
+
+    if let Err(e) = verify_peer(&conn, &auth, true).await {
+        conn.close(0u32.into(), b"auth-failed");
+        return Err(AttemptError::Auth(format!("{peer}: {e}")));
+    }
+
+    Ok(conn)
 }
 
 /// dialer 侧：开一条流发 HELLO，等 listener 回 ACK。
@@ -186,6 +261,7 @@ async fn listen_with_probes(
     endpoint: &Endpoint,
     candidates: &[SocketAddr],
     timeout: Duration,
+    auth: Option<AuthHandles>,
 ) -> Result<Connection, PunchError> {
     let deadline = Instant::now() + timeout;
 
@@ -215,6 +291,7 @@ async fn listen_with_probes(
                         continue;
                     }
                     let claim = claimed.clone();
+                    let auth = auth.clone();
                     handshakes.spawn(async move {
                         let conn = match tokio::time::timeout(ATTEMPT_TIMEOUT * 4, incoming).await {
                             Ok(Ok(conn)) => conn,
@@ -226,7 +303,9 @@ async fn listen_with_probes(
                             conn.close(0u32.into(), b"another-winner");
                             return None;
                         }
-                        if confirm_as_listener(&conn).await {
+                        if confirm_as_listener(&conn).await
+                            && verify_peer(&conn, &auth, false).await.is_ok()
+                        {
                             Some(conn)
                         } else {
                             // 确认失败就把机会让回去，否则整个打洞卡在一条坏连接上
