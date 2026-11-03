@@ -78,7 +78,7 @@ curl -X POST https://<你的域名>/v1/admin/networks \
 
 ```
 body      = 请求 JSON 去掉 sig
-canonical = 键排序、无空白、非 ASCII 转义成 \uXXXX 的 JSON
+canonical = 键按 Unicode 码点升序、无空白、非 ASCII 转义成 \uXXXX 的 JSON
 digest    = sha256_hex(canonical)
 message   = qp2p1|<op>|<network>|<ts>|<nonce>|<digest>
 sig       = hex(ed25519_sign(私钥, utf8(message)))
@@ -87,6 +87,13 @@ sig       = hex(ed25519_sign(私钥, utf8(message)))
 - `ts` 毫秒时间戳，服务端只接受 ±120 秒内
 - `nonce` 16~64 位十六进制，同一网络内一次性使用；写操作会消费它，重复提交直接 403
 - 轮询（`/v1/events`）不消费 nonce，因为它本身幂等，否则每次心跳都要多写一行
+- **数字只允许 ±(2^53-1) 以内的整数**。`-0`、超出范围的整数会被拒绝
+  （服务端返回 403，`detail` 里写"请求体无法规范化"）。
+  注意 `1.0`、`1e2` 这类写法在 JS 里解析后就是 `1`、`100`，**无法区分**，会被当作整数；
+  但 Rust 侧会原样看到 `1.0` 并拒绝签名。所以 Rust 客户端请用 `u64`/`i64` 写数字字段，
+  不要用 `f64`——这是唯一会真的把两边摘要搞坏的情况。
+- 键排序按码点而不是 UTF-16 码元；JS 默认 `sort()` 在遇到 BMP 之上的字符时顺序不同，
+  所以实现里用了专门的比较函数
 
 这样 `candidates`、`tls_fp`、`name` 任何一项被改，摘要就变，签名立刻失效。
 Rust 侧 `crates/core/src/signal/canonical.rs` 有一份同规则实现，和 JS 共用一组
@@ -141,7 +148,7 @@ node -e 'crypto.subtle.digest("SHA-256", Buffer.from(process.argv[1],"hex")).the
 ## 本地测试
 
 ```bash
-node signal/smoke.mjs                              # 内存 + SQLite 冒充 D1，两条路径各 47 项
+node signal/smoke.mjs                              # 内存 + SQLite 冒充 D1，两条路径各 72 项
 node signal/dev-server.mjs                         # 起在 127.0.0.1:8787，可直接 curl
 ADMIN_SECRET=dev node signal/dev-server.mjs 9000   # 换端口
 ```

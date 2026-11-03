@@ -7,6 +7,7 @@
 //! 把它当成访问内网/云元数据的开放代理。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 
 const KIND_TCP: u8 = 1;
 const HEADER_LEN: usize = 7;
@@ -175,55 +177,133 @@ async fn open_flow(conn: &Connection, target: SocketAddr) -> Result<(SendStream,
     }
 }
 
-/// 半关闭后的兜底时长：一端关了写端、另一端再也不发数据时，流不该无限挂着。
-const HALF_CLOSE_IDLE: Duration = Duration::from_secs(60);
+/// 半关闭后的空闲上限：一端关了写端、双方又都不再有数据往来时，流不该无限挂着。
+const DEFAULT_HALF_CLOSE_IDLE_MS: u64 = 60_000;
+static HALF_CLOSE_IDLE_MS: AtomicU64 = AtomicU64::new(DEFAULT_HALF_CLOSE_IDLE_MS);
+
+/// 调整半关闭后的空闲上限（默认 60 秒）。主要给测试用，对之后新建的流生效。
+pub fn set_half_close_idle(idle: Duration) {
+    let ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX).max(1);
+    HALF_CLOSE_IDLE_MS.store(ms, Ordering::Relaxed);
+}
+
+fn half_close_idle() -> Duration {
+    Duration::from_millis(HALF_CLOSE_IDLE_MS.load(Ordering::Relaxed))
+}
+
+/// 一条流的活动记录：任何方向每搬运一块数据就刷新时间戳。
+///
+/// 空闲判断必须基于"最后一次有数据往来"，而不是"半关闭那一刻"：
+/// 客户端发完请求就半关闭、服务端再持续回很久的响应（下载、导出、日志流）
+/// 是完全正常的，只要数据还在流动就不能收尾。
+struct Activity {
+    start: Instant,
+    last_ms: AtomicU64,
+    half_closed: AtomicBool,
+}
+
+impl Activity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            half_closed: AtomicBool::new(false),
+        })
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// 有数据往来。
+    fn touch(&self) {
+        self.last_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    /// 某个方向结束了。关闭本身也算一次活动：空闲从这一刻起重新计时。
+    fn mark_half_closed(&self) {
+        self.touch();
+        self.half_closed.store(true, Ordering::Relaxed);
+    }
+
+    /// 已经半关闭，并且最近 `limit` 内没有任何数据往来。
+    fn idle_exceeded(&self, limit: Duration) -> bool {
+        if !self.half_closed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+        self.elapsed_ms()
+            .saturating_sub(self.last_ms.load(Ordering::Relaxed))
+            >= limit_ms
+    }
+}
+
+/// 周期性检查，直到满足"半关闭 + 空闲超限"。
+async fn half_close_watchdog(activity: &Activity, limit: Duration) {
+    let step = (limit / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+    loop {
+        tokio::time::sleep(step).await;
+        if activity.idle_exceeded(limit) {
+            return;
+        }
+    }
+}
 
 /// 双向搬运数据。
 ///
 /// 用 `try_join!` 而不是 `select!`：TCP 是半关闭的，客户端 `shutdown(Write)`
 /// 之后往往还等着响应，此时上行结束不能把下行也丢掉。只有真正出错才提前收尾。
 ///
-/// 上行结束后启动一个空闲计时器：对端如果一直不发数据也不关流，就主动收尾，
-/// 否则这条流会一直占着连接直到整条连接关闭。
+/// 兜底：任一方向结束后，如果双方在 `half_close_idle()` 内都没有再搬运过数据，
+/// 才主动收尾，否则这条流会一直占着连接直到整条连接关闭。
+/// 全双工且两个方向都还开着的连接（比如空闲的 SSH）不受影响。
 async fn pump(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-    let (up_done_tx, up_done_rx) = tokio::sync::oneshot::channel();
+    let activity = Activity::new();
 
-    let up = async {
+    let up_activity = activity.clone();
+    let up = async move {
         let mut buf = vec![0u8; COPY_BUF];
         loop {
             let n = tcp_r.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
+            up_activity.touch();
             send.write_all(&buf[..n]).await?;
+            up_activity.touch();
         }
         let _ = send.finish();
-        let _ = up_done_tx.send(());
+        up_activity.mark_half_closed();
         Ok::<(), anyhow::Error>(())
     };
 
-    let down = async {
+    let down_activity = activity.clone();
+    let down = async move {
         let mut buf = vec![0u8; COPY_BUF];
         loop {
             match recv.read(&mut buf).await? {
                 Some(0) | None => break,
-                Some(n) => tcp_w.write_all(&buf[..n]).await?,
+                Some(n) => {
+                    down_activity.touch();
+                    tcp_w.write_all(&buf[..n]).await?;
+                    down_activity.touch();
+                }
             }
         }
         let _ = tcp_w.shutdown().await;
+        down_activity.mark_half_closed();
         Ok::<(), anyhow::Error>(())
     };
 
+    let limit = half_close_idle();
     let both = async { tokio::try_join!(up, down).map(|_| ()) };
-    let idle = async {
-        let _ = up_done_rx.await;
-        tokio::time::sleep(HALF_CLOSE_IDLE).await;
-    };
 
     tokio::select! {
         result = both => result,
-        _ = idle => bail!("半关闭后 {HALF_CLOSE_IDLE:?} 无数据，主动收尾"),
+        _ = half_close_watchdog(&activity, limit) => {
+            bail!("半关闭后 {limit:?} 内双方都没有数据往来，主动收尾")
+        }
     }
 }
 

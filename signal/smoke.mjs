@@ -8,7 +8,7 @@
  * 与服务端 worker.js 的 canonicalJson 逐字节一致。
  */
 
-import worker, { deriveVirtualIp } from "./worker.js";
+import worker, { deriveVirtualIp, canonicalJson as serverCanonicalJson } from "./worker.js";
 import { fakeD1 } from "./fake-d1.mjs";
 
 const ADMIN_SECRET = "smoke-secret";
@@ -37,17 +37,44 @@ async function identity() {
 function canonicalJson(value) {
   if (value === null) return "null";
   const type = typeof value;
-  if (type === "number") return String(value);
+  if (type === "number") {
+    // 与服务端、Rust 一致：只签 ±(2^53-1) 以内的整数，其余拒绝而不是各自格式化
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+      throw new Error(`不支持的数字 ${value}`);
+    }
+    return String(value);
+  }
   if (type === "boolean") return value ? "true" : "false";
   if (type === "string") return quoteJson(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (type === "object") {
     const keys = Object.keys(value)
       .filter((k) => value[k] !== undefined)
-      .sort();
+      .sort(compareCodePoints);
     return `{${keys.map((k) => `${quoteJson(k)}:${canonicalJson(value[k])}`).join(",")}}`;
   }
   throw new Error(`不支持的类型：${type}`);
+}
+
+function compareCodePoints(a, b) {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i += 1) {
+    const diff = x[i].codePointAt(0) - y[i].codePointAt(0);
+    if (diff !== 0) return diff;
+  }
+  return x.length - y.length;
+}
+
+/** 故意"宽松"的序列化：模拟只会 String(number) 的朴素客户端，用来构造"签名合法但数字不规范"的请求。 */
+function lenientCanonicalJson(value) {
+  if (value === null) return "null";
+  if (typeof value === "number") return String(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return quoteJson(value);
+  if (Array.isArray(value)) return `[${value.map(lenientCanonicalJson).join(",")}]`;
+  const keys = Object.keys(value).sort(compareCodePoints);
+  return `{${keys.map((k) => `${quoteJson(k)}:${lenientCanonicalJson(value[k])}`).join(",")}}`;
 }
 
 function quoteJson(text) {
@@ -86,7 +113,7 @@ async function signed(node, op, net, body, opts = {}) {
   const ts = opts.ts ?? Date.now();
   const nonce = opts.nonce ?? randomNonce();
   const payload = { ...body, ts, nonce };
-  const digest = await sha256Hex(canonicalJson(payload));
+  const digest = await sha256Hex((opts.canonical ?? canonicalJson)(payload));
   const message = `qp2p1|${op}|${net}|${ts}|${nonce}|${digest}`;
   const signature = await crypto.subtle.sign(
     { name: "Ed25519" },
@@ -404,6 +431,62 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     const got = [];
     for (const salt of [0, 1, 7]) got.push(await deriveVirtualIp(id, "10.64.0.0/16", salt));
     check(`派生向量 ${id.slice(0, 8)}`, JSON.stringify(got) === JSON.stringify(expected), { got, expected });
+  }
+
+  console.log("\n8. 规范 JSON 边界（与 Rust 侧 canonical.rs 同一组规则）");
+  const outcome = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return "REJECT";
+    }
+  };
+  for (const [name, impl] of [
+    ["服务端", serverCanonicalJson],
+    ["客户端副本", canonicalJson],
+  ]) {
+    check(`${name}：整数原样输出`, outcome(() => impl({ a: 1, b: -7 })) === '{"a":1,"b":-7}');
+    check(
+      `${name}：2^53-1 可签`,
+      outcome(() => impl({ a: Number.MAX_SAFE_INTEGER })) === '{"a":9007199254740991}',
+    );
+    for (const [label, value] of [
+      ["浮点 1.5", 1.5],
+      ["2^53（超出安全范围）", 2 ** 53],
+      ["1e21", 1e21],
+      ["-0", -0],
+      ["NaN", Number.NaN],
+    ]) {
+      check(`${name}：拒绝 ${label}`, outcome(() => impl({ a: value })) === "REJECT");
+    }
+    check(`${name}：嵌套里的浮点也拒绝`, outcome(() => impl({ a: [1, { b: 2.5 }] })) === "REJECT");
+    // U+FFFD 的码点小于 U+1F600；按 UTF-16 码元排序会得到相反的顺序
+    check(
+      `${name}：键按码点排序`,
+      outcome(() => impl({ "\u{1F600}": 1, "\uFFFD": 2, a: 3 })) ===
+        '{"a":3,"\\ufffd":2,"\\ud83d\\ude00":1}',
+    );
+  }
+
+  // 签名合法、但数字不规范：必须是 4xx 且有明确原因，不能变成 500
+  for (const [label, extra] of [
+    ["浮点数", 1.5],
+    ["超出 2^53 的整数", 2 ** 53],
+    ["1e21", 1e21],
+  ]) {
+    const body = await signed(
+      alice,
+      "register",
+      net,
+      { node_id: alice.nodeId, pubkey: alice.pubkey, candidates: ["203.0.113.5:51820"], extra },
+      { canonical: lenientCanonicalJson },
+    );
+    const res = await call("POST", "/v1/register", { token, body });
+    check(
+      `请求体含${label}被拒（403，说明原因）`,
+      res.status === 403 && String(res.body?.detail).includes("规范化"),
+      res,
+    );
   }
 
   console.log(`  ${label}：${passed} 通过，${failed} 失败`);

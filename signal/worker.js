@@ -854,19 +854,27 @@ const TS_WINDOW_MS = 120_000;
 const NONCE_TTL_MS = 300_000;
 
 /**
- * 规范 JSON：键按字典序排序、无空白、非 ASCII 转义成 \uXXXX。
+ * 规范 JSON：键按 Unicode 码点升序、无空白、非 ASCII 转义成 \\uXXXX。
  *
  * 客户端必须逐字节复现这段序列化，然后把 sha256 放进签名串：
  *   qp2p1|<op>|<network>|<ts>|<nonce>|<body digest>
  *
  * 之所以不手工挑字段：tls_fp、candidates、name 任何一个漏签，攻击者就能
  * 拿一份合法报文改掉它重放（tls_fp 将来要用于证书钉扎，尤其不能漏）。
+ *
+ * 数字规则（与 crates/core/src/signal/canonical.rs 一致）：
+ * 只允许 ±(2^53-1) 以内的整数，其余一律拒绝而不是各自格式化。
+ * JS 把 1.0 写成 1、会静默丢失 2^53 以上整数的精度，而 Rust 会原样输出，
+ * 两边摘要不同只会表现为难以排查的 bad_signature。-0 也拒绝：
+ * serde_json 把它解析成浮点，两端必须对"能不能签"得出同一个结论。
  */
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (value === null) return "null";
   const type = typeof value;
   if (type === "number") {
-    if (!Number.isFinite(value)) throw new Error("数字必须是有限值");
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+      throw new Error(`不支持的数字 ${value}：只允许 ±(2^53-1) 以内的整数`);
+    }
     return String(value);
   }
   if (type === "boolean") return value ? "true" : "false";
@@ -875,10 +883,22 @@ function canonicalJson(value) {
   if (type === "object") {
     const keys = Object.keys(value)
       .filter((k) => value[k] !== undefined)
-      .sort();
+      .sort(compareCodePoints);
     return `{${keys.map((k) => `${quoteJson(k)}:${canonicalJson(value[k])}`).join(",")}}`;
   }
   throw new Error(`不支持的类型：${type}`);
+}
+
+/** 按码点比较。默认 sort() 按 UTF-16 码元比较，遇到 BMP 之上的字符会和 Rust 的字节序不同。 */
+function compareCodePoints(a, b) {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  const n = Math.min(x.length, y.length);
+  for (let i = 0; i < n; i += 1) {
+    const diff = x[i].codePointAt(0) - y[i].codePointAt(0);
+    if (diff !== 0) return diff;
+  }
+  return x.length - y.length;
 }
 
 function quoteJson(text) {
@@ -926,7 +946,13 @@ async function verifySignedRequest({ env, op, networkId, body, pubkey, now, trac
   const nonce = String(body?.nonce ?? "").toLowerCase();
   if (!/^[0-9a-f]{16,64}$/.test(nonce)) return "nonce 必须是 16~64 位十六进制";
 
-  const digest = await bodyDigest(body);
+  let digest;
+  try {
+    digest = await bodyDigest(body);
+  } catch (e) {
+    // 请求体里有浮点 / 超出安全范围的整数：是客户端的问题，不能变成 500
+    return `请求体无法规范化：${e instanceof Error ? e.message : String(e)}`;
+  }
   const message = signingMessage(op, networkId, stamp, nonce, digest);
   const mismatch = await verifySignature(pubkey, message, body?.sig);
   if (mismatch) return mismatch;
