@@ -52,7 +52,9 @@ impl LinuxTun {
         }
 
         // SAFETY: fd 有效，req 是 #[repr(C)] 且大小与内核期望的 ifreq 一致
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &mut req) };
+        // 请求码的类型随 libc 变：gnu 上是 c_ulong，musl 上是 c_int。
+        // 用 `as _` 交给推断，两个目标都能编过。
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, &mut req) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("创建 TUN 设备 {} 失败", config.name));
