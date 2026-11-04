@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -36,8 +36,11 @@ const DDL_STATEMENTS = [
     network_id TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     cidr       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    join_hash  TEXT NOT NULL DEFAULT ''
   )`,
+  // 老库补列：重复执行会报 duplicate column，下面的循环会忽略
+  `ALTER TABLE networks ADD COLUMN join_hash TEXT NOT NULL DEFAULT ''`,
   `CREATE TABLE IF NOT EXISTS nodes (
     network_id TEXT NOT NULL,
     node_id    TEXT NOT NULL,
@@ -111,6 +114,8 @@ async function route(request, url, env, ctx) {
   if (path === "/") return landing();
   if (path === "/v1/health") return health(request, env);
   if (path === "/v1/admin/networks" && method === "POST") return createNetwork(request, env);
+  const rotate = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/rotate$/.exec(path);
+  if (rotate && method === "POST") return rotateJoinKey(request, env, rotate[1]);
 
   const isRead = method === "GET";
   if (path === "/v1/join" && method === "POST") return joinOrRegister(request, env, url, false);
@@ -132,7 +137,8 @@ async function landing() {
     `version ${VERSION}`,
     "",
     "GET  /v1/health",
-    "POST /v1/admin/networks   需要 X-Admin-Secret",
+    "POST /v1/admin/networks   需要 X-Admin-Secret，可带 join_key",
+    "POST /v1/admin/networks/<id>/rotate   需要 X-Admin-Secret，换加入密钥",
     "POST /v1/join",
     "POST /v1/register",
     "POST /v1/connect",
@@ -182,6 +188,96 @@ async function health(request, env) {
 }
 
 async function createNetwork(request, env) {
+  const admin = checkAdmin(request, env);
+  if (admin) return admin;
+
+  const body = await readJson(request);
+  if (body === null) return err(400, "invalid_json");
+
+  const name = String(body.name ?? "").trim().slice(0, 48);
+  const id = slug(name) || randomId();
+  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) {
+    return err(400, "invalid_name", "网络名只能包含字母、数字、连字符");
+  }
+
+  // 加入密钥（预设密钥）：管理员自己定；不填就生成一把随机的。
+  // 它跟 ADMIN_SECRET 没有任何推导关系——ADMIN_SECRET 只管管理面，
+  // 泄漏一把加入密钥不会连累管理面，换 ADMIN_SECRET 也不会把成员踢下线。
+  const preset = body.join_key === undefined ? null : String(body.join_key);
+  if (preset !== null) {
+    const bad = validateJoinKey(preset);
+    if (bad) return bad;
+  }
+
+  const existing = await getNetwork(env, id);
+  if (existing) {
+    // 带同一把预设密钥重复建网是幂等的（方便把命令存进脚本）
+    if (preset !== null && existing.join_hash && timingSafeEqual(await sha256Hex(preset), existing.join_hash)) {
+      return json({
+        ok: true,
+        network: { id: existing.network_id, name: existing.name, cidr: existing.cidr },
+        token: tokenOf(id, preset),
+        note: "网络已存在，预设密钥与现有的一致",
+      });
+    }
+    return err(
+      409,
+      "network_exists",
+      "网络已存在。要换加入密钥请 POST /v1/admin/networks/<id>/rotate（会自动生成新密钥）",
+    );
+  }
+
+  const cidr = body.cidr ? normalizeCidr(String(body.cidr)) : await pickCidr(env, id);
+  if (!cidr) return err(400, "invalid_cidr", "只接受 10.x.0.0/16 形式");
+
+  const joinKey = preset ?? randomSecret();
+  const net = {
+    network_id: id,
+    name: name || id,
+    cidr,
+    created_at: Date.now(),
+    join_hash: await sha256Hex(joinKey),
+  };
+  await putNetwork(env, net);
+
+  return json({
+    ok: true,
+    network: { id, name: net.name, cidr },
+    token: tokenOf(id, joinKey),
+    note: preset
+      ? "这是你预设的加入密钥，请分发给要加入的节点"
+      : "这是随机生成的加入密钥，只回显这一次；丢了用 rotate 换一把",
+  });
+}
+
+/** 换掉某个网络的加入密钥，返回新令牌。旧令牌立刻失效。 */
+async function rotateJoinKey(request, env, networkId) {
+  const admin = checkAdmin(request, env);
+  if (admin) return admin;
+
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  const body = (await readJson(request)) ?? {};
+  const preset = body.join_key === undefined ? null : String(body.join_key);
+  if (preset !== null) {
+    const bad = validateJoinKey(preset);
+    if (bad) return bad;
+  }
+
+  const joinKey = preset ?? randomSecret();
+  net.join_hash = await sha256Hex(joinKey);
+  await putNetwork(env, net);
+
+  return json({
+    ok: true,
+    network: { id: net.network_id, name: net.name, cidr: net.cidr },
+    token: tokenOf(net.network_id, joinKey),
+    note: "该网络原有令牌已失效，节点需要重新 join",
+  });
+}
+
+function checkAdmin(request, env) {
   if (!env.ADMIN_SECRET) {
     return err(
       503,
@@ -193,39 +289,24 @@ async function createNetwork(request, env) {
   if (!timingSafeEqual(provided, env.ADMIN_SECRET)) {
     return err(401, "invalid_admin_secret");
   }
+  return null;
+}
 
-  const body = await readJson(request);
-  if (body === null) return err(400, "invalid_json");
-
-  const name = String(body.name ?? "").trim().slice(0, 48);
-  const id = slug(name) || randomId();
-  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) {
-    return err(400, "invalid_name", "网络名只能包含字母、数字、连字符");
+function validateJoinKey(key) {
+  if (key.length < 16 || key.length > 128) {
+    return err(400, "invalid_join_key", "join_key 长度需在 16~128 字符之间");
   }
+  return null;
+}
 
-  const existing = await getNetwork(env, id);
-  if (existing) {
-    // 幂等：重复创建返回同一个网络和同一把密钥
-    return json({
-      ok: true,
-      network: { id: existing.network_id, name: existing.name, cidr: existing.cidr },
-      token: await tokenFor(id, env.ADMIN_SECRET),
-      note: "该网络已存在，返回同一把密钥",
-    });
-  }
+function tokenOf(networkId, joinKey) {
+  return `${TOKEN_PREFIX}${networkId}_${joinKey}`;
+}
 
-  const cidr = body.cidr ? normalizeCidr(String(body.cidr)) : await pickCidr(env, id);
-  if (!cidr) return err(400, "invalid_cidr", "只接受 10.x.0.0/16 形式");
-
-  const net = { network_id: id, name: name || id, cidr, created_at: Date.now() };
-  await putNetwork(env, net);
-
-  return json({
-    ok: true,
-    network: { id, name: net.name, cidr },
-    token: await tokenFor(id, env.ADMIN_SECRET),
-    note: "把这把密钥分发给要加入网络的节点；同一网络重复创建会得到同一把密钥",
-  });
+function randomSecret() {
+  const buf = new Uint8Array(24);
+  crypto.getRandomValues(buf);
+  return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -477,10 +558,6 @@ async function leave(request, env, url) {
 // ---------------------------------------------------------------------------
 
 async function authenticate(request, env, url) {
-  if (!env.ADMIN_SECRET) {
-    return { ok: false, response: err(503, "admin_secret_unset", "服务端未设置 ADMIN_SECRET") };
-  }
-
   const header = request.headers.get("authorization") ?? "";
   const token = header.toLowerCase().startsWith("bearer ")
     ? header.slice(7).trim()
@@ -493,19 +570,37 @@ async function authenticate(request, env, url) {
   const parsed = parseToken(token);
   if (!parsed) return { ok: false, response: err(401, "invalid_token") };
 
-  const expected = await tokenFor(parsed.networkId, env.ADMIN_SECRET);
+  let network = await getNetwork(env, parsed.networkId);
+
+  // 正常路径：加入密钥是每个网络自己的，服务端只存哈希，
+  // 与 ADMIN_SECRET 无关——换管理密钥不会让成员掉线，泄漏一把加入密钥
+  // 也推不出管理密钥。
+  if (network && network.join_hash) {
+    const digest = await sha256Hex(parsed.secret);
+    if (!timingSafeEqual(digest, network.join_hash)) {
+      return { ok: false, response: err(403, "wrong_secret", "加入密钥不正确") };
+    }
+    return { ok: true, network };
+  }
+
+  // 兼容：2.0 及更早建的网，密钥由 ADMIN_SECRET 派生，没有独立预设密钥。
+  // 建议管理员对这些网络调一次 rotate，之后就与 ADMIN_SECRET 解耦了。
+  if (!env.ADMIN_SECRET) {
+    return { ok: false, response: err(503, "admin_secret_unset", "服务端未设置 ADMIN_SECRET") };
+  }
+  const expected = await legacyTokenFor(parsed.networkId, env.ADMIN_SECRET);
   if (!timingSafeEqual(expected, token)) {
     return { ok: false, response: err(403, "wrong_secret", "网络密钥不匹配") };
   }
 
-  let network = await getNetwork(env, parsed.networkId);
   if (!network) {
-    // 令牌有效但注册表丢了（换库/换实例）：按同一算法补回，网段保持一致
+    // 旧版令牌有效但注册表丢了：按同一算法补回，网段保持一致
     network = {
       network_id: parsed.networkId,
       name: parsed.networkId,
       cidr: await pickCidr(env, parsed.networkId),
       created_at: Date.now(),
+      join_hash: "",
     };
     await putNetwork(env, network);
   }
@@ -520,7 +615,14 @@ function parseToken(token) {
   return { networkId: rest.slice(0, index), secret: rest.slice(index + 1) };
 }
 
-async function tokenFor(networkId, adminSecret) {
+/**
+ * 旧版令牌：`HMAC(ADMIN_SECRET, "token:<网络>")`。
+ *
+ * 只用于 2.0 及更早创建的网络（networks.join_hash 为空）。
+ * 这条路径的副作用是"拿到一把令牌就能离线爆破 ADMIN_SECRET"，
+ * 所以新网络一律走独立密钥；旧网络调一次 rotate 即可切过来。
+ */
+async function legacyTokenFor(networkId, adminSecret) {
   const mac = await hmacHex(adminSecret, `token:${networkId}`);
   return `${TOKEN_PREFIX}${networkId}_${mac.slice(0, 40)}`;
 }
@@ -536,7 +638,12 @@ async function ready(env) {
   if (!env.DB) return "memory";
   if (!migrated.has(env.DB)) {
     for (const sql of DDL_STATEMENTS) {
-      await env.DB.prepare(sql).run();
+      try {
+        await env.DB.prepare(sql).run();
+      } catch (e) {
+        // 只放过"列已存在"，其它错误照旧抛
+        if (!/duplicate column|already exists/i.test(String(e?.message ?? e))) throw e;
+      }
     }
     migrated.add(env.DB);
   }
@@ -554,9 +661,9 @@ async function putNetwork(env, net) {
     return;
   }
   await env.DB.prepare(
-    "INSERT OR REPLACE INTO networks (network_id, name, cidr, created_at) VALUES (?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO networks (network_id, name, cidr, created_at, join_hash) VALUES (?, ?, ?, ?, ?)",
   )
-    .bind(net.network_id, net.name, net.cidr, net.created_at)
+    .bind(net.network_id, net.name, net.cidr, net.created_at, net.join_hash ?? "")
     .run();
 }
 

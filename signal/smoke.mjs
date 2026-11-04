@@ -8,6 +8,8 @@
  * 与服务端 worker.js 的 canonicalJson 逐字节一致。
  */
 
+import { createHmac } from "node:crypto";
+
 import worker, { deriveVirtualIp, canonicalJson as serverCanonicalJson } from "./worker.js";
 import { fakeD1 } from "./fake-d1.mjs";
 
@@ -162,13 +164,15 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   check("health ok", health.status === 200 && health.body.ok === true, health.body);
   check(`storage=${expectedStorage}`, health.body.storage === expectedStorage, health.body.storage);
 
-  console.log("\n2. 建网");
+  console.log("\n2. 建网与加入密钥");
   const noSecret = await call("POST", "/v1/admin/networks", { body: { name: "home" } });
   check("缺少 admin secret 被拒", noSecret.status === 401, noSecret.body);
 
+  // 预设密钥：管理员自己定，与 ADMIN_SECRET 无关
+  const PRESET = "home-lab-preset-key-2024";
   const created = await call("POST", "/v1/admin/networks", {
     admin: secret,
-    body: { name: "Home Lab" },
+    body: { name: "Home Lab", join_key: PRESET },
   });
   check("建网成功", created.status === 200 && created.body.ok === true, created.body);
   const net = created.body.network.id;
@@ -179,20 +183,78 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     created.body.network,
   );
   const token = created.body.token;
-  check("令牌格式正确", String(token).startsWith("qp2p1_home-lab_"), token);
+  check("令牌里带的就是预设密钥", token === `qp2p1_home-lab_${PRESET}`, token);
+
+  const legacyMac = createHmac("sha256", secret).update("token:home-lab").digest("hex");
+  check(
+    "加入密钥不再由 ADMIN_SECRET 派生",
+    token !== `qp2p1_home-lab_${legacyMac.slice(0, 40)}`,
+    token,
+  );
 
   const again = await call("POST", "/v1/admin/networks", {
     admin: secret,
+    body: { name: "home lab", join_key: PRESET },
+  });
+  check("同一预设密钥重复建网是幂等的", again.body.token === token, again.body);
+  check(
+    "重复建网网段不变",
+    again.body.network?.cidr === created.body.network.cidr,
+    again.body.network,
+  );
+
+  const collide = await call("POST", "/v1/admin/networks", {
+    admin: secret,
     body: { name: "home lab" },
   });
-  check("重复建网返回同一把密钥", again.body.token === token, again.body.token);
-  check("重复建网网段不变", again.body.network.cidr === created.body.network.cidr, again.body.network);
+  check("已存在的网络不会被悄悄换密钥", collide.status === 409, collide.body);
+
+  const shortKey = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "tiny", join_key: "short" },
+  });
+  check("过短的加入密钥被拒", shortKey.status === 400, shortKey.body);
 
   const otherNet = await call("POST", "/v1/admin/networks", {
     admin: secret,
     body: { name: "lab" },
   });
   check("第二个网络网段不与第一个重叠", otherNet.body.network.cidr !== created.body.network.cidr);
+  check(
+    "不填 join_key 时随机生成",
+    /^qp2p1_lab_[0-9a-f]{48}$/.test(otherNet.body.token ?? ""),
+    otherNet.body.token,
+  );
+
+  // 轮换：只作废这一个网络的密钥，ADMIN_SECRET 不动
+  const rotNet = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "rotate-test", join_key: "rotate-preset-key-0001" },
+  });
+  const rotOld = rotNet.body.token;
+  const probe = (tk) =>
+    call("GET", "/v1/events", { token: tk, query: { node_id: "0".repeat(32), since: 0 } });
+  const before = await probe(rotOld);
+  check("轮换前令牌可用", before.body.error === "unknown_node", before.body);
+
+  const rotated = await call("POST", "/v1/admin/networks/rotate-test/rotate", {
+    admin: secret,
+    body: { join_key: "rotate-preset-key-0002" },
+  });
+  check(
+    "轮换返回新令牌",
+    rotated.status === 200 && rotated.body.token !== rotOld,
+    rotated.body,
+  );
+  const afterOld = await probe(rotOld);
+  const afterNew = await probe(rotated.body.token);
+  check("旧令牌立刻失效", afterOld.body.error === "wrong_secret", afterOld.body);
+  check("新令牌可用", afterNew.body.error === "unknown_node", afterNew.body);
+
+  // 兼容 2.0：那时没有 join_hash，令牌由 ADMIN_SECRET 派生，服务端仍要认
+  const ghostMac = createHmac("sha256", secret).update("token:ghost").digest("hex").slice(0, 40);
+  const legacyProbe = await probe(`qp2p1_ghost_${ghostMac}`);
+  check("旧版派生令牌仍被接受（兼容老网络）", legacyProbe.body.error === "unknown_node", legacyProbe.body);
 
   console.log("\n3. 加入与上报");
   const alice = await identity();

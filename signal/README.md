@@ -10,7 +10,8 @@
 2. 点 **Edit code**，把 `worker.js` 全选粘贴进去，**Deploy**
 3. （强烈建议）**Storage → D1 → Create database**，名字 `qp2p`
    然后回到 Worker → **Settings → Bindings → Add → D1 database**，变量名填 **`DB`**，选刚建的库
-4. **Settings → Variables → Add**，名字 **`ADMIN_SECRET`**，值随便一串长随机（这就是你的管理员密钥）
+4. **Settings → Variables → Add**，名字 **`ADMIN_SECRET`**，值随便一串长随机
+   （这是**管理密钥**，只用来建网络、换加入密钥；节点不用它）
 5. 打开 `https://<你的域名>/v1/health`，看到 `"ok": true` 就好了
 
 表结构在第一次请求时自动建立，**不需要手动执行 SQL**。
@@ -19,13 +20,26 @@
 但多地域的节点可能互相看不见（`/v1/health` 会显示 `"storage": "memory"` 并给出警告）。
 真正用起来请绑定 D1。
 
+## 两把钥匙，别混
+
+| | 谁持有 | 干什么 | 泄漏后果 |
+|---|---|---|---|
+| `ADMIN_SECRET` | **只有管理员**（Worker 环境变量） | 建网络、换某个网络的加入密钥 | 别人能建网络、能重置任意网络的密钥 |
+| 加入密钥 `<join_key>` | 该网络的每台节点 | 进入这一个网络 | 只丢这一个网络，换掉即可 |
+
+**两者没有任何推导关系。** 加入密钥在创建网络时确定（你指定，或服务端随机生成），
+服务端只存它的 `sha256`：
+- 泄漏一把加入密钥，推不出 `ADMIN_SECRET`，也推不出别的网络
+- 换 `ADMIN_SECRET`，现有节点**不会**掉线
+- 作废某个网络，只影响那一个网络
+
 ## 创建网络
 
 ```bash
 curl -X POST https://<你的域名>/v1/admin/networks \
   -H "X-Admin-Secret: $ADMIN_SECRET" \
   -H "content-type: application/json" \
-  -d '{"name":"home"}'
+  -d '{"name":"home","join_key":"我自己定的一串长密钥"}'
 ```
 
 返回：
@@ -34,22 +48,40 @@ curl -X POST https://<你的域名>/v1/admin/networks \
 {
   "ok": true,
   "network": { "id": "home", "name": "home", "cidr": "10.97.0.0/16" },
-  "token": "qp2p1_home_<40 位十六进制>"
+  "token": "qp2p1_home_我自己定的一串长密钥"
 }
 ```
 
-把这把 `token` 发给要加入网络的节点即可。**同一个名字重复创建会返回同一把密钥**，
-所以密钥丢了不用重建网络，再调一次就行（前提是 `ADMIN_SECRET` 没变）。
+- `join_key` 可省略（16~128 字符）：省略时服务端随机生成 48 位十六进制，**只回显这一次**
+- 带**同一个** `join_key` 重复建网是幂等的，返回同一把令牌，方便把命令存进脚本
+- 网络已存在又不带 `join_key` 时返回 409，不会悄悄换掉大家的密钥
+- 令牌形状是 `qp2p1_<网络id>_<join_key>`，节点只拿这个，永远不接触 `ADMIN_SECRET`
 
 网段从 `10.64.0.0/16` 起顺序分配，最多 64 个网络，按网络 id 的哈希挑位并跳过已占用的。
 需要指定就在请求里加 `"cidr": "10.99.0.0/16"`。
+
+## 换掉某个网络的加入密钥
+
+```bash
+curl -X POST https://<你的域名>/v1/admin/networks/home/rotate \
+  -H "X-Admin-Secret: $ADMIN_SECRET" \
+  -H "content-type: application/json" \
+  -d '{"join_key":"换一把新的"}'      # 不填则随机生成
+```
+
+旧令牌立刻失效，其他网络不受影响。
+
+> **升级提示**：2.0 版本的令牌是 `HMAC(ADMIN_SECRET, "token:<网络>")`，与 `ADMIN_SECRET`
+> 绑死——拿到一把令牌就能离线爆破管理密钥。这类老网络仍能继续用（服务端有兼容分支），
+> 但建议对每个网络调一次 `rotate`，之后就和 `ADMIN_SECRET` 解耦了。
 
 ## 接口
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/v1/health` | 无 | 状态、存储后端、节点数 |
-| POST | `/v1/admin/networks` | `X-Admin-Secret` | 创建/取回网络密钥 |
+| POST | `/v1/admin/networks` | `X-Admin-Secret` | 创建网络，返回加入密钥 |
+| POST | `/v1/admin/networks/:id/rotate` | `X-Admin-Secret` | 换掉该网络的加入密钥 |
 | POST | `/v1/join` | 令牌 | 登记节点、领虚拟地址、拿对端列表 |
 | POST | `/v1/register` | 令牌 | 上报候选地址（至少一个） |
 | POST | `/v1/connect` | 令牌 | 撮合：返回对端候选，并给对端投一条事件 |
@@ -58,12 +90,12 @@ curl -X POST https://<你的域名>/v1/admin/networks \
 
 令牌走 `Authorization: Bearer <token>`；`/v1/events` 这种 GET 也接受 `?token=`。
 
-### 令牌为什么不用存
+### 加入密钥为什么只存哈希
 
-`token = qp2p1_<网络>_<HMAC-SHA256(ADMIN_SECRET, "token:<网络>")[:40]>`。
+`token = qp2p1_<网络id>_<join_key>`，服务端存的是 `sha256(join_key)`。
 
-服务端拿到令牌就地重算一遍比对即可，数据库里**不存任何密钥**。
-副作用是换 `ADMIN_SECRET` 等于全网重新发牌——这正是想要的行为。
+比对时把令牌里的那一段重新哈希，与库里的值做常数时间比较。
+数据库里没有明文密钥，但也不需要 `ADMIN_SECRET` 参与——所以这两把钥匙互不影响。
 
 ### 身份与签名
 
