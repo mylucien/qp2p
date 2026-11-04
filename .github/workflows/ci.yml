@@ -78,6 +78,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: qp2p-linux-x86_64
             bin: qp2p
+          # 静态链接：gnu 版是在 Ubuntu 24.04 上编的，要求 glibc >= 2.39，
+          # 老发行版（Debian 12 / Ubuntu 22.04）直接跑不起来。musl 版没有这个限制。
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: qp2p-linux-x86_64-static
+            bin: qp2p
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: qp2p-windows-x86_64
@@ -94,7 +100,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: 安装 musl 工具链
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+
       - name: Build release
+        env:
+          # 只有 musl 目标需要；其它目标忽略
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --target ${{ matrix.target }} -p qp2p-cli
 
       - name: Upload binary
