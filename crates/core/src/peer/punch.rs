@@ -26,6 +26,11 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
 const ATTEMPT_CAP: Duration = Duration::from_secs(4);
 /// listener 发探针的间隔（只为自己这侧开孔）。
 const PROBE_INTERVAL: Duration = Duration::from_millis(300);
+/// 窗口到点后，留给"已经在飞"的握手的收尾时间。
+///
+/// 两端窗口的起点不可能对齐：对端通常比我们晚上线，它的窗口也晚结束。
+/// 到点立刻返回会把对端正要完成的连接连同端点一起丢掉（CI 上真实出现过）。
+const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
 
 /// 建连确认：双方必须落在**同一条** QUIC 连接上。
 ///
@@ -303,16 +308,32 @@ async fn listen_with_probes(
     let claimed = Arc::new(AtomicBool::new(false));
     let accept_loop = async move {
         let mut handshakes: JoinSet<Option<Connection>> = JoinSet::new();
+        // 窗口到点后仍在飞的握手的最晚收尾时刻。
+        // 两端的窗口起点几乎不可能对齐（对端往往比我们晚上线），
+        // 到点就直接返回会把对端正要完成的连接连同端点一起丢掉，
+        // 表现是对端在认证最后一步看到"closed by peer"。
+        let mut grace_until: Option<Instant> = None;
         loop {
+            let wake = grace_until.unwrap_or(deadline);
             tokio::select! {
                 // 并发握手：一个卡住的连接不能堵住真正的 dialer
                 joined = handshakes.join_next(), if !handshakes.is_empty() => {
-                    if let Some(Ok(Some(conn))) = joined {
-                        handshakes.abort_all();
-                        return Ok(conn);
+                    match joined {
+                        Some(Ok(Some(conn))) => {
+                            handshakes.abort_all();
+                            return Ok(conn);
+                        }
+                        Some(Ok(None)) => {
+                            // 握手失败就把机会让回去
+                            if handshakes.is_empty() && grace_until.is_some() {
+                                return Err(PunchError::Timeout(timeout));
+                            }
+                        }
+                        Some(Err(_)) => {}
+                        None => {}
                     }
                 }
-                incoming = accept_endpoint.accept() => {
+                incoming = accept_endpoint.accept(), if grace_until.is_none() => {
                     let Some(incoming) = incoming else {
                         return Err(PunchError::Dial("端点已关闭".to_string()));
                     };
@@ -351,6 +372,22 @@ async fn listen_with_probes(
                         Some(conn)
                     });
                 }
+                _ = tokio::time::sleep_until(wake) => {
+                    if grace_until.is_some() {
+                        handshakes.abort_all();
+                        return Err(PunchError::Timeout(timeout));
+                    }
+                    if handshakes.is_empty() {
+                        return Err(PunchError::Timeout(timeout));
+                    }
+                    // 还有握手在飞：给它们一段宽限，别再接受新连接
+                    tracing::debug!(
+                        "[punch] 窗口到点，仍有 {} 个握手在进行，宽限 {:?}",
+                        handshakes.len(),
+                        HANDSHAKE_GRACE
+                    );
+                    grace_until = Some(Instant::now() + HANDSHAKE_GRACE);
+                }
             }
         }
     };
@@ -359,8 +396,8 @@ async fn listen_with_probes(
     let mut next_probe = Instant::now();
     loop {
         tokio::select! {
+            // 窗口到点由 accept_loop 自己处理：它要先等还在飞的握手收尾
             result = &mut accept_loop => return result,
-            _ = tokio::time::sleep_until(deadline) => return Err(PunchError::Timeout(timeout)),
             _ = tokio::time::sleep_until(next_probe) => {
                 for peer in candidates {
                     if let Ok(connecting) = endpoint.connect(*peer, SERVER_NAME) {

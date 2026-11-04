@@ -20,7 +20,9 @@
 //! 在应用层证明"签名的人就是 TLS 对面的人"，两者任选其一都能挡住中继，
 //! 默认路径上只有通道绑定是始终生效的。
 //!
-//! 只花两个往返，一条流搞定。
+//! 一条流、三个消息往返：身份 + 双向签名 + 两侧各自的结论。
+//! 最后一步是刻意加上的——少了它，先返回的一侧会在对端还等着读的时候
+//! 就把端点丢掉，对端看到的只是一句"closed by peer"。
 
 use std::time::Duration;
 
@@ -31,17 +33,17 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{Identity, NodeId};
 
 /// 认证协议版本，改字段就换一个。
-const AUTH_VERSION: u8 = 2;
+const AUTH_VERSION: u8 = 3;
 /// 单步超时。握手是本地往返，超过这个时间基本就是出问题了。
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单帧上限，防止对端塞一个巨大的 JSON。
 const MAX_FRAME: usize = 4096;
 
-const AUTH_TAG: &str = "QP2P-AUTH-2";
+const AUTH_TAG: &str = "QP2P-AUTH-3";
 
 /// TLS keying material exporter 的标签与上下文。
 /// 两端必须一致；改了就要同时升 `AUTH_VERSION` 和 `AUTH_TAG`。
-const BINDING_LABEL: &[u8] = b"EXPORTER-qp2p-auth-v2";
+const BINDING_LABEL: &[u8] = b"EXPORTER-qp2p-auth-v3";
 const BINDING_LEN: usize = 32;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,18 +133,34 @@ pub async fn authenticate_dialer(
         sig: hex::encode(identity.sign(message.as_bytes())),
     };
     write_frame(&mut send, &my_proof).await?;
-    let _ = send.finish();
-
-    check_expected(&peer.node_id, expected)?;
 
     // 4. 等 listener 的最终裁决：它可能因为自己的 --peer-id 不匹配而拒了我
     let verdict: Verdict = read_frame(&mut recv)
         .await
         .context("对端没有给出认证结论（连接可能已被拒绝后关闭）")?;
-    if !verdict.ok {
-        bail!("对端拒绝了本次连接：{}", verdict.reason);
-    }
 
+    // 5. 我这边也要给出结论，并且必须在返回前发出去：
+    //    listener 等它才敢收尾，否则它一返回、端点被丢弃，
+    //    刚写的裁决帧会连同连接一起消失，我这边就成了"对端没说结论"
+    let outcome = if verdict.ok {
+        check_expected(&peer.node_id, expected)
+    } else {
+        Err(anyhow::anyhow!("对端拒绝了本次连接：{}", verdict.reason))
+    };
+    let ack = match &outcome {
+        Ok(()) => Verdict {
+            ok: true,
+            reason: String::new(),
+        },
+        Err(e) => Verdict {
+            ok: false,
+            reason: format!("{e:#}"),
+        },
+    };
+    let _ = write_frame(&mut send, &ack).await;
+    let _ = send.finish();
+
+    outcome?;
     Ok(peer)
 }
 
@@ -213,17 +231,22 @@ pub async fn authenticate_listener(
             reason: format!("{e:#}"),
         },
     };
-    let verdict_written = write_frame(&mut send, &verdict).await.is_ok();
+    let _ = write_frame(&mut send, &verdict).await;
+
+    // 5. 等对端的结论。必须等到它，否则我们会在对方还等着读取时就返回：
+    //    调用方一旦返回就会丢弃端点，裁决帧连同连接一起消失，
+    //    对方只能看到"closed by peer"，拿不到拒绝原因。
+    //    顺带把"对方接受了我"和"对方拒绝了我"也变成两侧一致的结果。
+    let peer_verdict: Verdict = read_frame(&mut recv).await.unwrap_or(Verdict {
+        ok: false,
+        reason: "对端没有给出结论".to_string(),
+    });
     let _ = send.finish();
 
-    if outcome.is_err() && verdict_written {
-        // 调用方拿到错误后会立刻 close 这条连接，CONNECTION_CLOSE 会抢在
-        // 结论帧前面，dialer 就只剩一句"closed by peer"，看不到拒绝原因。
-        // 先等这一帧被对端确认（最多 2 秒），再让错误传出去。
-        let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
-    }
-
     outcome?;
+    if !peer_verdict.ok {
+        bail!("对端拒绝了本次连接：{}", peer_verdict.reason);
+    }
     Ok(peer)
 }
 
@@ -369,7 +392,7 @@ mod tests {
     #[test]
     fn auth_message_binds_ids_nonces_and_session() {
         let a = auth_message("alice", "bob", "n1", "n2", "s1");
-        assert_eq!(a, "QP2P-AUTH-2|alice|bob|n1|n2|s1");
+        assert_eq!(a, "QP2P-AUTH-3|alice|bob|n1|n2|s1");
         // 换任何一段都必须得到不同的签名内容
         assert_ne!(a, auth_message("bob", "alice", "n1", "n2", "s1"));
         assert_ne!(a, auth_message("alice", "bob", "n2", "n1", "s1"));
