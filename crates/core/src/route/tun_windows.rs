@@ -205,19 +205,9 @@ impl WindowsTun {
         Ok(())
     }
 
-    /// 用 `netsh interface ipv4 show addresses` 找接口索引，找不到就交给系统挑。
+    /// 找接口索引，找不到就交给系统挑。
     fn if_index(&self) -> Option<u32> {
-        let output = Command::new("netsh")
-            .args(["interface", "ipv4", "show", "interfaces"])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            if line.contains(&self.name) {
-                return line.split_whitespace().next()?.parse().ok();
-            }
-        }
-        None
+        if_index_of(&self.name)
     }
 }
 
@@ -316,22 +306,38 @@ impl Drop for WindowsTun {
 }
 
 /// 让某个网段走这条隧道。
-#[allow(dead_code)]
+///
+/// `route add ... if` 要的是**接口索引**而不是名字，所以先把名字换成索引；
+/// 换不到就让系统自己挑（不加 if 参数）。
 pub fn route_to(device: &str, cidr: &Cidr) -> Result<()> {
     let mask = Ipv4Mask::of(cidr.prefix);
-    run(
-        "route",
-        &[
-            "add",
-            &cidr.base.to_string(),
-            "mask",
-            &mask.0,
-            "0.0.0.0",
-            "if",
-            device,
-        ],
-    )
-    .with_context(|| format!("添加路由 {cidr} 失败"))
+    let mut args = vec![
+        "add".to_string(),
+        cidr.base.to_string(),
+        "mask".to_string(),
+        mask.0.clone(),
+        "0.0.0.0".to_string(),
+    ];
+    if let Some(index) = if_index_of(device) {
+        args.push("if".to_string());
+        args.push(index.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run("route", &refs).with_context(|| format!("添加路由 {cidr} 失败"))
+}
+
+fn if_index_of(name: &str) -> Option<u32> {
+    let output = Command::new("netsh")
+        .args(["interface", "ipv4", "show", "interfaces"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if line.contains(name) {
+            return line.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
 }
 
 /// wintun.dll 应该被放在哪里，出问题时打到日志里。

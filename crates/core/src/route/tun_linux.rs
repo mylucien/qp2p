@@ -107,11 +107,6 @@ impl LinuxTun {
         run_ip(&["route", "add", &cidr.to_string(), "dev", device])
             .with_context(|| format!("添加路由 {cidr} 失败"))
     }
-
-    pub fn remove_route(cidr: &Cidr) -> Result<()> {
-        run_ip(&["route", "del", &cidr.to_string()])
-            .with_context(|| format!("删除路由 {cidr} 失败"))
-    }
 }
 
 fn run_ip(args: &[&str]) -> Result<()> {

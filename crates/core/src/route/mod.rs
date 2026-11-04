@@ -143,6 +143,26 @@ pub fn open(config: &TunConfig) -> Result<Box<dyn TunDevice>> {
     }
 }
 
+/// 让一个网段走这条隧道。
+///
+/// 典型用法：对端网卡背后还有一片局域网（192.168.1.0/24），
+/// 在本地加一条指向隧道的路由之后，访问那些地址就像访问本网段一样。
+pub fn add_route(device: &str, cidr: &Cidr) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        tun_linux::LinuxTun::route_to(device, cidr)
+    }
+    #[cfg(windows)]
+    {
+        tun_windows::route_to(device, cidr)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (device, cidr);
+        bail!("当前平台还不支持添加隧道路由")
+    }
+}
+
 /// 把同步的设备读写搬到两个独立线程，转成异步通道。
 ///
 /// TUN 设备的读写是阻塞的，放进 tokio 任务里会卡住整个运行时；

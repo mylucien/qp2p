@@ -39,6 +39,7 @@ qp2p — 私有打洞组网
   --tun-addr 本机虚拟地址；不填则由 node_id 派生（tun 模式）
   --mtu      虚拟网卡 MTU，默认 1400（tun 模式）
   --dev      虚拟网卡名，默认 qp2p0（Linux 最长 15 字节；Windows 需要管理员）
+  --route    额外让某个网段走隧道，可重复（例：--route 192.168.1.0/24）
   --allow-target  --serve 的别名，保留兼容
   --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
@@ -282,6 +283,16 @@ async fn cmd_tun(args: &[String]) -> Result<()> {
             config.name
         )
     })?;
+    // 访问对端背后的局域网：把那些网段指到这条隧道上
+    for raw in flags.many("route") {
+        let cidr: qp2p_core::route::Cidr = raw
+            .parse()
+            .with_context(|| format!("--route 不是合法网段：{raw}"))?;
+        qp2p_core::route::add_route(&config.name, &cidr)
+            .with_context(|| format!("添加路由 {cidr} 失败"))?;
+        println!("路由已添加: {cidr} → {}", config.name);
+    }
+
     let link = qp2p_core::route::spawn_io(device, mtu);
     println!("隧道已启动：可以 ping 对端的虚拟地址，Ctrl+C 退出");
 
