@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use qp2p_core::route::{self, Cidr, TunConfig, TunDevice};
+use qp2p_core::route::{self, Cidr, TunConfig};
 
 const DEV: &str = "qp2pt0";
 const ADDR: &str = "10.64.99.2";
