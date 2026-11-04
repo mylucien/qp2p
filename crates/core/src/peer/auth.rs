@@ -38,6 +38,8 @@ const AUTH_VERSION: u8 = 3;
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单帧上限，防止对端塞一个巨大的 JSON。
 const MAX_FRAME: usize = 4096;
+/// 拒绝时等对端收尾的上限：只是等一个 FIN，正常几毫秒。
+const CONCLUDE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const AUTH_TAG: &str = "QP2P-AUTH-3";
 
@@ -159,6 +161,19 @@ pub async fn authenticate_dialer(
     };
     let _ = write_frame(&mut send, &ack).await;
     let _ = send.finish();
+
+    // 6. 拒绝时等 listener 把流关掉再返回。
+    //    否则调用方立刻 close 连接，CONNECTION_CLOSE 会抢在这一帧前面，
+    //    listener 只看到"连接已关闭"，拿不到"对端身份不符"这个真实原因。
+    //    listener 读完这帧就 finish，这里会立刻读到 EOF，不额外消耗往返。
+    if outcome.is_err() {
+        let _ = tokio::time::timeout(CONCLUDE_TIMEOUT, async {
+            let mut scratch = [0u8; 16];
+            // 读到 EOF / 出错为止：对端读完那一帧就会 finish
+            while let Ok(Some(_)) = recv.read(&mut scratch).await {}
+        })
+        .await;
+    }
 
     outcome?;
     Ok(peer)

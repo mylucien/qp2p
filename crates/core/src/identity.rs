@@ -94,19 +94,21 @@ impl Identity {
 
         let path = dir.join(IDENTITY_FILE);
         if path.exists() {
-            let text = fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("读取身份文件失败 {}: {e}", path.display()))?;
-            let bytes = hex::decode(text.trim())
-                .map_err(|e| anyhow::anyhow!("身份文件不是合法十六进制: {e}"))?;
-            let seed: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("身份文件长度必须是 32 字节"))?;
-            return Ok(Self::from_seed(&seed));
+            return read_identity(&path);
         }
 
         let identity = Self::generate();
-        write_secret(&path, hex::encode(identity.to_seed()).as_bytes())?;
-        Ok(identity)
+        // create_new：权限从创建那一刻就是 0600，且不会覆盖别人刚写好的身份
+        let created =
+            crate::secret_file::create_private(&path, hex::encode(identity.to_seed()).as_bytes())
+                .map_err(|e| anyhow::anyhow!("写入身份文件失败 {}: {e}", path.display()))?;
+
+        if created {
+            Ok(identity)
+        } else {
+            // 另一个进程抢先创建了：用它写下的那一份
+            read_identity(&path)
+        }
     }
 
     pub fn public_key(&self) -> [u8; 32] {
@@ -140,15 +142,15 @@ impl fmt::Debug for Identity {
 }
 
 /// 写私密文件：内容只有自己能读。
-fn write_secret(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
-    fs::write(path, bytes)
-        .map_err(|e| anyhow::anyhow!("写入身份文件失败 {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+fn read_identity(path: &PathBuf) -> anyhow::Result<Identity> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("读取身份文件失败 {}: {e}", path.display()))?;
+    let bytes =
+        hex::decode(text.trim()).map_err(|e| anyhow::anyhow!("身份文件不是合法十六进制: {e}"))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("身份文件长度必须是 32 字节"))?;
+    Ok(Identity::from_seed(&seed))
 }
 
 /// 由 node_id 派生虚拟地址。

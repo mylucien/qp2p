@@ -51,8 +51,12 @@ pub async fn bind(
     // 1) STUN：必须在交给 quinn 之前，且用同一个 socket
     let srflx = probe_stun(&socket, stun_servers, Duration::from_secs(3)).await;
 
-    // 2) UPnP：失败只是少一个候选
-    let mapping = try_upnp(local_addr, Duration::from_secs(2)).await;
+    // 2) UPnP：失败只是少一个候选；回环地址上没有路由器可问，直接跳过
+    let mapping = if local_addr.ip().is_loopback() {
+        None
+    } else {
+        try_upnp(local_addr, Duration::from_secs(2)).await
+    };
     let upnp_mapping = mapping.as_ref().map(upnp::Mapping::external);
 
     socket

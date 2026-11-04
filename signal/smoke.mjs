@@ -215,6 +215,12 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   });
   check("过短的加入密钥被拒", shortKey.status === 400, shortKey.body);
 
+  const weak = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "weak-key-test", join_key: "abcdefghijklmnopqrst" },
+  });
+  check("可猜的预设密钥带提醒", weak.status === 200 && Boolean(weak.body.warning), weak.body);
+
   const otherNet = await call("POST", "/v1/admin/networks", {
     admin: secret,
     body: { name: "lab" },

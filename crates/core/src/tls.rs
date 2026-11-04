@@ -10,7 +10,7 @@
 //! 证书指纹留给需要 TLS 层钉扎的场景：`client_config(Some(fp))`。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,17 +53,16 @@ impl TlsIdentity {
         let key_path = dir.join(KEY_FILE);
 
         if cert_path.exists() && key_path.exists() {
-            let cert = fs::read(&cert_path).context("读取证书失败")?;
-            let key = fs::read(&key_path).context("读取私钥失败")?;
-            return Ok(Self {
-                cert: CertificateDer::from(cert),
-                key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
-            });
+            return Self::load(dir);
         }
 
         let generated = Self::generate()?;
-        generated.persist(dir)?;
-        Ok(generated)
+        if generated.persist(dir)? {
+            Ok(generated)
+        } else {
+            // 另一个进程抢先写了证书/私钥：以磁盘上的为准，避免"证书是 A 的、私钥是 B 的"
+            Self::load(dir)
+        }
     }
 
     fn generate() -> Result<Self> {
@@ -75,14 +74,26 @@ impl TlsIdentity {
         })
     }
 
-    fn persist(&self, dir: &Path) -> Result<()> {
+    fn load(dir: &Path) -> Result<Self> {
+        let cert = fs::read(dir.join(CERT_FILE)).context("读取证书失败")?;
+        let key = fs::read(dir.join(KEY_FILE)).context("读取私钥失败")?;
+        Ok(Self {
+            cert: CertificateDer::from(cert),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        })
+    }
+
+    /// 落盘。返回 false 表示证书或私钥已经存在（另一个进程抢先了）。
+    fn persist(&self, dir: &Path) -> Result<bool> {
         let key_der = match &self.key {
             PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
             _ => anyhow::bail!("只支持 PKCS#8 私钥"),
         };
-        write_private(&dir.join(CERT_FILE), self.cert.as_ref())?;
-        write_private(&dir.join(KEY_FILE), &key_der)?;
-        Ok(())
+        let cert_new = crate::secret_file::create_private(&dir.join(CERT_FILE), self.cert.as_ref())
+            .with_context(|| format!("写入证书失败：{}", dir.display()))?;
+        let key_new = crate::secret_file::create_private(&dir.join(KEY_FILE), &key_der)
+            .with_context(|| format!("写入私钥失败：{}", dir.display()))?;
+        Ok(cert_new && key_new)
     }
 
     /// 证书指纹（sha256 hex），用于钉扎与人工核对。
@@ -241,20 +252,10 @@ fn supported_schemes() -> Vec<rustls::SignatureScheme> {
         .supported_schemes()
 }
 
-/// 私钥只有自己能读。Windows 上没有等价的位，交给目录 ACL。
-fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).with_context(|| format!("写入失败：{}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("qp2p-tls-{tag}-{}", std::process::id()))

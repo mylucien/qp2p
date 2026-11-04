@@ -216,6 +216,9 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
         _ = tokio::signal::ctrl_c() => println!("收到中断，退出"),
         reason = conn.closed() => println!("连接已关闭（{reason}），退出"),
     }
+
+    // 显式收尾：删掉路由器上的 UPnP 映射。Drop 里 spawn 的任务在运行时关闭时跑不完。
+    engine.shutdown().await;
     Ok(())
 }
 
@@ -272,6 +275,9 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
             Err(e) => println!("转发任务异常：{e}"),
         },
     }
+
+    forward.abort();
+    engine.shutdown().await;
     Ok(())
 }
 

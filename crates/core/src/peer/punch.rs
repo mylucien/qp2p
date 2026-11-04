@@ -294,6 +294,17 @@ async fn confirm_as_listener(conn: &Connection) -> bool {
     send.write_all(HELLO_ACK).await.is_ok()
 }
 
+/// 窗口结束时该报什么错。
+///
+/// 只报"超时"会把"对面身份不符"这条最有用的信息盖掉；但如果只说身份不符，
+/// 调用方可能会以为不用再试。所以包成可重试的 `Dial`，把原因带上。
+fn window_expired(last_auth: &Option<String>, window: Duration) -> PunchError {
+    match last_auth {
+        Some(msg) => PunchError::Dial(format!("窗口内没有连上任何对端；最后一次失败：{msg}")),
+        None => PunchError::Timeout(window),
+    }
+}
+
 async fn listen_with_probes(
     endpoint: &Endpoint,
     candidates: &[SocketAddr],
@@ -307,7 +318,10 @@ async fn listen_with_probes(
     let allowed_ips: Vec<std::net::IpAddr> = candidates.iter().map(|c| c.ip()).collect();
     let claimed = Arc::new(AtomicBool::new(false));
     let accept_loop = async move {
-        let mut handshakes: JoinSet<Option<Connection>> = JoinSet::new();
+        // 握手失败的**原因**要留下来：只报"超时"等于把最有用的信息扔了，
+        // 用户看到的是"连不上"，实际是"对面身份不对"。
+        let mut handshakes: JoinSet<Result<Connection, String>> = JoinSet::new();
+        let mut last_auth: Option<String> = None;
         // 窗口到点后仍在飞的握手的最晚收尾时刻。
         // 两端的窗口起点几乎不可能对齐（对端往往比我们晚上线），
         // 到点就直接返回会把对端正要完成的连接连同端点一起丢掉，
@@ -319,14 +333,18 @@ async fn listen_with_probes(
                 // 并发握手：一个卡住的连接不能堵住真正的 dialer
                 joined = handshakes.join_next(), if !handshakes.is_empty() => {
                     match joined {
-                        Some(Ok(Some(conn))) => {
+                        Some(Ok(Ok(conn))) => {
                             handshakes.abort_all();
                             return Ok(conn);
                         }
-                        Some(Ok(None)) => {
+                        Some(Ok(Err(msg))) => {
+                            if !msg.is_empty() {
+                                tracing::debug!("[punch] 握手失败：{msg}");
+                                last_auth = Some(msg);
+                            }
                             // 握手失败就把机会让回去
                             if handshakes.is_empty() && grace_until.is_some() {
-                                return Err(PunchError::Timeout(timeout));
+                                return Err(window_expired(&last_auth, timeout));
                             }
                         }
                         Some(Err(_)) => {}
@@ -348,37 +366,37 @@ async fn listen_with_probes(
                     handshakes.spawn(async move {
                         let conn = match tokio::time::timeout(ATTEMPT_TIMEOUT * 4, incoming).await {
                             Ok(Ok(conn)) => conn,
-                            _ => return None,
+                            _ => return Err(String::new()),
                         };
                         // 先抢占再回 ACK：如果先回 ACK 再放弃，对端会确认这条连接，
                         // 而我们随后把它关掉——表现为"两端都连上了，但一用就断"
                         if claim.swap(true, Ordering::SeqCst) {
                             conn.close(0u32.into(), b"another-winner");
-                            return None;
+                            return Err(String::new());
                         }
                         // 确认失败就把机会让回去，否则整个打洞卡在一条坏连接上
                         if !confirm_as_listener(&conn).await {
                             claim.store(false, Ordering::SeqCst);
                             conn.close(0u32.into(), b"unconfirmed");
-                            return None;
+                            return Err(String::new());
                         }
                         // 认证失败要留下痕迹：否则有人在试探时，这一侧什么都看不到
                         if let Err(e) = verify_peer(&conn, &auth, false).await {
                             tracing::warn!("[punch] 拒绝来自 {remote} 的连接：{e}");
                             claim.store(false, Ordering::SeqCst);
                             conn.close(0u32.into(), b"auth-failed");
-                            return None;
+                            return Err(format!("{remote}: {e}"));
                         }
-                        Some(conn)
+                        Ok(conn)
                     });
                 }
                 _ = tokio::time::sleep_until(wake) => {
                     if grace_until.is_some() {
                         handshakes.abort_all();
-                        return Err(PunchError::Timeout(timeout));
+                        return Err(window_expired(&last_auth, timeout));
                     }
                     if handshakes.is_empty() {
-                        return Err(PunchError::Timeout(timeout));
+                        return Err(window_expired(&last_auth, timeout));
                     }
                     // 还有握手在飞：给它们一段宽限，别再接受新连接
                     tracing::debug!(

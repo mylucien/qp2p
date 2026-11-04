@@ -358,7 +358,7 @@ async fn wrong_expected_identity_is_rejected() {
     let a_peers = [b.local_addr()];
     let b_peers = [a.local_addr()];
     let window = Duration::from_secs(4);
-    let (dialer, _listener) = tokio::join!(
+    let (dialer, listener) = tokio::join!(
         a.punch(&a_peers, Role::Dialer, window),
         b.punch(&b_peers, Role::Listener, window)
     );
@@ -367,6 +367,15 @@ async fn wrong_expected_identity_is_rejected() {
     assert!(
         format!("{err}").contains("认证"),
         "失败原因应指向认证，而不是超时：{err}"
+    );
+
+    // dialer 拒绝时，listener 也必须看到真实原因，而不是一句"对端没有给出结论"。
+    // 之前 ack 写完后立刻 close，CONNECTION_CLOSE 会抢在帧前面。
+    let listener_err = listener.expect_err("被拒的一方不应报告连接成功");
+    let text = format!("{listener_err}");
+    assert!(
+        text.contains("身份不符") || text.contains("拒绝"),
+        "listener 应能看到拒绝原因：{text}"
     );
 }
 

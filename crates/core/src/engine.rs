@@ -166,6 +166,28 @@ impl Engine {
         &self.candidates
     }
 
+    /// 主动收尾：停续租、删掉路由器上的端口映射、关掉端点。
+    ///
+    /// `Drop` 里做不了这些——运行时可能已经关了，spawn 出去的删除任务根本跑不完，
+    /// 路由器上就留一条指向空气的映射。CLI 退出前应当显式调用这个方法。
+    pub async fn shutdown(&mut self) {
+        if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        if let Some(mapping) = self.mapping.take() {
+            match tokio::time::timeout(Duration::from_secs(3), mapping.delete()).await {
+                Ok(Ok(())) => tracing::info!("[engine] UPnP 映射已删除"),
+                Ok(Err(e)) => tracing::debug!("[engine] 删除 UPnP 映射失败: {e}"),
+                Err(_) => tracing::debug!("[engine] 删除 UPnP 映射超时"),
+            }
+        }
+        if let Some(endpoint) = self.endpoint.take() {
+            endpoint.close(0u32.into(), b"shutdown");
+            let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
+        }
+        self.keepalive = None;
+    }
+
     /// 关闭当前端点，在同一个端口上重建，并重新做 STUN / UPnP。
     ///
     /// 失败时端点保持关闭并返回错误，调用方下一轮会拿到"端点不可用"，
@@ -176,11 +198,13 @@ impl Engine {
             task.abort();
         }
         if let Some(old) = self.mapping.take() {
-            tokio::spawn(async move {
-                if let Err(e) = old.delete().await {
-                    tracing::debug!("[engine] 删除旧 UPnP 映射失败: {e}");
-                }
-            });
+            // 必须等它删完再重绑：映射是按端口登记的，新映射建好之后
+            // 旧的后台任务一删，删掉的就是新映射（同端口）。
+            match tokio::time::timeout(Duration::from_secs(3), old.delete()).await {
+                Ok(Ok(())) => tracing::debug!("[engine] 旧 UPnP 映射已删除"),
+                Ok(Err(e)) => tracing::debug!("[engine] 删除旧 UPnP 映射失败: {e}"),
+                Err(_) => tracing::debug!("[engine] 删除旧 UPnP 映射超时"),
+            }
         }
 
         if let Some(endpoint) = self.endpoint.take() {
@@ -378,7 +402,7 @@ impl Drop for Engine {
         if let Some(task) = self.renewer.take() {
             task.abort();
         }
-        // 退出时把路由器上的映射删掉，别占着端口表
+        // 兜底：正常退出应当显式调用 shutdown().await，这里只处理被遗忘的情况
         if let Some(mapping) = self.mapping.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {

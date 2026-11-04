@@ -247,6 +247,9 @@ async function createNetwork(request, env) {
     note: preset
       ? "这是你预设的加入密钥，请分发给要加入的节点"
       : "这是随机生成的加入密钥，只回显这一次；丢了用 rotate 换一把",
+    ...(preset && joinKeyLooksWeak(joinKey)
+      ? { warning: "这把预设密钥看起来容易被猜：服务端只存它的哈希，一旦数据库泄漏就能离线爆破。建议省略 join_key，让服务端生成随机的" }
+      : {}),
   });
 }
 
@@ -274,6 +277,9 @@ async function rotateJoinKey(request, env, networkId) {
     network: { id: net.network_id, name: net.name, cidr: net.cidr },
     token: tokenOf(net.network_id, joinKey),
     note: "该网络原有令牌已失效，节点需要重新 join",
+    ...(preset && joinKeyLooksWeak(joinKey)
+      ? { warning: "这把预设密钥看起来容易被猜，建议省略 join_key 让服务端生成随机密钥" }
+      : {}),
   });
 }
 
@@ -297,6 +303,19 @@ function validateJoinKey(key) {
     return err(400, "invalid_join_key", "join_key 长度需在 16~128 字符之间");
   }
   return null;
+}
+
+/**
+ * 手写密钥是不是明显可猜。
+ *
+ * 服务端只存 sha256，所以弱密钥本身不致命——但一旦 D1 备份泄漏，
+ * 哈希就可以离线爆破。这里不拒绝（会误伤密码短语），只提醒。
+ */
+function joinKeyLooksWeak(key) {
+  const unique = new Set(key).size;
+  if (unique < 8) return true;
+  if (/^[a-z]+$/.test(key) || /^[0-9]+$/.test(key)) return true;
+  return false;
 }
 
 function tokenOf(networkId, joinKey) {
