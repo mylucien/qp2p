@@ -14,8 +14,8 @@ const HELP: &str = "\
 qp2p — 私有打洞组网
 
 用法：
-  qp2p punch   --bind <addr> --peer <addr> [--dialer] [--stun <host:port>]...
-  qp2p forward --bind <addr> --peer <addr> [--dialer] --listen <addr> --target <addr>
+  qp2p punch   --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer) [--stun <host:port>]...
+  qp2p forward --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer) --listen <addr> --target <addr>
   qp2p doctor  [--bind <addr>] [--stun <host:port>]...
   qp2p -V | --version
 
@@ -27,8 +27,10 @@ qp2p — 私有打洞组网
   --target   对端要去连的地址（由对端发起 TCP 连接，不是本机连它）
   --serve    本机允许对端访问的地址，可重复；不填则拒绝一切入站
              （通常填对端的 --target，两边要对称）
-  --peer-id  要求对端必须是指定的 node_id（32 位十六进制）
-             不填则只验签、不限定具体身份
+  --peer-id  要求对端必须是指定的 node_id（32 位十六进制），在对端运行 `qp2p doctor` 可查到
+             必须二选一：--peer-id 或 --any-peer，否则拒绝启动
+  --any-peer 不限定对端身份：任何人生成一把密钥都能通过认证，并访问 --serve 里的地址
+             只建议在完全可信的网络里做试验时用
   --peer-fp  要求对端 TLS 证书指纹一致（64 位十六进制），不符时握手就失败
   --data-dir 身份与证书的存放目录，默认 ~/.qp2p；同一目录重启后 node_id 不变
   --allow-target  --serve 的别名，保留兼容
@@ -273,7 +275,40 @@ async fn cmd_forward(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 对端身份策略。
+///
+/// 认证只证明"对面持有某把密钥"，不证明"对面是你想连的那个人"：不限定身份时，
+/// 任何人现生成一把密钥都能通过认证、并访问 `--serve` 白名单里的地址。
+/// 所以默认必须明说要连谁；确实不想限定，要显式写 `--any-peer`。
+#[derive(Debug, PartialEq, Eq)]
+enum PeerPolicy {
+    Pinned(qp2p_core::identity::NodeId),
+    Any,
+}
+
+fn peer_policy(flags: &Flags) -> Result<PeerPolicy> {
+    let pinned = flags.get("peer-id");
+    let any = flags.flag("any-peer");
+
+    match (pinned, any) {
+        (Some(_), true) => bail!("--peer-id 和 --any-peer 互相矛盾，只能选一个"),
+        (Some(raw), false) => {
+            let id = qp2p_core::identity::NodeId::parse(raw)
+                .with_context(|| format!("--peer-id 格式不对（要 32 位十六进制）：{raw}"))?;
+            Ok(PeerPolicy::Pinned(id))
+        }
+        (None, true) => Ok(PeerPolicy::Any),
+        (None, false) => bail!(
+            "缺少 --peer-id：不限定对端身份时，任何人生成一把密钥都能通过认证，\n\
+             并访问 --serve 里的地址。请在对端运行 `qp2p doctor` 取它的 node_id；\n\
+             确实要放开（仅限可信网络试验），请显式加 --any-peer"
+        ),
+    }
+}
+
 async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
+    // 先校验策略：错了就立刻报，别等绑定端口、STUN、UPnP 折腾完才发现
+    let policy = peer_policy(flags)?;
     let bind = flags.addr("bind", Some("0.0.0.0:51820"))?;
     let peers = flags.addrs("peer")?;
     if peers.is_empty() {
@@ -291,11 +326,12 @@ async fn prepare(flags: &Flags) -> Result<(Engine, Vec<SocketAddr>, Role)> {
         .await
         .context("绑定 UDP 失败")?;
 
-    // 打洞成功后双方会交换身份并互相验签；给了 --peer-id 就要求必须是它
-    if let Some(raw) = flags.get("peer-id") {
-        let id = qp2p_core::identity::NodeId::parse(raw)
-            .with_context(|| format!("--peer-id 格式不对（要 32 位十六进制）：{raw}"))?;
-        engine.expect_peer(Some(id));
+    // 打洞成功后双方会交换身份并互相验签，并且签名绑定本条 TLS 会话
+    match policy {
+        PeerPolicy::Pinned(id) => engine.expect_peer(Some(id)),
+        PeerPolicy::Any => {
+            tracing::warn!("已指定 --any-peer：不限定对端身份，任何持有合法密钥的节点都能通过认证")
+        }
     }
 
     if let Some(fp) = flags.get("peer-fp") {
@@ -314,4 +350,53 @@ fn data_dir(flags: &Flags) -> Result<Option<std::path::PathBuf>> {
     }
     let base = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     Ok(base.map(|p| std::path::PathBuf::from(p).join(".qp2p")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "00112233445566778899aabbccddeeff";
+
+    fn flags(args: &[&str]) -> Flags {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        Flags::parse(&args).expect("参数合法")
+    }
+
+    #[test]
+    fn peer_id_is_required_by_default() {
+        let err = peer_policy(&flags(&["--peer", "1.2.3.4:5"])).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--peer-id"), "{text}");
+        assert!(text.contains("--any-peer"), "{text}");
+    }
+
+    #[test]
+    fn peer_id_pins_the_identity() {
+        let policy = peer_policy(&flags(&["--peer-id", ID])).unwrap();
+        match policy {
+            PeerPolicy::Pinned(id) => assert_eq!(id.as_str(), ID),
+            PeerPolicy::Any => panic!("应当是 Pinned"),
+        }
+    }
+
+    #[test]
+    fn any_peer_must_be_explicit() {
+        assert_eq!(
+            peer_policy(&flags(&["--any-peer"])).unwrap(),
+            PeerPolicy::Any
+        );
+        // 开关后面紧跟别的选项也要认
+        assert_eq!(
+            peer_policy(&flags(&["--any-peer", "--dialer"])).unwrap(),
+            PeerPolicy::Any
+        );
+    }
+
+    #[test]
+    fn conflicting_or_malformed_peer_id_is_rejected() {
+        assert!(peer_policy(&flags(&["--peer-id", ID, "--any-peer"])).is_err());
+        assert!(peer_policy(&flags(&["--peer-id", "not-hex"])).is_err());
+        assert!(peer_policy(&flags(&["--peer-id", "abcd"])).is_err());
+    }
 }

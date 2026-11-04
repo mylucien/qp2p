@@ -6,6 +6,7 @@
 //! 旧实现是"双方在同一个 800ms 窗口里同时发"，启动差 1.5 秒就必然错过，
 //! 而重试间隔是 30 秒起——手动开两个终端基本打不通。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -143,32 +144,51 @@ async fn dial_all(
     let started = Instant::now();
     let mut last_error = String::new();
 
+    // 身份不符的候选：它背后是别的节点（比如同网段里另一台 qp2p），
+    // 不能因为它就放弃其他候选，但也没必要在后续轮次里再去敲它。
+    // 去重但保持调用方给的顺序（内网优先、upnp 先于 srflx）：
+    // 换成 HashSet 虽然能去重，但日志顺序会随进程变化，排障时对不上。
+    let mut distinct: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
+    for addr in candidates {
+        if !distinct.contains(addr) {
+            distinct.push(*addr);
+        }
+    }
+    let mut wrong_identity: HashSet<SocketAddr> = HashSet::new();
+    let mut auth_notes: Vec<String> = Vec::new();
+
     let result = loop {
         // 每个候选只发一条连接，让 QUIC 自己重传 Initial；
         // 以前每 150ms 新建一条，10 秒就是几百次握手，还会让两端各自
         // 选中不同的连接（已复现：一端拿到连接后立刻被对端关掉）。
-        let mut attempts: JoinSet<Result<Connection, AttemptError>> = JoinSet::new();
-        for addr in candidates {
+        let mut attempts: JoinSet<(SocketAddr, Result<Connection, AttemptError>)> = JoinSet::new();
+        for addr in distinct.iter().filter(|a| !wrong_identity.contains(a)) {
             let endpoint = endpoint.clone();
             let addr = *addr;
             let auth = auth.clone();
-            attempts.spawn(async move { attempt_once(&endpoint, addr, deadline, auth).await });
+            attempts
+                .spawn(async move { (addr, attempt_once(&endpoint, addr, deadline, auth).await) });
         }
 
         let mut winner = None;
         while let Some(joined) = attempts.join_next().await {
             match joined {
-                Ok(Ok(conn)) => {
+                Ok((_, Ok(conn))) => {
                     winner = Some(conn);
                     break;
                 }
-                Ok(Err(AttemptError::Auth(msg))) => {
-                    // 身份不对不是网络抖动，重试没有意义，立刻收尾并把原因说清楚
-                    attempts.abort_all();
-                    drain_task.abort();
-                    return Err(PunchError::Auth(msg));
+                Ok((addr, Err(AttemptError::Auth(msg)))) => {
+                    tracing::warn!("[punch] 候选 {addr} 不是要找的节点，后续不再尝试它：{msg}");
+                    wrong_identity.insert(addr);
+                    auth_notes.push(msg);
+                    // 所有候选都是别人：重试只会一直失败，立刻收尾并说清原因
+                    if wrong_identity.len() >= distinct.len() {
+                        attempts.abort_all();
+                        drain_task.abort();
+                        return Err(PunchError::Auth(auth_notes.join("；")));
+                    }
                 }
-                Ok(Err(e)) => last_error = e.message().to_string(),
+                Ok((_, Err(e))) => last_error = e.message().to_string(),
                 Err(e) => last_error = e.to_string(),
             }
         }
@@ -178,7 +198,19 @@ async fn dial_all(
             break Ok(conn);
         }
         if Instant::now() >= deadline {
-            break if last_error.is_empty() {
+            break if !auth_notes.is_empty() {
+                // 只剩"别人"和"没连上"：把两件事都讲出来，别只报一个超时
+                let rest = if last_error.is_empty() {
+                    String::new()
+                } else {
+                    format!("；其余候选：{last_error}")
+                };
+                Err(PunchError::Dial(format!(
+                    "{} 个候选身份不符（{}）{rest}",
+                    wrong_identity.len(),
+                    auth_notes[0]
+                )))
+            } else if last_error.is_empty() {
                 Err(PunchError::Timeout(started.elapsed()))
             } else {
                 Err(PunchError::Dial(last_error))
@@ -303,16 +335,20 @@ async fn listen_with_probes(
                             conn.close(0u32.into(), b"another-winner");
                             return None;
                         }
-                        if confirm_as_listener(&conn).await
-                            && verify_peer(&conn, &auth, false).await.is_ok()
-                        {
-                            Some(conn)
-                        } else {
-                            // 确认失败就把机会让回去，否则整个打洞卡在一条坏连接上
+                        // 确认失败就把机会让回去，否则整个打洞卡在一条坏连接上
+                        if !confirm_as_listener(&conn).await {
                             claim.store(false, Ordering::SeqCst);
                             conn.close(0u32.into(), b"unconfirmed");
-                            None
+                            return None;
                         }
+                        // 认证失败要留下痕迹：否则有人在试探时，这一侧什么都看不到
+                        if let Err(e) = verify_peer(&conn, &auth, false).await {
+                            tracing::warn!("[punch] 拒绝来自 {remote} 的连接：{e}");
+                            claim.store(false, Ordering::SeqCst);
+                            conn.close(0u32.into(), b"auth-failed");
+                            return None;
+                        }
+                        Some(conn)
                     });
                 }
             }

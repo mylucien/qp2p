@@ -1,20 +1,26 @@
 //! 连接建立后的对端认证（应用层握手）。
 //!
-//! QUIC 这一层目前是自签证书 + 跳过校验，任何能到达 UDP 端口的人都能把
+//! QUIC 这一层默认是自签证书 + 跳过校验，任何能到达 UDP 端口的人都能把
 //! 握手做完；而 `serve_flows` 会服务"打洞胜出的那条连接"，所以光有打洞
 //! 不能说明对面是谁。
 //!
 //! 这里在 QUIC 之上做一次带 nonce 的双向挑战应答：双方各自用身份私钥签名，
-//! 签名里同时绑定对方和自己的 node_id，因此
+//! 签名里同时绑定对方和自己的 node_id，以及**这条 TLS 会话的导出值**，因此
 //!
 //! - 复放一张旧的认证帧没用（nonce 是本次连接现生成的）
 //! - 反射攻击没用（签名顺序里两边的 id 不能互换）
 //! - 想冒充某个已知 node_id，必须先拿到它的私钥
+//! - **中继 / 中间人没用**：TLS 不校验证书，路径上的人可以终结两段 QUIC 再
+//!   逐帧转发认证帧；但两段 TLS 会话的导出值不同，转发过去的签名在对面
+//!   必然校验失败（通道绑定，RFC 5705 / RFC 9266 同一思路）
 //!
-//! 只花两个往返，一条流搞定。之所以不走 TLS 证书钉扎：身份本来就是一把
-//! Ed25519 密钥，再引入"证书 → 指纹 → 钉扎"要多一层持久化和分发，
-//! 得到的保证是同一个。将来若要在 TLS 层也隐身（抗 DPI 或挡握手 DoS），
-//! 再把证书绑到这把密钥上、复用同一套指纹即可。
+//! 最后一条是关键：只有"身份签名"而没有"会话绑定"，认证只能证明对面有那把
+//! 钥匙，证明不了自己正在和它直接通话。这一点不能靠"反正身份是 Ed25519
+//! 密钥"省掉，也不等价于证书钉扎——钉扎是在 TLS 层拒绝陌生证书，通道绑定是
+//! 在应用层证明"签名的人就是 TLS 对面的人"，两者任选其一都能挡住中继，
+//! 默认路径上只有通道绑定是始终生效的。
+//!
+//! 只花两个往返，一条流搞定。
 
 use std::time::Duration;
 
@@ -25,13 +31,18 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{Identity, NodeId};
 
 /// 认证协议版本，改字段就换一个。
-const AUTH_VERSION: u8 = 1;
+const AUTH_VERSION: u8 = 2;
 /// 单步超时。握手是本地往返，超过这个时间基本就是出问题了。
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单帧上限，防止对端塞一个巨大的 JSON。
 const MAX_FRAME: usize = 4096;
 
-const AUTH_TAG: &str = "QP2P-AUTH-1";
+const AUTH_TAG: &str = "QP2P-AUTH-2";
+
+/// TLS keying material exporter 的标签与上下文。
+/// 两端必须一致；改了就要同时升 `AUTH_VERSION` 和 `AUTH_TAG`。
+const BINDING_LABEL: &[u8] = b"EXPORTER-qp2p-auth-v2";
+const BINDING_LEN: usize = 32;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Hello {
@@ -45,8 +56,19 @@ struct Hello {
 struct Proof {
     v: u8,
     node_id: String,
-    /// 对 `AUTH_TAG|signer|peer|my_nonce|peer_nonce` 的签名
+    /// 对 `AUTH_TAG|signer|peer|my_nonce|peer_nonce|binding` 的签名
     sig: String,
+}
+
+/// listener 对本次认证的最终裁决。
+///
+/// 少了这一帧，dialer 发完自己的签名就返回成功：即使 listener 因为身份不符
+/// 把连接关掉，dialer 侧还是打印"认证通过"，然后在第一次开流时才莫名其妙地失败。
+#[derive(Debug, Serialize, Deserialize)]
+struct Verdict {
+    ok: bool,
+    #[serde(default)]
+    reason: String,
 }
 
 /// 认证结果：确认过的对端身份。
@@ -67,6 +89,7 @@ pub async fn authenticate_dialer(
         .context("打开认证流超时")?
         .context("打开认证流失败")?;
 
+    let binding = channel_binding(conn)?;
     let my_nonce = random_nonce();
 
     // 1. 我先亮身份（含 nonce）
@@ -91,6 +114,7 @@ pub async fn authenticate_dialer(
         &identity.node_id(),
         &peer_nonce,
         &my_nonce,
+        &binding,
     )?;
 
     // 3. 我回签，证明我也持有私钥
@@ -99,6 +123,7 @@ pub async fn authenticate_dialer(
         peer.node_id.as_str(),
         &my_nonce,
         &peer_nonce,
+        &binding,
     );
     let my_proof = Proof {
         v: AUTH_VERSION,
@@ -109,6 +134,15 @@ pub async fn authenticate_dialer(
     let _ = send.finish();
 
     check_expected(&peer.node_id, expected)?;
+
+    // 4. 等 listener 的最终裁决：它可能因为自己的 --peer-id 不匹配而拒了我
+    let verdict: Verdict = read_frame(&mut recv)
+        .await
+        .context("对端没有给出认证结论（连接可能已被拒绝后关闭）")?;
+    if !verdict.ok {
+        bail!("对端拒绝了本次连接：{}", verdict.reason);
+    }
+
     Ok(peer)
 }
 
@@ -122,6 +156,8 @@ pub async fn authenticate_listener(
         .await
         .context("等待认证流超时")?
         .context("接受认证流失败")?;
+
+    let binding = channel_binding(conn)?;
 
     // 1. 对端先亮身份
     let peer_hello: Hello = read_frame(&mut recv).await?;
@@ -143,6 +179,7 @@ pub async fn authenticate_listener(
         peer.node_id.as_str(),
         &my_nonce,
         &peer_nonce,
+        &binding,
     );
     let my_proof = Proof {
         v: AUTH_VERSION,
@@ -153,22 +190,61 @@ pub async fn authenticate_listener(
 
     // 3. 对端回签，证明它确实持有那把私钥
     let peer_proof: Proof = read_frame(&mut recv).await?;
-    verify_proof(
+    let outcome = verify_proof(
         &peer_proof,
         &peer,
         &peer.node_id,
         &identity.node_id(),
         &peer_nonce,
         &my_nonce,
-    )?;
+        &binding,
+    )
+    .and_then(|()| check_expected(&peer.node_id, expected));
+
+    // 4. 无论通过还是拒绝，都给出结论再关流：
+    //    dialer 靠这一帧区分"真的通过了"和"对端已经把我关了"
+    let verdict = match &outcome {
+        Ok(()) => Verdict {
+            ok: true,
+            reason: String::new(),
+        },
+        Err(e) => Verdict {
+            ok: false,
+            reason: format!("{e:#}"),
+        },
+    };
+    let verdict_written = write_frame(&mut send, &verdict).await.is_ok();
     let _ = send.finish();
 
-    check_expected(&peer.node_id, expected)?;
+    if outcome.is_err() && verdict_written {
+        // 调用方拿到错误后会立刻 close 这条连接，CONNECTION_CLOSE 会抢在
+        // 结论帧前面，dialer 就只剩一句"closed by peer"，看不到拒绝原因。
+        // 先等这一帧被对端确认（最多 2 秒），再让错误传出去。
+        let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+    }
+
+    outcome?;
     Ok(peer)
 }
 
-fn auth_message(signer: &str, peer: &str, my_nonce: &str, peer_nonce: &str) -> String {
-    format!("{AUTH_TAG}|{signer}|{peer}|{my_nonce}|{peer_nonce}")
+/// 导出这条 TLS 会话独有的绑定值（十六进制）。
+///
+/// 同一条 TLS 会话的两端会得到相同的值，不同会话（比如中间人的两段）一定不同。
+fn channel_binding(conn: &Connection) -> Result<String> {
+    let mut out = [0u8; BINDING_LEN];
+    conn.export_keying_material(&mut out, BINDING_LABEL, b"")
+        .map_err(|e| anyhow::anyhow!("导出 TLS 会话绑定值失败：{e:?}"))?;
+    Ok(hex::encode(out))
+}
+
+fn auth_message(
+    signer: &str,
+    peer: &str,
+    my_nonce: &str,
+    peer_nonce: &str,
+    binding: &str,
+) -> String {
+    format!("{AUTH_TAG}|{signer}|{peer}|{my_nonce}|{peer_nonce}|{binding}")
 }
 
 fn check_hello(hello: &Hello) -> Result<PeerIdentity> {
@@ -200,6 +276,7 @@ fn verify_proof(
     receiver: &NodeId,
     signer_nonce: &str,
     receiver_nonce: &str,
+    binding: &str,
 ) -> Result<()> {
     if proof.v != AUTH_VERSION {
         bail!("认证协议版本不匹配");
@@ -218,9 +295,10 @@ fn verify_proof(
         receiver.as_str(),
         signer_nonce,
         receiver_nonce,
+        binding,
     );
     if !Identity::verify(&peer.pubkey, message.as_bytes(), &sig) {
-        bail!("对端认证签名校验失败（密钥不对，或 nonce 被篡改）");
+        bail!("对端认证签名校验失败（密钥不对、nonce 被篡改，或 TLS 会话被中继）");
     }
     Ok(())
 }
@@ -281,13 +359,21 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(recv: &mut RecvStream) -> Resu
 mod tests {
     use super::*;
 
+    fn identity_of(id: &Identity) -> PeerIdentity {
+        PeerIdentity {
+            node_id: id.node_id(),
+            pubkey: id.public_key(),
+        }
+    }
+
     #[test]
-    fn auth_message_binds_both_ids_and_nonces() {
-        let a = auth_message("alice", "bob", "n1", "n2");
-        assert_eq!(a, "QP2P-AUTH-1|alice|bob|n1|n2");
+    fn auth_message_binds_ids_nonces_and_session() {
+        let a = auth_message("alice", "bob", "n1", "n2", "s1");
+        assert_eq!(a, "QP2P-AUTH-2|alice|bob|n1|n2|s1");
         // 换任何一段都必须得到不同的签名内容
-        assert_ne!(a, auth_message("bob", "alice", "n1", "n2"));
-        assert_ne!(a, auth_message("alice", "bob", "n2", "n1"));
+        assert_ne!(a, auth_message("bob", "alice", "n1", "n2", "s1"));
+        assert_ne!(a, auth_message("alice", "bob", "n2", "n1", "s1"));
+        assert_ne!(a, auth_message("alice", "bob", "n1", "n2", "s2"));
     }
 
     #[test]
@@ -313,37 +399,51 @@ mod tests {
         assert!(check_hello(&forged).is_err());
     }
 
+    fn signed_proof(signer: &Identity, receiver: &Identity, sn: &str, rn: &str, b: &str) -> Proof {
+        let message = auth_message(
+            signer.node_id().as_str(),
+            receiver.node_id().as_str(),
+            sn,
+            rn,
+            b,
+        );
+        Proof {
+            v: AUTH_VERSION,
+            node_id: signer.node_id().as_str().to_string(),
+            sig: hex::encode(signer.sign(message.as_bytes())),
+        }
+    }
+
+    fn check(proof: &Proof, signer: &Identity, receiver: &Identity, binding: &str) -> Result<()> {
+        verify_proof(
+            proof,
+            &identity_of(signer),
+            &signer.node_id(),
+            &receiver.node_id(),
+            "peer-nonce",
+            "my-nonce",
+            binding,
+        )
+    }
+
+    #[test]
+    fn proof_from_right_key_and_session_is_accepted() {
+        let me = Identity::generate();
+        let peer = Identity::generate();
+        let proof = signed_proof(&peer, &me, "peer-nonce", "my-nonce", "session-A");
+        assert!(check(&proof, &peer, &me, "session-A").is_ok());
+    }
+
     #[test]
     fn proof_from_wrong_key_is_rejected() {
         let me = Identity::generate();
         let peer = Identity::generate();
         let attacker = Identity::generate();
 
-        let message = auth_message(
-            peer.node_id().as_str(),
-            me.node_id().as_str(),
-            "peer-nonce",
-            "my-nonce",
-        );
-        let bad = Proof {
-            v: AUTH_VERSION,
-            node_id: peer.node_id().as_str().to_string(),
-            sig: hex::encode(attacker.sign(message.as_bytes())),
-        };
-
-        let identity = PeerIdentity {
-            node_id: peer.node_id(),
-            pubkey: peer.public_key(),
-        };
-        assert!(verify_proof(
-            &bad,
-            &identity,
-            &peer.node_id(),
-            &me.node_id(),
-            "peer-nonce",
-            "my-nonce"
-        )
-        .is_err());
+        // 攻击者拿自己的密钥签，却声称自己是 peer
+        let mut bad = signed_proof(&attacker, &me, "peer-nonce", "my-nonce", "session-A");
+        bad.node_id = peer.node_id().as_str().to_string();
+        assert!(check(&bad, &peer, &me, "session-A").is_err());
     }
 
     #[test]
@@ -352,25 +452,19 @@ mod tests {
         let peer = Identity::generate();
 
         // 上一轮会话的签名帧，换到新 nonce 下应当失效
-        let stale = auth_message(peer.node_id().as_str(), me.node_id().as_str(), "old", "old");
-        let proof = Proof {
-            v: AUTH_VERSION,
-            node_id: peer.node_id().as_str().to_string(),
-            sig: hex::encode(peer.sign(stale.as_bytes())),
-        };
+        let stale = signed_proof(&peer, &me, "old", "old", "session-A");
+        assert!(check(&stale, &peer, &me, "session-A").is_err());
+    }
 
-        let identity = PeerIdentity {
-            node_id: peer.node_id(),
-            pubkey: peer.public_key(),
-        };
-        assert!(verify_proof(
-            &proof,
-            &identity,
-            &peer.node_id(),
-            &me.node_id(),
-            "new",
-            "new"
-        )
-        .is_err());
+    /// 通道绑定：中间人把 D↔M 会话里签好的帧原样转给另一段 TLS 会话，
+    /// 对面用自己那条会话的导出值验签，必然失败。
+    #[test]
+    fn proof_relayed_into_another_tls_session_is_rejected() {
+        let me = Identity::generate();
+        let peer = Identity::generate();
+
+        let proof = signed_proof(&peer, &me, "peer-nonce", "my-nonce", "session-peer-side");
+        assert!(check(&proof, &peer, &me, "session-peer-side").is_ok());
+        assert!(check(&proof, &peer, &me, "session-my-side").is_err());
     }
 }

@@ -436,3 +436,37 @@ async fn pinned_fingerprint_controls_handshake() {
         listener2.err()
     );
 }
+
+/// listener 拒绝时，dialer 不能以为自己连上了。
+///
+/// 修复前 dialer 发完自己的签名就返回成功，即使 listener 因为 `--peer-id`
+/// 不符把连接关掉，也会打印"认证通过"，然后在第一次开流时才莫名失败。
+#[tokio::test]
+async fn listener_rejection_is_visible_to_dialer() {
+    let mut a = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let mut b = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let stranger = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+
+    // 两边各自钉住一个不同的身份：B 只接受 stranger，A 只接受 B → B 必然拒绝 A
+    a.expect_peer(Some(b.node_id()));
+    b.expect_peer(Some(stranger.node_id()));
+
+    let a_peers = [b.local_addr()];
+    let b_peers = [a.local_addr()];
+    let window = Duration::from_secs(5);
+    let (dialer, listener) = tokio::join!(
+        a.punch(&a_peers, Role::Dialer, window),
+        b.punch(&b_peers, Role::Listener, window)
+    );
+
+    let err = dialer.expect_err("对端拒绝时 dialer 不能报认证通过");
+    let text = format!("{err}");
+    assert!(text.contains("拒绝") || text.contains("身份"), "{text}");
+    assert!(listener.is_err(), "拒绝方本身也不应成功");
+}
