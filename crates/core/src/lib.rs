@@ -15,6 +15,7 @@ pub mod identity;
 pub mod link;
 pub mod path;
 pub mod peer;
+pub mod route;
 pub mod secret_file;
 pub mod signal;
 pub mod socket;

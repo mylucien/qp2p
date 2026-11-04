@@ -6,6 +6,8 @@
 //! 安全边界：接受端只连**白名单里**的目标。否则任何能完成握手的人都能
 //! 把它当成访问内网/云元数据的开放代理。
 
+pub mod tun;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

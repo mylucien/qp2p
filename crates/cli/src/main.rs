@@ -16,6 +16,8 @@ qp2p — 私有打洞组网
 用法：
   qp2p punch   --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer) [--stun <host:port>]...
   qp2p forward --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer) --listen <addr> --target <addr>
+  qp2p tun     --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer)
+               [--net 10.64.0.0/16] [--tun-addr <ipv4>] [--mtu 1400] [--dev qp2p0]
   qp2p doctor  [--bind <addr>] [--stun <host:port>]...
   qp2p -V | --version
 
@@ -33,6 +35,10 @@ qp2p — 私有打洞组网
              只建议在完全可信的网络里做试验时用
   --peer-fp  要求对端 TLS 证书指纹一致（64 位十六进制），不符时握手就失败
   --data-dir 身份与证书的存放目录，默认 ~/.qp2p；同一目录重启后 node_id 不变
+  --net      虚拟网段，默认 10.64.0.0/16（tun 模式）
+  --tun-addr 本机虚拟地址；不填则由 node_id 派生（tun 模式）
+  --mtu      虚拟网卡 MTU，默认 1400（tun 模式）
+  --dev      虚拟网卡名，默认 qp2p0（Linux 最长 15 字节；Windows 需要管理员）
   --allow-target  --serve 的别名，保留兼容
   --stun     可重复；支持域名，用同一个 UDP socket 探测公网映射
 ";
@@ -81,6 +87,7 @@ async fn run(args: &[String]) -> Result<()> {
         }
         Some("punch") => cmd_punch(&args[1..]).await,
         Some("forward") => cmd_forward(&args[1..]).await,
+        Some("tun") => cmd_tun(&args[1..]).await,
         Some("doctor") => cmd_doctor(&args[1..]).await,
         Some(other) => {
             print!("{HELP}");
@@ -218,6 +225,73 @@ async fn cmd_punch(args: &[String]) -> Result<()> {
     }
 
     // 显式收尾：删掉路由器上的 UPnP 映射。Drop 里 spawn 的任务在运行时关闭时跑不完。
+    engine.shutdown().await;
+    Ok(())
+}
+
+/// TUN 模式：把整台机器接进虚拟网段，能直接 ping / 访问对端网段。
+///
+/// 和 `forward` 的区别：`forward` 是"一个本地端口 ↔ 一个对端地址"，不需要任何权限；
+/// `tun` 要建虚拟网卡（Linux 需 root/CAP_NET_ADMIN，Windows 需管理员 + wintun.dll），
+/// 换来的是透明访问——不用为每个目标配一条映射。
+async fn cmd_tun(args: &[String]) -> Result<()> {
+    let flags = Flags::parse(args)?;
+    let (mut engine, peers, role) = prepare(&flags).await?;
+
+    let net_text = flags.get("net").unwrap_or("10.64.0.0/16");
+    let net: qp2p_core::route::Cidr = net_text
+        .parse()
+        .with_context(|| format!("--net 不是合法网段：{net_text}"))?;
+
+    let address = match flags.get("tun-addr") {
+        Some(raw) => raw
+            .parse::<std::net::Ipv4Addr>()
+            .with_context(|| format!("--tun-addr 不是合法 IPv4：{raw}"))?,
+        // 由 node_id 派生：同一个身份每次拿到同一个地址，不用手工分配、也不会撞车
+        None => qp2p_core::identity::derive_virtual_ip(&engine.node_id(), net.base, net.prefix, 0),
+    };
+    if !net.contains(address) {
+        bail!("--tun-addr {address} 不在 --net {net} 里");
+    }
+
+    let mtu: u16 = flags
+        .get("mtu")
+        .unwrap_or("1400")
+        .parse()
+        .context("--mtu 不是数字")?;
+
+    println!("本端 node_id: {}", engine.node_id());
+    println!("虚拟地址   : {address}/{}", net.prefix);
+    println!("对端候选   : {} 个  角色: {role:?}", peers.len());
+
+    let conn = engine
+        .punch_with_retry(role, || peers.clone(), 2)
+        .await
+        .context("打洞失败")?;
+    println!("直连已建立 rtt={:?}", conn.rtt());
+
+    let config = qp2p_core::route::TunConfig {
+        name: flags.get("dev").unwrap_or("qp2p0").to_string(),
+        address,
+        prefix: net.prefix,
+        mtu,
+    };
+    let device = qp2p_core::route::open(&config).with_context(|| {
+        format!(
+            "创建虚拟网卡 {} 失败（Linux 需要 root；Windows 需要管理员并把 wintun.dll 放在 exe 旁边）",
+            config.name
+        )
+    })?;
+    let link = qp2p_core::route::spawn_io(device, mtu);
+    println!("隧道已启动：可以 ping 对端的虚拟地址，Ctrl+C 退出");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => println!("收到中断，退出"),
+        result = link::tun::run(conn.clone(), link, address) => {
+            result.context("TUN 转发结束")?;
+        }
+    }
+
     engine.shutdown().await;
     Ok(())
 }

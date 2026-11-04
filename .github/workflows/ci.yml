@@ -37,6 +37,17 @@ jobs:
       - name: Test
         run: cargo test --all
 
+      # 虚拟网卡只有 root 能建。单独跑一次，验证"设备能建、地址能配、路由能下发"，
+      # 这部分编译通过说明不了任何问题。没有 /dev/net/tun 的机器直接跳过。
+      - name: TUN（需要 root）
+        if: runner.os == 'Linux'
+        run: |
+          if [ ! -e /dev/net/tun ]; then
+            echo "没有 /dev/net/tun，跳过"
+            exit 0
+          fi
+          sudo -E env "PATH=$PATH" cargo test -p qp2p-core --test tun_linux -- --ignored --nocapture
+
   signal:
     name: signal (node)
     runs-on: ubuntu-latest

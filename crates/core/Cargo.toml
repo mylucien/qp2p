@@ -24,3 +24,10 @@ rcgen.workspace = true
 socket2.workspace = true
 if-addrs.workspace = true
 reqwest.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+libloading.workspace = true
+windows-sys.workspace = true
