@@ -46,7 +46,12 @@ jobs:
             echo "没有 /dev/net/tun，跳过"
             exit 0
           fi
-          sudo -E env "PATH=$PATH" cargo test -p qp2p-core --test tun_linux -- --ignored --nocapture
+          # 先以普通用户编译，再 sudo 跑测试二进制：
+          # sudo 会丢掉 RUSTUP_TOOLCHAIN，直接 sudo cargo 会报"没有默认工具链"
+          cargo test -p qp2p-core --test tun_linux --no-run
+          BIN=$(ls -t target/debug/deps/tun_linux-* | grep -v '\.d$' | head -1)
+          echo "跑 $BIN"
+          sudo "$BIN" --ignored --nocapture
 
   signal:
     name: signal (node)

@@ -13,8 +13,9 @@
 | P2 | 单 socket + 同 socket STUN + 角色化打洞 | ✅（探针复用 Initial，D1 魔数分流待补） |
 | P3 | link 复用层（per-flow QUIC 流）+ 端口转发 | ✅ |
 | P4 | CLI：`punch` / `forward` / `doctor` | ✅（控制接口与信令客户端未接） |
-| P5 | Linux TUN + 路由下发 | ⬜ |
-| P6–P8 | Windows / Android 前端 | ⬜ |
+| P5 | Linux TUN + 路由下发 | ✅ |
+| P6 | Windows TUN（WinTun） | ✅ 代码完成，需管理员 + wintun.dll |
+| P7–P8 | Windows 桌面壳 / Android APK | ⬜ |
 | P9 | 信令 Worker（单文件 + D1） | 🟡 代码与本地测试完成，未部署联调 |
 
 ## 快速开始（当前可用）
@@ -46,6 +47,51 @@ qp2p forward --bind 0.0.0.0:51820 --peer 192.168.1.10:51820 --dialer --peer-id <
 打洞成功后，访问本机 `127.0.0.1:8080` 的流量会经 QUIC 直连送到对端，由对端连它的 `10.0.0.7:22`。
 `--stun host:port` 可重复指定，用同一个 UDP socket 探测公网映射。
 `--peer` 也可重复：所有候选地址会**并行**打，先通先用。
+
+## TUN 模式（整网段互访）
+
+`forward` 是"一个本地端口 ↔ 一个对端地址"，要访问 20 个服务就得写 20 条。
+`tun` 换成虚拟网卡：每台机器在 `10.64.0.0/16` 里有个固定地址，整网段透明可达。
+
+```bash
+# A（10.64.x.y），需要 root / 管理员
+sudo qp2p tun --bind 0.0.0.0:51820 --peer <B 的地址> --peer-id <B 的 node_id> \
+              --any-peer --net 10.64.0.0/16
+
+# B（dialer）
+sudo qp2p tun --bind 0.0.0.0:51820 --peer <A 的地址> --dialer --peer-id <A 的 node_id> \
+              --net 10.64.0.0/16
+```
+
+两边会打印自己的虚拟地址（由 `node_id` 派生，重启不变），然后就能 `ping` 对面。
+
+参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--net` | 虚拟网段，默认 `10.64.0.0/16`；两边必须一致 |
+| `--tun-addr` | 手工指定虚拟地址；不填就按 `node_id` 派生 |
+| `--mtu` | 虚拟网卡 MTU，默认 1400；内层 TCP 的 MSS 由它推出来 |
+| `--dev` | 网卡名（Linux 最长 15 字节） |
+| `--route` | 额外让某个网段走隧道，可重复 |
+
+**平台要求**
+
+- Linux：`/dev/net/tun` + `ip` 命令，需要 root 或 `CAP_NET_ADMIN`
+- Windows：管理员权限 + [wintun.dll](https://www.wintun.net/) 放在 `qp2p.exe` 同目录
+  （不静态链接，所以升级 dll 不用重编）
+
+**访问对端背后的局域网**
+
+```
+A: qp2p tun ... --route 192.168.1.0/24     # 让 192.168.1.0/24 走隧道
+B: 需要转发并做 SNAT，否则内网设备不知道怎么回到 10.64/16：
+   sysctl -w net.ipv4.ip_forward=1
+   iptables -t nat -A POSTROUTING -s 10.64.0.0/16 -o eth0 -j MASQUERADE
+```
+
+不做静态 NAT 的时候，**ping 仍然通**：echo 请求由对端直接应答，不经过内核转发。
+这也是判断"隧道通没通"最省事的办法。
 
 ## 打洞成功率相关的实现
 
