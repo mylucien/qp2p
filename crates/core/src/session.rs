@@ -191,6 +191,8 @@ impl Session {
             mesh.set_wake(wake_tx).await;
         }
         let mut forced: Option<Ipv4Addr> = None;
+        // 空闲断链之后进入休眠：不主动拨号、也不高频轮询，等 TUN 里有包再来叫醒
+        let mut sleeping = false;
 
         while !self.stop.load(Ordering::Relaxed) {
             // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request
@@ -267,17 +269,25 @@ impl Session {
             }
 
             // 2) 主动发起：node_id 小的一方负责拨号，避免两边同时重复建连
-            dial_round(
-                &client,
-                &identity,
-                &node_id,
-                &self.engine,
-                &self.peers,
-                &self.mesh,
-                &self.notify,
-                forced.take(),
-            )
-            .await;
+            if sleeping {
+                // 休眠中不主动连，否则刚断开又立刻拨回去，空闲断链毫无意义
+                if forced.is_some() {
+                    sleeping = false;
+                }
+            }
+            if !sleeping {
+                dial_round(
+                    &client,
+                    &identity,
+                    &node_id,
+                    &self.engine,
+                    &self.peers,
+                    &self.mesh,
+                    &self.notify,
+                    forced.take(),
+                )
+                .await;
+            }
 
             // 3) 定时重新注册：候选地址可能变了，顺便刷新成员列表
             if last_register.elapsed() >= REGISTER_EVERY {
@@ -342,6 +352,7 @@ impl Session {
                         state.connected = false;
                         state.attempts = 0;
                     }
+                    sleeping = true;
                     self.notify.say(&format!(
                         "· 空闲 {}s，断开 {dropped} 条直连（有流量会自动重连）",
                         timeout.as_secs()
@@ -356,7 +367,10 @@ impl Session {
                     !table.is_empty() && table.values().all(|p| p.connected)
                 };
                 let idle = self.mesh.as_ref().map(|m| m.idle_for()).unwrap_or_default();
-                if !all_connected {
+                if sleeping {
+                    // 休眠时只保留最低频的轮询：新节点加入最多晚 60 秒发现
+                    POLL_COLD
+                } else if !all_connected {
                     POLL_HOT
                 } else if idle >= IDLE_AFTER {
                     POLL_COLD
