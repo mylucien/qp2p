@@ -440,6 +440,10 @@ async function updateNetwork(request, env, networkId) {
       });
       reassigned += 1;
     }
+    // 落在新网段外的预留已经不可能生效，一并清掉（管理员随时可以重新预留）
+    for (const r of await listReservations(env, networkId)) {
+      if (!ipInCidr(net.cidr, r.ip)) await deleteReservation(env, networkId, r.ip);
+    }
   }
 
   await audit(env, "network.update", networkId, `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`);
@@ -522,6 +526,15 @@ async function reserveIp(request, env, networkId) {
   const holder = others.find((n) => n.virtual_ip === ip && n.node_id !== nodeId);
   if (holder) {
     return err(409, "virtual_ip_taken", `${ip} 当前被「${holder.name}」占用，先踢下线再预留`);
+  }
+
+  // 一个节点只保留一条预留：给它新地址就把旧的删掉，免得 join 时二选一
+  if (nodeId) {
+    for (const old of await listReservations(env, networkId)) {
+      if (old.node_id === nodeId && old.ip !== ip) {
+        await deleteReservation(env, networkId, old.ip);
+      }
+    }
   }
 
   await putReservation(env, {
