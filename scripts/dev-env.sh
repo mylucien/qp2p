@@ -12,11 +12,18 @@ export TEMP="E:/workbuddy/tmp"
 export CARGO_INCREMENTAL=0          # E: 上的 incremental 目录会「拒绝访问」
 export PATH="$CARGO_HOME/bin:$PATH"
 
-# 产物目录本来就是仓库内的 target（在 E:），这里显式写一遍，防止有人从别处启动
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(pwd)/target}"
+# 产物目录放到**工作区之外**。
+#
+# 放在仓库里（默认 target/）有个坑：agent 的「安全删除」会在删除前把整棵树
+# 备份到 C:\Users\<你>\.workbuddy\workspace\sessions\<会话>\modify_backup，
+# 然后进回收站。一次 `cargo clean` 删掉 5.4GB 产物，就等于在 C 盘又写了一份
+# 5.4GB，而且不真正释放空间——这台机器的 C 盘就是这么被占满的。
+# 挪到工作区外，清理时就不会被备份。
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-E:/workbuddy/qp2p-target}"
 
 mkdir -p "$TMPDIR"
 echo "CARGO_HOME=$CARGO_HOME"
 echo "TMPDIR=$TMPDIR"
 echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "提示：能用 CI 就别本机编。推送用 python scripts/push_api.py"
+echo "注意：不要在仓库内执行 cargo clean —— 删除会被备份到 C 盘会话目录并进回收站，"
