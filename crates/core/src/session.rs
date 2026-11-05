@@ -259,7 +259,7 @@ impl Session {
                 let alive = mesh.peer_ips().await;
                 let mut table = self.peers.lock().await;
                 for state in table.values_mut() {
-                    if state.connected && state.virtual_ip.map_or(true, |ip| !alive.contains(&ip)) {
+                    if state.connected && state.virtual_ip.is_none_or(|ip| !alive.contains(&ip)) {
                         state.connected = false;
                         state.attempts = 0;
                     }
@@ -430,6 +430,7 @@ async fn answer_punch(
 }
 
 /// 主动拨号：只对"我该发起"且没连上的成员执行。
+#[allow(clippy::too_many_arguments)]
 async fn dial_round(
     client: &SignalClient,
     identity: &Identity,
