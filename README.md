@@ -208,6 +208,16 @@ rustup default stable-x86_64-pc-windows-gnu
 
 CI 跑在带有 MSVC 的 runner 上，因此仓库不固定工具链，由开发者按环境选择。
 
+## 开发约定
+
+- **编译和测试交给 CI**，本机不编。改完推上去看 Actions：
+  `test (ubuntu)` 跑 clippy + 全部测试，`test (windows)` 跑 Windows 侧，
+  `build (*)` 产出三个二进制。
+- **不要往 C 盘写构建产物**：`CARGO_HOME`、`TMP/TEMP` 都指到 E 盘，
+  需要在本机调试时先 `source scripts/dev-env.sh`（里面写了原因）。
+- **推送用 `python scripts/push_api.py "说明"`**，不用 `git push`：
+  本机到 github.com:443 的代理连接经常 502，`api.github.com` 才是通的。
+
 ## 目录
 
 ```
