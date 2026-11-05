@@ -82,8 +82,19 @@ curl -X POST https://<你的域名>/v1/admin/networks/home/rotate \
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/v1/health` | 无 | 状态、存储后端、节点数 |
-| POST | `/v1/admin/networks` | `X-Admin-Secret` | 创建网络，返回加入密钥 |
-| POST | `/v1/admin/networks/:id/rotate` | `X-Admin-Secret` | 换掉该网络的加入密钥 |
+| GET | `/admin` | 页面登录 | 内置管理页面（网络 / 节点 / 预留 / 审计） |
+| POST | `/v1/admin/login` | secret 换 cookie | 签发 2 小时 HttpOnly 会话 |
+| POST | `/v1/admin/logout` | cookie | 清掉会话 |
+| GET | `/v1/admin/networks` | `X-Admin-Secret` 或 cookie | 网络列表（含在线数、预留数） |
+| POST | `/v1/admin/networks` | 同上 | 创建网络，可带 `cidr` / `join_key`，返回加入密钥 |
+| PATCH | `/v1/admin/networks/:id` | 同上 | 改名字 / 改网段（网段外的节点自动重分配） |
+| DELETE | `/v1/admin/networks/:id` | 同上 | 删除网络（要带 `{"confirm":"<id>"}`），连带清节点/事件/预留 |
+| POST | `/v1/admin/networks/:id/rotate` | 同上 | 换掉该网络的加入密钥 |
+| GET | `/v1/admin/networks/:id/nodes` | 同上 | 节点列表：在线状态、虚拟地址、NAT、最后心跳 |
+| POST | `/v1/admin/networks/:id/nodes/:node/kick` | 同上 | 踢下线（清节点与它的事件，保留用户预留） |
+| GET/POST | `/v1/admin/networks/:id/reservations` | 同上 | 查 / 加 IP 预留 |
+| DELETE | `/v1/admin/networks/:id/reservations/:ip` | 同上 | 释放预留 |
+| GET | `/v1/admin/audit` | 同上 | 管理操作审计（`?limit=`） |
 | POST | `/v1/join` | 令牌 | 登记节点、领虚拟地址、拿对端列表 |
 | POST | `/v1/register` | 令牌 | 上报候选地址（至少一个） |
 | POST | `/v1/connect` | 令牌 | 撮合：返回对端候选，并给对端投一条事件 |
@@ -138,6 +149,22 @@ Rust 侧 `crates/core/src/signal/canonical.rs` 有一份同规则实现，和 JS
 ```bash
 node -e 'crypto.subtle.digest("SHA-256", Buffer.from(process.argv[1],"hex")).then(d=>console.log(Buffer.from(d).toString("hex").slice(0,32)))' <pubkey hex>
 ```
+
+## IP 预留
+
+`reservations` 表把"用户手填的地址"固定下来：
+
+| kind | 何时产生 | 生命周期 |
+|---|---|---|
+| `user` | 用户 join 时指定、或管理员手动预留 | 一直保留，除非管理员释放或删网 |
+| `auto` | 服务端自动分配 | 跟着节点走，节点被清理时一起删 |
+
+效果：
+
+- 节点离线 10 分钟被清掉之后，它的手填地址仍然归它，重连自动拿回；
+- 别人填这个地址会得到 `409 virtual_ip_reserved`；
+- 自动分配会跳过所有"别人的预留"；
+- 改网段时，落在新网段外的节点重新分配，失效的预留一并清理。
 
 ## 虚拟地址
 
