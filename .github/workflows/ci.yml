@@ -179,10 +179,11 @@ jobs:
       - name: 打 APK
         working-directory: android
         env:
-          # AGP 默认往 ~/.config/.android 写 debug keystore，runner 上不可写，
-          # 指到临时目录省得跟权限较劲
-          ANDROID_USER_HOME: ${{ runner.temp }}/android-user-home
+          # AGP 默认往 ~/.config/.android 写 debug keystore，runner 上不可写。
+          # 注意这两个值必须自洽（USER_HOME == SDK_HOME/.android），
+          # 否则 AGP 会报 "different paths to the Android Preferences folder"。
           ANDROID_SDK_HOME: ${{ runner.temp }}
+          ANDROID_USER_HOME: ${{ runner.temp }}/.android
         run: |
           mkdir -p "$ANDROID_USER_HOME"
           gradle assembleDebug --no-daemon --stacktrace
