@@ -50,51 +50,52 @@ struct WintunApi {
 
 impl WintunApi {
     fn load() -> Result<Self> {
-        let lib = unsafe { Library::new(WINTUN_DLL) }.or_else(|e| {
-            // 退一步到 exe 同目录找
-            let beside = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join(WINTUN_DLL)));
-            match beside {
-                Some(path) if path.exists() => unsafe { Library::new(path) },
-                _ => Err(e),
-            }
-        })?;
+        // 注意：加载失败的报错必须只挂在 Library::new 上。符号缺失是另一种病
+        // （老版本 wintun 0.10 的导出名带 X 后缀），混在一起会把「版本不对」
+        // 误报成「文件没找到」，排查时会绕远路。
+        let lib = unsafe { Library::new(WINTUN_DLL) }
+            .or_else(|e| {
+                // 退一步到 exe 同目录找
+                let beside = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join(WINTUN_DLL)));
+                match beside {
+                    Some(path) if path.exists() => unsafe { Library::new(path) },
+                    _ => Err(e),
+                }
+            })
+            .with_context(|| format!("加载 {WINTUN_DLL} 失败。{}", download_hint()))?;
 
         // SAFETY: 名字与 wintun.h 一致；dll 生命周期由 self._lib 持有
         unsafe {
             Ok(Self {
-                create_adapter: *lib
-                    .get::<CreateAdapterFn>(b"WintunCreateAdapter\0")
-                    .context("wintun.dll 里没有 WintunCreateAdapter")?,
-                delete_adapter: *lib
-                    .get::<DeleteAdapterFn>(b"WintunDeleteAdapter\0")
-                    .context("wintun.dll 里没有 WintunDeleteAdapter")?,
-                start_session: *lib
-                    .get::<StartSessionFn>(b"WintunStartSession\0")
-                    .context("wintun.dll 里没有 WintunStartSession")?,
-                end_session: *lib
-                    .get::<EndSessionFn>(b"WintunEndSession\0")
-                    .context("wintun.dll 里没有 WintunEndSession")?,
-                read_wait_event: *lib
-                    .get::<GetReadWaitEventFn>(b"WintunGetReadWaitEvent\0")
-                    .context("wintun.dll 里没有 WintunGetReadWaitEvent")?,
-                receive_packet: *lib
-                    .get::<ReceivePacketFn>(b"WintunReceivePacket\0")
-                    .context("wintun.dll 里没有 WintunReceivePacket")?,
-                release_receive_packet: *lib
-                    .get::<ReleaseReceivePacketFn>(b"WintunReleaseReceivePacket\0")
-                    .context("wintun.dll 里没有 WintunReleaseReceivePacket")?,
-                allocate_send_packet: *lib
-                    .get::<AllocateSendPacketFn>(b"WintunAllocateSendPacket\0")
-                    .context("wintun.dll 里没有 WintunAllocateSendPacket")?,
-                send_packet: *lib
-                    .get::<SendPacketFn>(b"WintunSendPacket\0")
-                    .context("wintun.dll 里没有 WintunSendPacket")?,
+                create_adapter: sym(&lib, b"WintunCreateAdapter\0")?,
+                delete_adapter: sym(&lib, b"WintunDeleteAdapter\0")?,
+                start_session: sym(&lib, b"WintunStartSession\0")?,
+                end_session: sym(&lib, b"WintunEndSession\0")?,
+                read_wait_event: sym(&lib, b"WintunGetReadWaitEvent\0")?,
+                receive_packet: sym(&lib, b"WintunReceivePacket\0")?,
+                release_receive_packet: sym(&lib, b"WintunReleaseReceivePacket\0")?,
+                allocate_send_packet: sym(&lib, b"WintunAllocateSendPacket\0")?,
+                send_packet: sym(&lib, b"WintunSendPacket\0")?,
                 _lib: lib,
             })
         }
     }
+}
+
+/// 按名字取导出函数；缺失时给出「版本太老」的提示而不是裸的GetProcAddress 错误。
+///
+/// 顺带 `copied()` 把 `&T` 变 `T`：函数指针都是 Copy，字段直接存值。
+unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
+    unsafe { lib.get(name) }
+        .copied()
+        .with_context(|| {
+            format!(
+                "wintun.dll 里没有 {}。多半是版本太老（wintun 0.10 的导出名带 X 后缀），请换 wintun.net 的 0.14+ amd64 版",
+                String::from_utf8_lossy(&name[..name.len() - 1])
+            )
+        })
 }
 
 fn download_hint() -> &'static str {

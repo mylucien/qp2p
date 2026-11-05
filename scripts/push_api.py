@@ -62,7 +62,10 @@ remote_tree = call("GET", f"/git/commits/{remote_head}")["tree"]["sha"]
 local_tree = git("rev-parse", "HEAD^{tree}").strip()
 print(f"远端 {BRANCH}: {remote_head[:7]}  本地 tree: {local_tree[:7]}")
 
-if remote_tree == local_tree:
+# 快速路径只在工作树干净（没有未提交修改）时生效：脚本实际推送的是
+# 工作树内容，工作树和 HEAD 不一致时 HEAD^{tree} 相同不代表内容相同。
+dirty = bool(git("status", "--porcelain").strip())
+if not dirty and remote_tree == local_tree:
     print("内容已经一致，不需要推送")
     raise SystemExit(0)
 
