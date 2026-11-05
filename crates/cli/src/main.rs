@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use qp2p_core::config::{parse_token, Config, Network};
@@ -1095,6 +1096,12 @@ async fn cmd_up(args: &[String]) -> Result<()> {
             name: name.clone(),
             net: net_cidr,
             wanted_ip,
+            // --idle <秒>：直连空闲这么久就断开（省电/省流量）。默认不断。
+            idle_timeout: flags
+                .get("idle")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .map(Duration::from_secs),
             peers: reply.peers.clone(),
         },
         engine.clone(),

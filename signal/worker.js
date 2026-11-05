@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -67,6 +67,26 @@ const DDL_STATEMENTS = [
     nonce      TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL
   )`,
+  // IP 预留：用户手填的地址要"固定"下来，节点离线清理后不能被别人抢走。
+  // kind=user 永久保留（除非管理员释放）；kind=auto 跟随节点存在。
+  `CREATE TABLE IF NOT EXISTS reservations (
+    network_id TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    node_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'auto',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (network_id, ip)
+  )`,
+  `CREATE INDEX IF NOT EXISTS reservations_by_node ON reservations (network_id, node_id)`,
+  // 管理面审计：谁在什么时候改了网段、换了密钥、踢了谁
+  `CREATE TABLE IF NOT EXISTS admin_actions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         INTEGER NOT NULL,
+    action     TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    detail     TEXT NOT NULL DEFAULT ''
+  )`,
 ];
 
 // ---------------------------------------------------------------------------
@@ -112,13 +132,28 @@ async function route(request, url, env, ctx) {
   const method = request.method;
 
   if (path === "/") return landing();
+  if (path === "/admin") return adminPage();
   if (path === "/v1/health") return health(request, env);
+  if (path === "/v1/admin/login" && method === "POST") return adminLogin(request, env);
+  if (path === "/v1/admin/logout" && method === "POST") return adminLogout();
+  if (path === "/v1/admin/audit" && method === "GET") return auditLog(request, env, url);
   if (path === "/v1/admin/networks" && method === "GET") return listNetworks(request, env);
   if (path === "/v1/admin/networks" && method === "POST") return createNetwork(request, env);
   const rotate = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/rotate$/.exec(path);
   if (rotate && method === "POST") return rotateJoinKey(request, env, rotate[1]);
-  const remove = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})$/.exec(path);
-  if (remove && method === "DELETE") return deleteNetwork(request, env, remove[1]);
+  const netPath = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})$/.exec(path);
+  if (netPath && method === "DELETE") return deleteNetwork(request, env, netPath[1]);
+  if (netPath && method === "PATCH") return updateNetwork(request, env, netPath[1]);
+  const nodesPath = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/nodes$/.exec(path);
+  if (nodesPath && method === "GET") return listNetworkNodes(request, env, nodesPath[1]);
+  const kick = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/nodes\/([0-9a-f]{32})\/kick$/.exec(path);
+  if (kick && method === "POST") return kickNode(request, env, kick[1], kick[2]);
+  const resv = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/reservations$/.exec(path);
+  if (resv && method === "GET") return listReservationsAdmin(request, env, resv[1]);
+  if (resv && method === "POST") return reserveIp(request, env, resv[1]);
+  const resvOne =
+    /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/reservations\/((?:\d{1,3}\.){3}\d{1,3})$/.exec(path);
+  if (resvOne && method === "DELETE") return releaseIp(request, env, resvOne[1], resvOne[2]);
 
   const isRead = method === "GET";
   if (path === "/v1/join" && method === "POST") return joinOrRegister(request, env, url, false);
@@ -140,8 +175,16 @@ async function landing() {
     `version ${VERSION}`,
     "",
     "GET  /v1/health",
-    "POST /v1/admin/networks   需要 X-Admin-Secret，可带 join_key",
+    "GET  /admin                       管理页面（登录后操作）",
+    "POST /v1/admin/login              用 ADMIN_SECRET 换 2 小时 cookie",
+    "POST /v1/admin/networks   需要 X-Admin-Secret，可带 join_key / cidr",
+    "PATCH /v1/admin/networks/<id>     改名字 / 网段",
     "POST /v1/admin/networks/<id>/rotate   需要 X-Admin-Secret，换加入密钥",
+    "GET  /v1/admin/networks/<id>/nodes    节点列表（在线状态）",
+    "POST /v1/admin/networks/<id>/nodes/<node>/kick   踢下线",
+    "GET/POST /v1/admin/networks/<id>/reservations     查/加 IP 预留",
+    "DELETE /v1/admin/networks/<id>/reservations/<ip> 释放预留",
+    "GET  /v1/admin/audit              管理操作审计",
     "POST /v1/join",
     "POST /v1/register",
     "POST /v1/connect",
@@ -191,7 +234,7 @@ async function health(request, env) {
 }
 
 async function createNetwork(request, env) {
-  const admin = checkAdmin(request, env);
+  const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
   const body = await readJson(request);
@@ -258,7 +301,7 @@ async function createNetwork(request, env) {
 
 /** 换掉某个网络的加入密钥，返回新令牌。旧令牌立刻失效。 */
 async function rotateJoinKey(request, env, networkId) {
-  const admin = checkAdmin(request, env);
+  const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
   const net = await getNetwork(env, networkId);
@@ -288,11 +331,13 @@ async function rotateJoinKey(request, env, networkId) {
 
 /** 列出所有网络（管理面）：用于管理员决定要不要删、要不要换密钥。 */
 async function listNetworks(request, env) {
-  const admin = checkAdmin(request, env);
+  const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
   const networks = await allNetworks(env);
   const counts = await nodeCounts(env);
+  const online = await onlineCounts(env);
+  const reserved = await reservationCounts(env);
   return json({
     ok: true,
     networks: networks.map((n) => ({
@@ -301,6 +346,8 @@ async function listNetworks(request, env) {
       cidr: n.cidr,
       created_at: n.created_at,
       nodes: counts[n.network_id] ?? 0,
+      online: online[n.network_id] ?? 0,
+      reservations: reserved[n.network_id] ?? 0,
       has_join_key: Boolean(n.join_hash),
     })),
   });
@@ -313,7 +360,7 @@ async function listNetworks(request, env) {
  * 加一道"你得说出名字"的门槛，避免脚本里一个手滑把整个网络清掉。
  */
 async function deleteNetwork(request, env, networkId) {
-  const admin = checkAdmin(request, env);
+  const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
   const body = (await readJson(request)) ?? {};
@@ -329,9 +376,188 @@ async function deleteNetwork(request, env, networkId) {
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const removed = await purgeNetwork(env, networkId);
+  await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`);
   console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
 
   return json({ ok: true, network: { id: networkId, name: net.name }, removed_nodes: removed });
+}
+
+/** 改网络：名字 / 网段。改网段会把落在新网段外的节点重新分配地址。 */
+async function updateNetwork(request, env, networkId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  const body = await readJson(request);
+  if (body === null) return err(400, "invalid_json");
+
+  const changes = [];
+  if (body.name !== undefined) {
+    const name = String(body.name).trim().slice(0, 48);
+    if (!name) return err(400, "invalid_name", "网络名不能为空");
+    if (name !== net.name) changes.push(`名字 ${net.name} → ${name}`);
+    net.name = name;
+  }
+  if (body.cidr !== undefined) {
+    const cidr = normalizeCidr(String(body.cidr));
+    if (!cidr) return err(400, "invalid_cidr", "只接受 10.x.0.0/16 形式");
+    if (cidr !== net.cidr) {
+      // 两个网络用同一网段，同一台机器接入时会路由打架，直接拒绝
+      const clash = (await allNetworks(env)).find(
+        (n) => n.network_id !== networkId && n.cidr === cidr,
+      );
+      if (clash) return err(409, "cidr_in_use", `${cidr} 已被网络「${clash.name}」使用`);
+      changes.push(`网段 ${net.cidr} → ${cidr}`);
+      net.cidr = cidr;
+    }
+  }
+  if (changes.length === 0) {
+    return json({ ok: true, changed: false, network: { id: net.network_id, name: net.name, cidr: net.cidr } });
+  }
+
+  await putNetwork(env, net);
+
+  // 网段变了：不在新网段里的节点重新分配，否则它们会顶着一个 ping 不通的地址
+  let reassigned = 0;
+  if (body.cidr !== undefined) {
+    const nodes = await listNodes(env, networkId);
+    for (const node of nodes) {
+      if (ipInCidr(net.cidr, node.virtual_ip)) continue;
+      const oldIp = node.virtual_ip;
+      const fresh = await assignIp(net, node.node_id, nodes, []);
+      await deleteReservation(env, networkId, oldIp);
+      node.virtual_ip = fresh;
+      await putNode(env, node);
+      await putReservation(env, {
+        network_id: networkId,
+        ip: fresh,
+        node_id: node.node_id,
+        kind: "auto",
+        note: "网段变更后重新分配",
+        created_at: Date.now(),
+      });
+      reassigned += 1;
+    }
+  }
+
+  await audit(env, "network.update", networkId, `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`);
+  return json({
+    ok: true,
+    changed: true,
+    network: { id: net.network_id, name: net.name, cidr: net.cidr },
+    reassigned,
+  });
+}
+
+/** 管理面看节点：带在线状态、预留信息，按虚拟 IP 排序。 */
+async function listNetworkNodes(request, env, networkId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  const now = Date.now();
+  const nodes = await listNodes(env, networkId);
+  const reservations = await listReservations(env, networkId);
+  const rows = nodes
+    .map((n) => ({
+      ...publicNode(n, now),
+      node_id: n.node_id,
+      advertised: safeParseArray(n.advertise),
+      reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
+    }))
+    .sort((a, b) => ipv4ToInt(a.virtual_ip) - ipv4ToInt(b.virtual_ip));
+
+  return json({
+    ok: true,
+    network: { id: net.network_id, name: net.name, cidr: net.cidr },
+    nodes: rows,
+    reservations,
+  });
+}
+
+/** 踢一个节点下线：删记录 + 清它的事件，定向预留保留。 */
+async function kickNode(request, env, networkId, nodeId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  const node = await getNode(env, networkId, nodeId);
+  if (!node) return err(404, "node_not_found", `没有节点 ${nodeId}`);
+
+  await deleteNode(env, networkId, nodeId);
+  await dropNodeEvents(env, networkId, nodeId);
+  await audit(env, "node.kick", `${networkId}/${nodeId}`, node.name);
+  console.warn(`[signal] 管理员踢下线 ${node.name} (${nodeId})`);
+
+  return json({ ok: true, node: { node_id: nodeId, name: node.name } });
+}
+
+/** 管理员手动预留一个 IP（可以给还没上线的节点预占）。 */
+async function reserveIp(request, env, networkId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  const body = await readJson(request);
+  if (body === null) return err(400, "invalid_json");
+
+  const ip = String(body.ip ?? "").trim();
+  const nodeId = String(body.node_id ?? "").trim().toLowerCase();
+  if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip) || ip.split(".").some((p) => Number(p) > 255)) {
+    return err(400, "invalid_virtual_ip", `IP 格式不对：${ip}`);
+  }
+  if (nodeId && !/^[0-9a-f]{32}$/.test(nodeId)) {
+    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+  }
+  if (!ipInCidr(net.cidr, ip)) {
+    return err(400, "virtual_ip_not_in_network", `${ip} 不在网段 ${net.cidr} 里`);
+  }
+
+  const others = await listNodes(env, networkId);
+  const holder = others.find((n) => n.virtual_ip === ip && n.node_id !== nodeId);
+  if (holder) {
+    return err(409, "virtual_ip_taken", `${ip} 当前被「${holder.name}」占用，先踢下线再预留`);
+  }
+
+  await putReservation(env, {
+    network_id: networkId,
+    ip,
+    node_id: nodeId,
+    kind: "user",
+    note: String(body.note ?? "").slice(0, 100),
+    created_at: Date.now(),
+  });
+  await audit(env, "reservation.put", `${networkId}/${ip}`, nodeId || "(未绑定节点)");
+  return json({ ok: true, reservation: { ip, node_id: nodeId } });
+}
+
+async function releaseIp(request, env, networkId, ip) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  await deleteReservation(env, networkId, ip);
+  await audit(env, "reservation.delete", `${networkId}/${ip}`, "");
+  return json({ ok: true, released: ip });
+}
+
+async function listReservationsAdmin(request, env, networkId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+  return json({ ok: true, reservations: await listReservations(env, networkId) });
+}
+
+async function auditLog(request, env, url) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+  const limit = Number(url.searchParams.get("limit") ?? 100) || 100;
+  return json({ ok: true, actions: await listAudit(env, limit) });
 }
 
 async function allNetworks(env) {
@@ -356,6 +582,44 @@ async function nodeCounts(env) {
   return out;
 }
 
+/** 每网络在线节点数（管理页用，一次查询拿全）。 */
+async function onlineCounts(env) {
+  const now = Date.now();
+  if ((await ready(env)) === "memory") {
+    const out = {};
+    for (const node of memory.nodes.values()) {
+      if (now - node.last_seen <= OFFLINE_MS) {
+        out[node.network_id] = (out[node.network_id] ?? 0) + 1;
+      }
+    }
+    return out;
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT network_id, COUNT(*) AS n FROM nodes WHERE last_seen >= ? GROUP BY network_id",
+  )
+    .bind(now - OFFLINE_MS)
+    .all();
+  const out = {};
+  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  return out;
+}
+
+async function reservationCounts(env) {
+  if ((await ready(env)) === "memory") {
+    const out = {};
+    for (const r of memory.reservations.values()) {
+      out[r.network_id] = (out[r.network_id] ?? 0) + 1;
+    }
+    return out;
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT network_id, COUNT(*) AS n FROM reservations GROUP BY network_id",
+  ).all();
+  const out = {};
+  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  return out;
+}
+
 /** 删掉一个网络及其节点、事件、nonce，返回清理掉的节点数。 */
 async function purgeNetwork(env, networkId) {
   if ((await ready(env)) === "memory") {
@@ -364,6 +628,9 @@ async function purgeNetwork(env, networkId) {
       if (node.network_id === networkId) memory.nodes.delete(k);
     }
     memory.events = memory.events.filter((e) => e.network_id !== networkId);
+    for (const [k, r] of [...memory.reservations.entries()]) {
+      if (r.network_id === networkId) memory.reservations.delete(k);
+    }
     memory.networks.delete(networkId);
     return before;
   }
@@ -373,11 +640,12 @@ async function purgeNetwork(env, networkId) {
     .first();
   await env.DB.prepare("DELETE FROM nodes WHERE network_id = ?").bind(networkId).run();
   await env.DB.prepare("DELETE FROM events WHERE network_id = ?").bind(networkId).run();
+  await env.DB.prepare("DELETE FROM reservations WHERE network_id = ?").bind(networkId).run();
   await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
   return Number(count?.n ?? 0);
 }
 
-function checkAdmin(request, env) {
+async function checkAdmin(request, env) {
   if (!env.ADMIN_SECRET) {
     return err(
       503,
@@ -386,10 +654,71 @@ function checkAdmin(request, env) {
     );
   }
   const provided = request.headers.get("x-admin-secret") ?? "";
-  if (!timingSafeEqual(provided, env.ADMIN_SECRET)) {
+  if (timingSafeEqual(provided, env.ADMIN_SECRET)) return null;
+
+  // 管理页面用 cookie：secret 只 POST 一次换成短期签名，之后不再出现在
+  // URL 或 localStorage 里，被 XSS 抄走的机会小得多。
+  if (await adminCookieValid(request, env)) return null;
+  return err(401, "invalid_admin_secret", "需要 X-Admin-Secret，或先在 /admin 登录");
+}
+
+const ADMIN_COOKIE = "qp2p_admin";
+const ADMIN_SESSION_MS = 2 * 60 * 60 * 1000; // 2 小时
+
+async function adminCookieFor(env, expiresAt) {
+  const mac = await hmacHex(env.ADMIN_SECRET, `admin:${expiresAt}`);
+  return `${expiresAt}.${mac.slice(0, 32)}`;
+}
+
+async function adminCookieValid(request, env) {
+  if (!env.ADMIN_SECRET) return false;
+  const raw = cookieValue(request, ADMIN_COOKIE);
+  if (!raw) return false;
+  const [expText, mac] = raw.split(".");
+  const expiresAt = Number(expText);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
+  const expect = await hmacHex(env.ADMIN_SECRET, `admin:${expiresAt}`);
+  return timingSafeEqual(mac ?? "", expect.slice(0, 32));
+}
+
+function cookieValue(request, name) {
+  const header = request.headers.get("cookie") ?? "";
+  for (const part of header.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) return decodeURIComponent(rest.join("="));
+  }
+  return "";
+}
+
+/** 用 secret 换一张短期 cookie；管理页面靠它免重复输入。 */
+async function adminLogin(request, env) {
+  if (!env.ADMIN_SECRET) return err(503, "admin_secret_unset", "请先部署 ADMIN_SECRET");
+  const body = (await readJson(request)) ?? {};
+  const secret = String(body.secret ?? "");
+  if (!timingSafeEqual(secret, env.ADMIN_SECRET)) {
+    await audit(env, "login.failed", "admin", request.headers.get("cf-connecting-ip") ?? "");
     return err(401, "invalid_admin_secret");
   }
-  return null;
+  const expiresAt = Date.now() + ADMIN_SESSION_MS;
+  const value = await adminCookieFor(env, expiresAt);
+  await audit(env, "login.ok", "admin", "");
+  return new Response(JSON.stringify({ ok: true, expires_at: expiresAt }), {
+    status: 200,
+    headers: {
+      ...JSON_HEADERS,
+      "set-cookie": `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ADMIN_SESSION_MS / 1000}`,
+    },
+  });
+}
+
+async function adminLogout() {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      ...JSON_HEADERS,
+      "set-cookie": `${ADMIN_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+    },
+  });
 }
 
 function validateJoinKey(key) {
@@ -487,6 +816,7 @@ async function joinOrRegister(request, env, url, needCandidates) {
   }
 
   const others = await listNodes(env, network.network_id);
+  const reservations = await listReservations(env, network.network_id);
 
   // 用户可以在加入时自己指定虚拟地址（家庭里想固定 IP 的典型需求）。
   // 只校验、不自动改：撞车就报错，别让人以为生效了其实是别的地址。
@@ -494,11 +824,35 @@ async function joinOrRegister(request, env, url, needCandidates) {
     ? null
     : String(body.virtual_ip).trim();
   if (requested !== null) {
-    const bad = validateVirtualIp(network, requested, nodeId, others);
+    const bad = validateVirtualIp(network, requested, nodeId, others, reservations);
     if (bad) return bad;
   }
 
-  const virtualIp = requested ?? existing?.virtual_ip ?? (await assignIp(network, nodeId, others));
+  // 地址优先级：这次指定 > 已有记录 > 自己的预留 > 自动分配。
+  // 预留让"用户手填的地址"在节点离线清理之后依然归它——否则重连就换地址了。
+  let virtualIp = requested ?? existing?.virtual_ip ?? null;
+  if (!virtualIp) {
+    const mine = reservations.find((r) => r.node_id === nodeId);
+    const stolen = mine && others.some((n) => n.node_id !== nodeId && n.virtual_ip === mine.ip);
+    if (mine && !stolen) virtualIp = mine.ip;
+  }
+  // 管理员改过网段的话，旧地址可能已经不在网段里：重新分配，别给个 ping 不通的地址
+  if (!virtualIp || !ipInCidr(network.cidr, virtualIp)) {
+    virtualIp = await assignIp(network, nodeId, others, reservations);
+  }
+
+  // 记录预留：用户手填的永久保留，自动分配的跟着节点走（节点清理时一起删）
+  const oldRes = reservations.find((r) => r.node_id === nodeId && r.ip !== virtualIp);
+  if (oldRes) await deleteReservation(env, network.network_id, oldRes.ip);
+  await putReservation(env, {
+    network_id: network.network_id,
+    ip: virtualIp,
+    node_id: nodeId,
+    kind: reservations.find((r) => r.ip === virtualIp && r.node_id === nodeId)?.kind ??
+      (requested !== null ? "user" : "auto"),
+    note: reservations.find((r) => r.ip === virtualIp)?.note ?? "",
+    created_at: Date.now(),
+  });
 
   const record = {
     network_id: network.network_id,
@@ -759,7 +1113,15 @@ async function legacyTokenFor(networkId, adminSecret) {
 // 存储：D1 优先，未绑定时退回 isolate 内存
 // ---------------------------------------------------------------------------
 
-const memory = { networks: new Map(), nodes: new Map(), events: [], nonces: new Map(), seq: 0 };
+const memory = {
+  networks: new Map(),
+  nodes: new Map(),
+  events: [],
+  nonces: new Map(),
+  reservations: new Map(),
+  audit: [],
+  seq: 0,
+};
 const migrated = new WeakSet(); // 每个 D1 绑定只建一次表
 
 async function ready(env) {
@@ -849,11 +1211,13 @@ async function touchNode(env, networkId, nodeId, ts) {
 async function deleteNode(env, networkId, nodeId) {
   if ((await ready(env)) === "memory") {
     memory.nodes.delete(key(networkId, nodeId));
-    return;
+  } else {
+    await env.DB.prepare("DELETE FROM nodes WHERE network_id = ? AND node_id = ?")
+      .bind(networkId, nodeId)
+      .run();
   }
-  await env.DB.prepare("DELETE FROM nodes WHERE network_id = ? AND node_id = ?")
-    .bind(networkId, nodeId)
-    .run();
+  // 节点没了，自动预留跟着走；用户手填的留着，重装后还能拿回原地址
+  await dropAutoReservations(env, networkId, nodeId);
 }
 
 async function listNodes(env, networkId) {
@@ -862,6 +1226,90 @@ async function listNodes(env, networkId) {
   }
   const { results } = await env.DB.prepare("SELECT * FROM nodes WHERE network_id = ?")
     .bind(networkId)
+    .all();
+  return results ?? [];
+}
+
+// --- IP 预留 ---------------------------------------------------------------
+
+async function listReservations(env, networkId) {
+  if ((await ready(env)) === "memory") {
+    return [...memory.reservations.values()].filter((r) => r.network_id === networkId);
+  }
+  const { results } = await env.DB.prepare("SELECT * FROM reservations WHERE network_id = ?")
+    .bind(networkId)
+    .all();
+  return results ?? [];
+}
+
+async function putReservation(env, r) {
+  if ((await ready(env)) === "memory") {
+    memory.reservations.set(key(r.network_id, r.ip), { ...r });
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO reservations (network_id, ip, node_id, kind, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(network_id, ip) DO UPDATE SET
+       node_id = excluded.node_id,
+       kind = excluded.kind,
+       note = excluded.note`,
+  )
+    .bind(r.network_id, r.ip, r.node_id, r.kind, r.note ?? "", r.created_at)
+    .run();
+}
+
+async function deleteReservation(env, networkId, ip) {
+  if ((await ready(env)) === "memory") {
+    memory.reservations.delete(key(networkId, ip));
+    return;
+  }
+  await env.DB.prepare("DELETE FROM reservations WHERE network_id = ? AND ip = ?")
+    .bind(networkId, ip)
+    .run();
+}
+
+/** 节点没了：自动预留一起删，用户指定的保留（换台机器重装还能拿回原地址）。 */
+async function dropAutoReservations(env, networkId, nodeId) {
+  if ((await ready(env)) === "memory") {
+    for (const [k, r] of [...memory.reservations.entries()]) {
+      if (r.network_id === networkId && r.node_id === nodeId && r.kind !== "user") {
+        memory.reservations.delete(k);
+      }
+    }
+    return;
+  }
+  await env.DB.prepare(
+    "DELETE FROM reservations WHERE network_id = ? AND node_id = ? AND kind != 'user'",
+  )
+    .bind(networkId, nodeId)
+    .run();
+}
+
+// --- 管理审计 --------------------------------------------------------------
+
+async function audit(env, action, target, detail = "") {
+  const row = { at: Date.now(), action, target, detail: String(detail).slice(0, 400) };
+  if ((await ready(env)) === "memory") {
+    memory.audit.push(row);
+    if (memory.audit.length > 500) memory.audit.shift();
+    return;
+  }
+  await env.DB.prepare(
+    "INSERT INTO admin_actions (at, action, target, detail) VALUES (?, ?, ?, ?)",
+  )
+    .bind(row.at, row.action, row.target, row.detail)
+    .run();
+}
+
+async function listAudit(env, limit = 100) {
+  if ((await ready(env)) === "memory") {
+    return memory.audit.slice(-limit).reverse();
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT at, action, target, detail FROM admin_actions ORDER BY id DESC LIMIT ?",
+  )
+    .bind(Math.min(500, Math.max(1, limit)))
     .all();
   return results ?? [];
 }
@@ -884,6 +1332,19 @@ async function pushEvent(env, networkId, nodeId, type, payload) {
     "INSERT INTO events (network_id, node_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
   )
     .bind(networkId, nodeId, type, JSON.stringify(payload), now)
+    .run();
+}
+
+/** 节点被踢掉时清掉发给它的事件，否则它会一直读到过期的 punch_request。 */
+async function dropNodeEvents(env, networkId, nodeId) {
+  if ((await ready(env)) === "memory") {
+    memory.events = memory.events.filter(
+      (e) => !(e.network_id === networkId && e.node_id === nodeId),
+    );
+    return;
+  }
+  await env.DB.prepare("DELETE FROM events WHERE network_id = ? AND node_id = ?")
+    .bind(networkId, nodeId)
     .run();
 }
 
@@ -927,7 +1388,7 @@ function key(networkId, nodeId) {
  * 服务端是唯一权威：客户端算出来的地址可能有冲突，这里必须拒绝而不是"帮它改"。
  * 返回错误响应，或 null 表示可用。
  */
-function validateVirtualIp(network, text, nodeId, others) {
+function validateVirtualIp(network, text, nodeId, others, reservations = []) {
   if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(text)) {
     return err(400, "invalid_virtual_ip", `虚拟地址必须是 a.b.c.d 形式：${text}`);
   }
@@ -954,11 +1415,20 @@ function validateVirtualIp(network, text, nodeId, others) {
   if (taken) {
     return err(409, "virtual_ip_taken", `${text} 已经被节点「${taken.name}」占用，换一个`);
   }
+
+  // 被别人预留过的地址也不能抢：预留的意义就是"人不在也算他的"
+  const reserved = reservations.find((r) => r.ip === text && r.node_id !== nodeId);
+  if (reserved) {
+    return err(409, "virtual_ip_reserved", `${text} 已被另一个节点预留，请让管理员先释放`);
+  }
   return null;
 }
 
-async function assignIp(network, nodeId, others) {
+async function assignIp(network, nodeId, others, reservations = []) {
   const used = new Set(others.map((n) => n.virtual_ip).filter(Boolean));
+  for (const r of reservations) {
+    if (r.node_id !== nodeId) used.add(r.ip);
+  }
   for (let salt = 0; salt < 32; salt += 1) {
     const ip = await deriveVirtualIp(nodeId, network.cidr, salt);
     if (!used.has(ip)) return ip;
@@ -1283,6 +1753,16 @@ function intToIpv4(value) {
   return [24, 16, 8, 0].map((shift) => (value >>> shift) & 0xff).join(".");
 }
 
+/** ip 是否落在 cidr 里。改网段后判断哪些节点要重新分配时用。 */
+function ipInCidr(cidr, ip) {
+  if (!ip || !/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip)) return false;
+  const [base, prefixRaw] = String(cidr).split("/");
+  const prefix = Math.min(30, Math.max(8, Number(prefixRaw) || 16));
+  const hostBits = 32 - prefix;
+  const mask = (0xffffffff << hostBits) >>> 0;
+  return (ipv4ToInt(ip) & mask) >>> 0 === (ipv4ToInt(base) & mask) >>> 0;
+}
+
 function safeParse(text) {
   try {
     const parsed = JSON.parse(text);
@@ -1327,7 +1807,7 @@ function limited(request, max = RATE_MAX) {
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-headers": "authorization, content-type, x-admin-secret",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
 };
 
 const JSON_HEADERS = {
@@ -1361,6 +1841,12 @@ async function sweep(env) {
     for (const [key, node] of memory.nodes) {
       if (node.last_seen < nodeCutoff) memory.nodes.delete(key);
     }
+    // 节点没了，自动预留跟着清；用户手填的（kind=user）一直留着
+    for (const [k, r] of [...memory.reservations.entries()]) {
+      if (r.kind === "user") continue;
+      const owner = memory.nodes.get(key(r.network_id, r.node_id));
+      if (!owner) memory.reservations.delete(k);
+    }
     for (const [key, at] of memory.nonces) {
       if (at < now - NONCE_TTL_MS) memory.nonces.delete(key);
     }
@@ -1371,8 +1857,238 @@ async function sweep(env) {
     .bind(staleCutoff)
     .run();
   await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
+  await env.DB.prepare(
+    `DELETE FROM reservations
+      WHERE kind != 'user'
+        AND NOT EXISTS (
+          SELECT 1 FROM nodes n
+           WHERE n.network_id = reservations.network_id AND n.node_id = reservations.node_id
+        )`,
+  ).run();
   await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
     .bind(now - NONCE_TTL_MS)
     .run();
   return meta?.changes ?? 0;
 }
+
+// ---------------------------------------------------------------------------
+// 管理页面：单文件，同域，登录后所有请求走 cookie
+// ---------------------------------------------------------------------------
+
+function adminPage() {
+  return new Response(ADMIN_PAGE, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "content-security-policy":
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'",
+    },
+  });
+}
+
+const ADMIN_PAGE = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>qp2p 管理台</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1a1c1f;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--danger:#dc2626;--ok:#16a34a}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8eb;--muted:#9aa3ad;--line:#262b33;--accent:#5b8cff;--danger:#f87171;--ok:#4ade80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:16px;margin:0;font-weight:600}
+main{max-width:1080px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+button{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{color:var(--danger);border-color:var(--danger)}
+button.sm{padding:3px 8px;font-size:12px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
+th{color:var(--muted);font-weight:500;font-size:12px}
+tr:last-child td{border-bottom:0}
+.muted{color:var(--muted)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
+.on{background:var(--ok)}.off{background:var(--muted)}
+pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;border-radius:8px;font-size:12px}
+.hide{display:none}
+</style>
+</head>
+<body>
+<header><h1>qp2p 管理台</h1><span class="muted" id="who"></span><span style="flex:1"></span><button id="refresh" class="hide">刷新</button><button id="logout" class="hide">退出</button></header>
+<main>
+  <section id="login" class="card hide" style="max-width:420px;margin:40px auto">
+    <h2 style="margin-top:0;font-size:15px">用管理员密钥登录</h2>
+    <label>ADMIN_SECRET</label>
+    <input id="secret" type="password" autocomplete="current-password" placeholder="部署时设置的变量">
+    <div class="row" style="margin-top:12px"><button class="primary" id="doLogin">登录</button><span class="muted" id="loginMsg"></span></div>
+    <p class="muted" style="font-size:12px;margin-bottom:0">登录后服务端签发 2 小时 HttpOnly cookie，密钥不会存进浏览器。</p>
+  </section>
+
+  <div id="dash" class="hide">
+    <section class="card">
+      <h2 style="margin:0 0 10px;font-size:15px">网络</h2>
+      <table><thead><tr><th>名称</th><th>网段</th><th>节点</th><th>在线</th><th>预留</th><th>操作</th></tr></thead><tbody id="nets"></tbody></table>
+      <div class="row" style="margin-top:12px">
+        <input id="newName" placeholder="新网络名称" style="max-width:180px">
+        <input id="newCidr" placeholder="网段（可空，如 10.90.0.0/16）" style="max-width:220px">
+        <input id="newKey" placeholder="加入密钥（可空，自动生成）" style="max-width:220px">
+        <button class="primary" id="createNet">新建</button>
+      </div>
+      <pre id="tokenOut" class="hide"></pre>
+    </section>
+
+    <section class="card hide" id="nodesCard">
+      <h2 style="margin:0 0 10px;font-size:15px">节点 <span class="muted" id="nodesFor"></span></h2>
+      <table><thead><tr><th>状态</th><th>名称</th><th>虚拟 IP</th><th>NAT</th><th>最后心跳</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table>
+      <h2 style="margin:18px 0 10px;font-size:15px">IP 预留</h2>
+      <table><thead><tr><th>IP</th><th>节点</th><th>类型</th><th>备注</th><th>操作</th></tr></thead><tbody id="resv"></tbody></table>
+      <div class="row" style="margin-top:12px">
+        <input id="resvIp" placeholder="要预留的 IP" style="max-width:160px">
+        <input id="resvNode" placeholder="node_id（可空）" style="max-width:280px">
+        <input id="resvNote" placeholder="备注" style="max-width:180px">
+        <button id="addResv">预留</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 10px;font-size:15px">操作审计</h2>
+      <table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody id="audit"></tbody></table>
+    </section>
+  </div>
+</main>
+<script>
+var current = null;
+function $(id){return document.getElementById(id)}
+function api(path, method, body){
+  var opt = {method: method||'GET', credentials:'same-origin', headers:{}};
+  if (body !== undefined) { opt.headers['content-type']='application/json'; opt.body=JSON.stringify(body); }
+  return fetch(path, opt).then(function(r){
+    return r.json().catch(function(){return {ok:false,error:'bad_json'}}).then(function(j){
+      if (!r.ok || j.ok === false) throw new Error((j.error||String(r.status))+' '+(j.detail||''));
+      return j;
+    });
+  });
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function ago(ms){ if(!ms) return '—'; var d=Math.min(9999,Math.round((Date.now()-ms)/1000)); if(d<60)return d+' 秒前'; if(d<3600)return Math.round(d/60)+' 分钟前'; return Math.round(d/3600)+' 小时前'; }
+function showDash(){
+  $('login').classList.add('hide'); $('dash').classList.remove('hide');
+  $('refresh').classList.remove('hide'); $('logout').classList.remove('hide');
+  load();
+}
+function showLogin(){ $('dash').classList.add('hide'); $('login').classList.remove('hide'); $('refresh').classList.add('hide'); $('logout').classList.add('hide'); }
+function load(){
+  api('/v1/admin/networks').then(function(j){ renderNets(j.networks) }).catch(function(e){ if(/401/.test(e.message)) showLogin(); });
+  api('/v1/admin/audit?limit=50').then(function(j){ renderAudit(j.actions) }).catch(function(){});
+  if (current) loadNodes(current);
+}
+function renderNets(list){
+  var t = $('nets'); t.innerHTML='';
+  if (!list.length) t.innerHTML = '<tr><td colspan="6" class="muted">还没有网络，先新建一个</td></tr>';
+  list.forEach(function(n){
+    var tr=document.createElement('tr');
+    tr.innerHTML = '<td><b>'+esc(n.name)+'</b><div class="muted" style="font-size:12px">'+esc(n.id)+'</div></td>'+
+      '<td>'+esc(n.cidr)+'</td><td>'+n.nodes+'</td><td>'+n.online+'</td><td>'+n.reservations+'</td>';
+    var td=document.createElement('td'); td.className='row';
+    td.appendChild(btn('节点','sm',function(){ current=n.id; loadNodes(n.id); }));
+    td.appendChild(btn('改网段','sm',function(){
+      var v=prompt('新网段（10.x.0.0/16）。落在网段外的节点会被重新分配地址', n.cidr);
+      if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(function(){ load(); }).catch(function(e){alert(e.message)});
+    }));
+    td.appendChild(btn('换密钥','sm',function(){
+      if(!confirm('换掉「'+n.name+'」的加入密钥？旧令牌立刻失效')) return;
+      api('/v1/admin/networks/'+n.id+'/rotate','POST',{}).then(function(j){
+        $('tokenOut').classList.remove('hide'); $('tokenOut').textContent='新令牌（只显示这一次）：\\n'+j.token;
+      }).catch(function(e){alert(e.message)});
+    }));
+    td.appendChild(btn('删除','sm danger',function(){
+      var v=prompt('不可撤销。输入网络 id 确认删除：'+n.id); if(v!==n.id) return;
+      api('/v1/admin/networks/'+n.id,'DELETE',{confirm:v}).then(function(){
+        if(current===n.id){current=null;$('nodesCard').classList.add('hide')} load();
+      }).catch(function(e){alert(e.message)});
+    }));
+    tr.appendChild(td); t.appendChild(tr);
+  });
+}
+function btn(text, cls, fn){ var b=document.createElement('button'); b.textContent=text; b.className=cls; b.onclick=fn; return b; }
+function loadNodes(id){
+  $('nodesCard').classList.remove('hide'); $('nodesFor').textContent='· '+id;
+  api('/v1/admin/networks/'+id+'/nodes').then(function(j){
+    var t=$('nodes'); t.innerHTML='';
+    if(!j.nodes.length) t.innerHTML='<tr><td colspan="6" class="muted">还没有节点</td></tr>';
+    j.nodes.forEach(function(n){
+      var tr=document.createElement('tr');
+      tr.innerHTML='<td><span class="dot '+(n.online?'on':'off')+'"></span>'+(n.online?'在线':'离线')+'</td>'+
+        '<td>'+esc(n.name)+(n.reserved?' <span class="muted" style="font-size:12px">已固定</span>':'')+'</td>'+
+        '<td>'+esc(n.virtual_ip)+'</td><td>'+esc(n.nat_type)+'</td><td class="muted">'+ago(n.last_seen)+'</td>';
+      var td=document.createElement('td'); td.className='row';
+      td.appendChild(btn('踢下线','sm danger',function(){
+        if(!confirm('把「'+n.name+'」踢下线？')) return;
+        api('/v1/admin/networks/'+id+'/nodes/'+n.node_id+'/kick','POST',{}).then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
+      }));
+      td.appendChild(btn('固定此 IP','sm',function(){
+        api('/v1/admin/networks/'+id+'/reservations','POST',{ip:n.virtual_ip,node_id:n.node_id,note:'页面固定'})
+          .then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
+      }));
+      tr.appendChild(td); t.appendChild(tr);
+    });
+    var r=$('resv'); r.innerHTML='';
+    if(!j.reservations.length) r.innerHTML='<tr><td colspan="5" class="muted">没有预留</td></tr>';
+    j.reservations.forEach(function(x){
+      var tr=document.createElement('tr');
+      tr.innerHTML='<td>'+esc(x.ip)+'</td><td class="muted">'+esc(x.node_id||'—')+'</td><td>'+(x.kind==='user'?'手动':'自动')+'</td><td class="muted">'+esc(x.note||'')+'</td>';
+      var td=document.createElement('td');
+      td.appendChild(btn('释放','sm danger',function(){
+        api('/v1/admin/networks/'+id+'/reservations/'+x.ip,'DELETE').then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
+      }));
+      tr.appendChild(td); r.appendChild(tr);
+    });
+  }).catch(function(e){ if(/401/.test(e.message)) showLogin(); });
+}
+function renderAudit(list){
+  var t=$('audit'); t.innerHTML='';
+  if(!list || !list.length){ t.innerHTML='<tr><td colspan="4" class="muted">还没有操作记录</td></tr>'; return; }
+  list.forEach(function(a){
+    var tr=document.createElement('tr');
+    tr.innerHTML='<td class="muted">'+new Date(a.at).toLocaleString()+'</td><td>'+esc(a.action)+'</td><td>'+esc(a.target)+'</td><td class="muted">'+esc(a.detail)+'</td>';
+    t.appendChild(tr);
+  });
+}
+$('doLogin').onclick=function(){
+  $('loginMsg').textContent='登录中…';
+  api('/v1/admin/login','POST',{secret:$('secret').value}).then(function(){
+    $('secret').value=''; $('loginMsg').textContent=''; showDash();
+  }).catch(function(e){ $('loginMsg').textContent='登录失败：'+e.message; });
+};
+$('secret').addEventListener('keydown',function(e){ if(e.key==='Enter') $('doLogin').click(); });
+$('refresh').onclick=load;
+$('logout').onclick=function(){ api('/v1/admin/logout','POST',{}).then(showLogin).catch(showLogin); };
+$('createNet').onclick=function(){
+  var body={name:$('newName').value.trim()};
+  if($('newCidr').value.trim()) body.cidr=$('newCidr').value.trim();
+  if($('newKey').value.trim()) body.join_key=$('newKey').value.trim();
+  api('/v1/admin/networks','POST',body).then(function(j){
+    $('tokenOut').classList.remove('hide');
+    $('tokenOut').textContent='加入令牌（只显示这一次，请立刻保存）：\\n'+j.token+'\\n\\n客户端命令：\\nqp2p join '+j.token+' --name 设备名';
+    $('newName').value=''; $('newCidr').value=''; $('newKey').value='';
+    load();
+  }).catch(function(e){ alert(e.message); });
+};
+$('addResv').onclick=function(){
+  if(!current) return;
+  api('/v1/admin/networks/'+current+'/reservations','POST',{ip:$('resvIp').value.trim(),node_id:$('resvNode').value.trim(),note:$('resvNote').value.trim()})
+    .then(function(){ $('resvIp').value='';$('resvNode').value='';$('resvNote').value=''; loadNodes(current); })
+    .catch(function(e){alert(e.message)});
+};
+api('/v1/admin/networks').then(function(){ showDash() }).catch(function(){ showLogin() });
+</script>
+</body>
+</html>`;

@@ -684,6 +684,162 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   });
   check("已删网络的令牌立即失效", [401, 403].includes(goneToken.status), goneToken.body);
 
+  console.log("\nO. IP 预留与管理面");
+  const resvNet = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "resv-test", cidr: "10.99.0.0/16" },
+  });
+  check("可以指定网段建网", resvNet.body.network?.cidr === "10.99.0.0/16", resvNet.body.network);
+  const rNet = resvNet.body.network.id;
+  const rToken = resvNet.body.token;
+
+  const pinnedIp = "10.99.0.50";
+  const nick = await identity();
+  const nickJoin = await call("POST", "/v1/join", {
+    token: rToken,
+    body: await signed(nick, "join", rNet, {
+      node_id: nick.nodeId,
+      pubkey: nick.pubkey,
+      name: "nick",
+      virtual_ip: pinnedIp,
+    }),
+  });
+  check("加入时指定 IP 生效", nickJoin.body.node?.virtual_ip === pinnedIp, nickJoin.body.node);
+
+  const resvList = await call("GET", `/v1/admin/networks/${rNet}/reservations`, { admin: secret });
+  const nickResv = (resvList.body.reservations ?? []).find((r) => r.ip === pinnedIp);
+  check("手填 IP 生成 user 预留", nickResv?.kind === "user" && nickResv?.node_id === nick.nodeId, nickResv);
+
+  const nickLeave = await call("POST", "/v1/leave", {
+    token: rToken,
+    body: await signed(nick, "leave", rNet, { node_id: nick.nodeId, pubkey: nick.pubkey }),
+  });
+  check("nick 下线", nickLeave.status === 200, nickLeave.body);
+
+  const resvAfterLeave = await call("GET", `/v1/admin/networks/${rNet}/reservations`, { admin: secret });
+  check(
+    "下线后 user 预留还在",
+    (resvAfterLeave.body.reservations ?? []).some((r) => r.ip === pinnedIp),
+    resvAfterLeave.body.reservations,
+  );
+
+  const eve = await identity();
+  const stealResv = await call("POST", "/v1/join", {
+    token: rToken,
+    body: await signed(eve, "join", rNet, {
+      node_id: eve.nodeId,
+      pubkey: eve.pubkey,
+      name: "eve",
+      virtual_ip: pinnedIp,
+    }),
+  });
+  check(
+    "预留地址不能被别人抢",
+    stealResv.status === 409 && stealResv.body.error === "virtual_ip_reserved",
+    stealResv.body,
+  );
+
+  const eveJoin = await call("POST", "/v1/join", {
+    token: rToken,
+    body: await signed(eve, "join", rNet, { node_id: eve.nodeId, pubkey: eve.pubkey, name: "eve" }),
+  });
+  check("自动分配跳过预留地址", eveJoin.body.node?.virtual_ip !== pinnedIp, eveJoin.body.node);
+  const eveIp = eveJoin.body.node?.virtual_ip;
+
+  const autoResv =
+    (await call("GET", `/v1/admin/networks/${rNet}/reservations`, { admin: secret })).body
+      .reservations ?? [];
+  check(
+    "自动分配的地址登记为 auto",
+    autoResv.some((r) => r.ip === eveIp && r.kind === "auto"),
+    autoResv,
+  );
+
+  const nodeList = await call("GET", `/v1/admin/networks/${rNet}/nodes`, { admin: secret });
+  const eveRow = (nodeList.body.nodes ?? []).find((n) => n.node_id === eve.nodeId);
+  check("节点列表带在线状态", eveRow?.online === true, eveRow);
+  check("节点列表带预留标记", eveRow?.reserved === true, eveRow);
+
+  const nickBack = await call("POST", "/v1/join", {
+    token: rToken,
+    body: await signed(nick, "join", rNet, { node_id: nick.nodeId, pubkey: nick.pubkey, name: "nick" }),
+  });
+  check("重连拿回预留地址", nickBack.body.node?.virtual_ip === pinnedIp, nickBack.body.node);
+
+  const manualIp = "10.99.0.77";
+  const manual = await call("POST", `/v1/admin/networks/${rNet}/reservations`, {
+    admin: secret,
+    body: { ip: manualIp, note: "打印机" },
+  });
+  check("管理员可以预留 IP", manual.status === 200, manual.body);
+
+  const outsideResv = await call("POST", `/v1/admin/networks/${rNet}/reservations`, {
+    admin: secret,
+    body: { ip: "10.250.1.1" },
+  });
+  check("预留必须在网段内", outsideResv.status === 400, outsideResv.body);
+
+  const releaseManual = await call("DELETE", `/v1/admin/networks/${rNet}/reservations/${manualIp}`, {
+    admin: secret,
+  });
+  check("可以释放预留", releaseManual.status === 200, releaseManual.body);
+
+  const patch = await call("PATCH", `/v1/admin/networks/${rNet}`, {
+    admin: secret,
+    body: { cidr: "10.100.0.0/16" },
+  });
+  check("改网段成功", patch.status === 200 && patch.body.network?.cidr === "10.100.0.0/16", patch.body);
+  check("网段外的节点重新分配", patch.body.reassigned === 2, patch.body);
+
+  const movedNodes = await call("GET", `/v1/admin/networks/${rNet}/nodes`, { admin: secret });
+  check(
+    "重分配后地址都在新网段",
+    (movedNodes.body.nodes ?? []).every((n) => String(n.virtual_ip).startsWith("10.100.")),
+    movedNodes.body.nodes,
+  );
+
+  const clashPatch = await call("PATCH", `/v1/admin/networks/${rNet}`, {
+    admin: secret,
+    body: { cidr: created.body.network.cidr },
+  });
+  check("网段冲突被拒", clashPatch.status === 409 && clashPatch.body.error === "cidr_in_use", clashPatch.body);
+
+  const kick = await call("POST", `/v1/admin/networks/${rNet}/nodes/${eve.nodeId}/kick`, {
+    admin: secret,
+  });
+  check("踢下线成功", kick.status === 200, kick.body);
+  const afterKick = await call("GET", `/v1/admin/networks/${rNet}/nodes`, { admin: secret });
+  check(
+    "踢下线后节点消失",
+    !(afterKick.body.nodes ?? []).some((n) => n.node_id === eve.nodeId),
+    afterKick.body.nodes,
+  );
+
+  const auditRows = await call("GET", "/v1/admin/audit?limit=50", { admin: secret });
+  const actions = (auditRows.body.actions ?? []).map((a) => a.action);
+  check("审计记录改网段", actions.includes("network.update"), actions);
+  check("审计记录踢下线", actions.includes("node.kick"), actions);
+  check("审计记录预留", actions.includes("reservation.put"), actions);
+
+  const badLogin = await call("POST", "/v1/admin/login", { body: { secret: "wrong-secret" } });
+  check("错误密钥登录被拒", badLogin.status === 401, badLogin.body);
+  const goodLogin = await call("POST", "/v1/admin/login", { body: { secret } });
+  check("正确密钥登录成功", goodLogin.status === 200 && goodLogin.body.ok === true, goodLogin.body);
+
+  const page = remote
+    ? await fetch(`${base}/admin`)
+    : await worker.fetch(new Request(`${base}/admin`), env, ctx);
+  const pageText = await page.text();
+  check("管理页面可访问", page.status === 200 && pageText.includes("qp2p 管理台"), page.status);
+
+  const delResvNet = await call("DELETE", `/v1/admin/networks/${rNet}`, {
+    admin: secret,
+    body: { confirm: rNet },
+  });
+  check("删网一并清预留", delResvNet.status === 200, delResvNet.body);
+  const goneResv = await call("GET", `/v1/admin/networks/${rNet}/reservations`, { admin: secret });
+  check("删网后预留查询 404", goneResv.status === 404, goneResv.body);
+
   console.log(`  ${label}：${passed} 通过，${failed} 失败`);
   totals.passed += passed;
   totals.failed += failed;

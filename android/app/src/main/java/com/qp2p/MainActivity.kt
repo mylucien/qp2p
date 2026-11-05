@@ -7,7 +7,9 @@ import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
@@ -29,6 +31,8 @@ class MainActivity : Activity() {
     private lateinit var workerInput: EditText
     private lateinit var tokenInput: EditText
     private lateinit var nameInput: EditText
+    private lateinit var ipInput: EditText
+    private lateinit var subnetHint: TextView
     private lateinit var statusText: TextView
     private lateinit var connectButton: Button
 
@@ -39,6 +43,14 @@ class MainActivity : Activity() {
         setContentView(buildLayout())
         loadSettings()
         checkNative()
+
+        // 手填 IP 实时校验：不合法就把按钮禁掉，别让人点了才看到服务端报错
+        ipInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+            override fun afterTextChanged(s: Editable?) = refreshIpHint()
+        })
+        refreshIpHint()
 
         connectButton.setOnClickListener {
             if (Qp2pVpnService.connected) {
@@ -53,6 +65,8 @@ class MainActivity : Activity() {
             override fun run() {
                 statusText.text = Qp2pVpnService.status.ifEmpty { "未连接" }
                 connectButton.text = if (Qp2pVpnService.connected) "断开" else "连接"
+                // 连上之后才知道网段，这里补一次提示
+                refreshIpHint()
                 ui.postDelayed(this, 800)
             }
         })
@@ -75,6 +89,17 @@ class MainActivity : Activity() {
         root.addView(label("本机名称（可留空）"))
         nameInput = field("phone", InputType.TYPE_CLASS_TEXT)
         root.addView(nameInput)
+
+        root.addView(label("虚拟 IP（可留空，自动分配）"))
+        ipInput = field("留空 = 服务端分配；想要固定地址就填，如 10.78.0.50", InputType.TYPE_CLASS_TEXT)
+        root.addView(ipInput)
+        subnetHint = TextView(this).apply {
+            text = ""
+            setTextColor(Color.parseColor("#888888"))
+            textSize = 12f
+            setPadding(0, 8, 0, 0)
+        }
+        root.addView(subnetHint)
 
         connectButton = Button(this).apply { text = "连接" }
         root.addView(connectButton)
@@ -125,6 +150,7 @@ class MainActivity : Activity() {
         workerInput.setText(prefs.getString("worker", ""))
         tokenInput.setText(prefs.getString("token", ""))
         nameInput.setText(prefs.getString("name", ""))
+        ipInput.setText(prefs.getString("virtual_ip", ""))
     }
 
     private fun saveSettings() {
@@ -132,6 +158,7 @@ class MainActivity : Activity() {
             .putString("worker", workerInput.text.toString().trim())
             .putString("token", tokenInput.text.toString().trim())
             .putString("name", nameInput.text.toString().trim())
+            .putString("virtual_ip", ipInput.text.toString().trim())
             .apply()
     }
 
@@ -140,11 +167,54 @@ class MainActivity : Activity() {
         json.put("worker", workerInput.text.toString().trim().trimEnd('/'))
         json.put("token", tokenInput.text.toString().trim())
         json.put("name", nameInput.text.toString().trim())
+        val ip = ipInput.text.toString().trim()
+        if (ip.isNotEmpty()) json.put("virtual_ip", ip)
         json.put("data_dir", filesDir.absolutePath)
         // 移动网络常见 1280 的内层 MTU，先用保守值，跑通再按需调大
         json.put("mtu", 1280)
         json.put("bind", "0.0.0.0:0")
         return json.toString()
+    }
+
+    /** 空字符串表示"让服务端分配"，所以空值一律合法。 */
+    private fun ipProblem(raw: String): String? {
+        if (raw.isEmpty()) return null
+        val parts = raw.split(".")
+        if (parts.size != 4) return "格式应为 a.b.c.d"
+        val nums = parts.map { it.toIntOrNull() ?: return "每段必须是数字" }
+        if (nums.any { it < 0 || it > 255 }) return "每段必须在 0~255 之间"
+
+        val cidr = Qp2pVpnService.lastCidr
+        if (cidr.contains("/")) {
+            val baseText = cidr.substringBefore("/")
+            val prefix = cidr.substringAfter("/").toIntOrNull() ?: 16
+            val shift = 32 - prefix.coerceIn(1, 32)
+            val mask = if (shift == 32) 0u else (0xFFFFFFFFu shl shift)
+            val ipInt = nums.fold(0u) { acc, n -> (acc shl 8) or n.toUInt() }
+            val baseInt = baseText.split(".").mapNotNull { it.toIntOrNull() }
+                .fold(0u) { acc, n -> (acc shl 8) or n.toUInt() }
+            if ((ipInt and mask) != (baseInt and mask)) return "不在本网络网段 $cidr 内"
+            val host = ipInt and mask.inv()
+            if (host == 0u) return "这是网段地址，不能给设备用"
+            if (host == mask.inv()) return "这是广播地址，不能给设备用"
+        }
+        return null
+    }
+
+    private fun refreshIpHint() {
+        if (!::subnetHint.isInitialized) return
+        val ip = ipInput.text.toString().trim()
+        val problem = ipProblem(ip)
+        val cidr = Qp2pVpnService.lastCidr
+        subnetHint.text = when {
+            problem != null -> "✗ $problem"
+            cidr.isNotEmpty() -> "本网络网段 $cidr：留空自动分配，手填须在网段内"
+            else -> "留空由服务端分配；第一次连上后会显示本网络网段"
+        }
+        subnetHint.setTextColor(
+            if (problem != null) Color.parseColor("#D93025") else Color.parseColor("#888888")
+        )
+        connectButton.isEnabled = problem == null
     }
 
     private fun ensurePermissionThenConnect() {
@@ -163,6 +233,11 @@ class MainActivity : Activity() {
         val config = configJson()
         if (config.contains("\"token\":\"\"")) {
             Qp2pVpnService.status = "先填加入令牌"
+            return
+        }
+        val problem = ipProblem(ipInput.text.toString().trim())
+        if (problem != null) {
+            Qp2pVpnService.status = "虚拟 IP 有问题：$problem"
             return
         }
         Qp2pVpnService.status = "正在连接…"

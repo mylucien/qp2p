@@ -28,6 +28,10 @@ class Qp2pVpnService : VpnService() {
         /** 给界面读的当前状态 */
         @Volatile
         var status: String = ""
+
+        /** 上次注册拿到的网段（如 10.78.0.0/16），界面用它提示可填的 IP 范围 */
+        @Volatile
+        var lastCidr: String = ""
         @Volatile
         var connected: Boolean = false
             private set
@@ -92,7 +96,9 @@ class Qp2pVpnService : VpnService() {
             val ip = info.getString("virtual_ip")
             val prefix = info.getInt("prefix")
             val mtu = info.getInt("mtu")
-            val cidr = info.getString("cidr").substringBefore("/")
+            val cidrText = info.getString("cidr")
+            lastCidr = cidrText
+            val cidr = cidrText.substringBefore("/")
 
             val builder = Builder()
                 .setSession("qp2p")

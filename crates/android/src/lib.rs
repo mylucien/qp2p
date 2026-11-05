@@ -12,6 +12,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,9 @@ pub struct StartConfig {
     /// UDP 绑定地址，默认让系统挑端口
     #[serde(default)]
     pub bind: Option<String>,
+    /// 用户手填的虚拟地址；留空/非法则由服务端分配
+    #[serde(default)]
+    pub virtual_ip: Option<String>,
 }
 
 /// `prepare` 返回给 Kotlin 的信息，用来构建 VpnService。
@@ -168,6 +172,14 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
 
     let client = SignalClient::new(&config.worker, &config.token)?;
     let name = config.name.clone();
+    // 手填地址在这里只做"能解析就传"的处理：合不合法由服务端权威判断，
+    // 免得两边各写一套校验规则后互相打架
+    let wanted_ip: Option<Ipv4Addr> = config
+        .virtual_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| text.parse().ok());
 
     let (engine, reply) = rt.block_on(async {
         let engine = Engine::bind_in(bind, &stun, data_dir)
@@ -189,7 +201,7 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
                 &engine.tls_fp(),
                 &candidates,
                 nat,
-                None,
+                wanted_ip,
             )
             .await
             .context("向信令服务器注册失败（令牌过期或网络已删除？）")?;
@@ -282,6 +294,8 @@ pub fn start(fd: i32) -> Result<()> {
                 name,
                 net,
                 wanted_ip: Some(virtual_ip),
+                // 手机按流量计费：空闲 10 分钟就断链，有流量时自动重连
+                idle_timeout: Some(Duration::from_secs(600)),
                 peers,
             },
             engine.clone(),

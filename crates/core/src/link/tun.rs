@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,40 @@ const FLOW_IDLE: Duration = Duration::from_secs(120);
 const FLOW_CAPACITY: usize = 200;
 const READ_BUF: usize = 4096;
 
+/// 数据面活跃度：收到/发出任何包就打一个时间戳。
+///
+/// 会话循环靠它决定轮询档位（有流量就勤快点，静默就退到 60 秒一次），
+/// 空闲断链也靠它判断"真的没人用了"。
+#[derive(Clone)]
+struct Activity {
+    base: Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return Duration::ZERO;
+        }
+        self.base
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
+    }
+}
+
 /// 多对端连接表：目标虚拟地址 → 已建立的直连。
 ///
 /// 组网时一台机器同时和多个节点相连，内核把一个包交给 TUN 之后，
@@ -37,6 +72,12 @@ const READ_BUF: usize = 4096;
 pub struct MeshLinks {
     peers: RwLock<HashMap<Ipv4Addr, Connection>>,
     to_tun: mpsc::Sender<Vec<u8>>,
+    /// 目标没有直连时，把对端虚拟地址丢进来，让会话循环立刻去打通它
+    wake: RwLock<Option<mpsc::Sender<Ipv4Addr>>>,
+    activity: Activity,
+    /// 上一次唤醒的时间（毫秒）；3 秒冷却，避免持续丢包把信令打成洪水
+    started: Instant,
+    last_wake_ms: Arc<AtomicU64>,
 }
 
 impl MeshLinks {
@@ -44,7 +85,53 @@ impl MeshLinks {
         Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
             to_tun,
+            wake: RwLock::new(None),
+            activity: Activity::new(),
+            started: Instant::now(),
+            last_wake_ms: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// 会话循环启动时挂上唤醒通道。没挂之前丢包就是丢包，行为和以前一致。
+    pub async fn set_wake(&self, tx: mpsc::Sender<Ipv4Addr>) {
+        *self.wake.write().await = Some(tx);
+    }
+
+    /// 收到发往"还没连上"的对端的包：叫会话循环马上打洞。
+    ///
+    /// `try_send` 而不是 `send`：TUN 不能因为队列满就阻塞，丢几个包
+    /// 换来的是打洞立刻开始，重传会补上。
+    async fn wake_peer(&self, ip: Ipv4Addr) {
+        let now = self.started.elapsed().as_millis() as u64;
+        let prev = self.last_wake_ms.load(Ordering::Relaxed);
+        if prev != 0 && now.saturating_sub(prev) < 3_000 {
+            return;
+        }
+        self.last_wake_ms.store(now, Ordering::Relaxed);
+        let guard = self.wake.read().await;
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.try_send(ip);
+        }
+    }
+
+    /// 距上次有任何数据包过去了多久。
+    pub fn idle_for(&self) -> Duration {
+        self.activity.idle()
+    }
+
+    /// 全局空闲超过 `timeout` 就把所有直连断掉，返回断掉几条。
+    ///
+    /// 移动端省电/省流量的可选行为：断了之后下一次有包会立刻重新打洞。
+    pub async fn drop_all_idle(&self, timeout: Duration) -> usize {
+        if self.activity.idle() < timeout {
+            return 0;
+        }
+        let mut peers = self.peers.write().await;
+        let count = peers.len();
+        for (_, conn) in peers.drain() {
+            conn.close(0u32.into(), b"idle");
+        }
+        count
     }
 
     /// 挂上一个刚打通的直连：开始接收它的入站包，断开时自动摘除。
@@ -66,8 +153,9 @@ impl MeshLinks {
         {
             let conn = conn.clone();
             let to_tun = self.to_tun.clone();
+            let activity = self.activity.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_inbound(conn, to_tun).await {
+                if let Err(e) = serve_inbound(conn, to_tun, activity).await {
                     tracing::debug!("[tun] 接收循环结束: {e:#}");
                 }
             });
@@ -115,8 +203,9 @@ pub async fn run(conn: Connection, link: TunLink, local: Ipv4Addr) -> Result<()>
     let inbound = {
         let conn = conn.clone();
         let to_tun = to_tun.clone();
+        let activity = Activity::new();
         tokio::spawn(async move {
-            if let Err(e) = serve_inbound(conn, to_tun).await {
+            if let Err(e) = serve_inbound(conn, to_tun, activity).await {
                 tracing::debug!("[tun] 接收循环结束: {e:#}");
             }
         })
@@ -212,6 +301,11 @@ async fn dispatch(
         return Ok(());
     };
 
+    // 出站包也算活跃：会话循环据此决定轮询档位和要不要断链
+    if let Route::Mesh(links) = route {
+        links.activity.touch();
+    }
+
     // 1. 打自己的 ping 就地应答，不打扰对端
     if parsed.dst == local && ip::is_echo_request(&parsed) {
         if let Some(reply) = ip::echo_reply(&parsed) {
@@ -236,9 +330,12 @@ async fn dispatch(
         flows.remove(&key);
     }
 
-    // 3. 这个目标没有直连：多半是对端还没连上，丢掉比排队更合适
+    // 3. 这个目标没有直连：叫会话循环立刻去打通它，这个包先丢（重传会补上）
     let Some(conn) = route.conn_for(parsed.dst).await else {
-        tracing::trace!("[tun] 目标 {} 还没有直连，丢弃", parsed.dst);
+        if let Route::Mesh(links) = route {
+            links.wake_peer(parsed.dst).await;
+        }
+        tracing::debug!("[tun] 目标 {} 没有直连，已唤醒打洞", parsed.dst);
         return Ok(());
     };
 
@@ -271,7 +368,11 @@ async fn write_frame(send: &mut SendStream, packet: &[u8]) -> Result<()> {
 }
 
 /// 接收方向：对端每开一条流就是一个新 flow。
-async fn serve_inbound(conn: Connection, to_tun: mpsc::Sender<Vec<u8>>) -> Result<()> {
+async fn serve_inbound(
+    conn: Connection,
+    to_tun: mpsc::Sender<Vec<u8>>,
+    activity: Activity,
+) -> Result<()> {
     loop {
         let (send, mut recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
@@ -281,8 +382,9 @@ async fn serve_inbound(conn: Connection, to_tun: mpsc::Sender<Vec<u8>>) -> Resul
             }
         };
         let to_tun = to_tun.clone();
+        let activity = activity.clone();
         tokio::spawn(async move {
-            if let Err(e) = pump_stream(&mut recv, to_tun).await {
+            if let Err(e) = pump_stream(&mut recv, to_tun, activity).await {
                 tracing::trace!("[tun] 流结束: {e:#}");
             }
             drop(send);
@@ -290,7 +392,11 @@ async fn serve_inbound(conn: Connection, to_tun: mpsc::Sender<Vec<u8>>) -> Resul
     }
 }
 
-async fn pump_stream(recv: &mut RecvStream, to_tun: mpsc::Sender<Vec<u8>>) -> Result<()> {
+async fn pump_stream(
+    recv: &mut RecvStream,
+    to_tun: mpsc::Sender<Vec<u8>>,
+    activity: Activity,
+) -> Result<()> {
     let mut kind = [0u8; 1];
     recv.read_exact(&mut kind).await.context("读流类型失败")?;
     if kind[0] != KIND_IP {
@@ -311,6 +417,7 @@ async fn pump_stream(recv: &mut RecvStream, to_tun: mpsc::Sender<Vec<u8>>) -> Re
         }
         let mut buf = vec![0u8; len];
         recv.read_exact(&mut buf).await.context("读帧失败")?;
+        activity.touch();
         if to_tun.send(buf).await.is_err() {
             return Ok(());
         }

@@ -19,12 +19,21 @@ use crate::peer::Role;
 use crate::route::Cidr;
 use crate::signal::client::{PeerInfo, SignalClient};
 
-/// 事件轮询间隔。
-const POLL: Duration = Duration::from_secs(3);
-/// 重新注册间隔：候选地址可能因 NAT 重新映射而变化。
-const REGISTER_EVERY: Duration = Duration::from_secs(60);
+/// 事件轮询间隔：三档自适应。
+///
+/// 固定 3 秒时，一台常开机器每天要 2.9 万次请求——Workers 免费额度
+/// （10 万/日）三台就打满。这里按"有没有事"分档：还有对端没连上就
+/// 3 秒（要尽快应答撮合）；全连上了 20 秒；彻底静默 60 秒。
+const POLL_HOT: Duration = Duration::from_secs(3);
+const POLL_WARM: Duration = Duration::from_secs(20);
+const POLL_COLD: Duration = Duration::from_secs(60);
+/// 重新注册间隔：候选地址可能因 NAT 重新映射而变化。5 分钟足够，
+/// 地址真变了也会在打洞时通过对端回报的 candidates 自愈。
+const REGISTER_EVERY: Duration = Duration::from_secs(300);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
+/// 数据面静默多久算「彻底空闲」。
+const IDLE_AFTER: Duration = Duration::from_secs(120);
 
 /// 状态输出回调。
 ///
@@ -57,6 +66,8 @@ pub struct SessionConfig {
     pub net: Option<Cidr>,
     /// 用户指定 / 上次分配到的虚拟地址，重注册时继续沿用
     pub wanted_ip: Option<Ipv4Addr>,
+    /// 直连空闲多久自动断开（None = 从不断，桌面默认）
+    pub idle_timeout: Option<Duration>,
     /// 注册时拿到的成员列表
     pub peers: Vec<PeerInfo>,
 }
@@ -157,6 +168,7 @@ impl Session {
             name,
             net,
             wanted_ip,
+            idle_timeout,
             peers: initial,
         } = self.config;
 
@@ -171,6 +183,14 @@ impl Session {
         let mut last_register = Instant::now();
         let mut last_renew = Instant::now();
         let mut last_error = String::new();
+
+        // TUN 收到"目标没连上"的包时会往这里塞一个虚拟地址：
+        // 立刻针对这个对端拨号，不用等下一轮定时器
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<Ipv4Addr>(16);
+        if let Some(mesh) = self.mesh.as_ref() {
+            mesh.set_wake(wake_tx).await;
+        }
+        let mut forced: Option<Ipv4Addr> = None;
 
         while !self.stop.load(Ordering::Relaxed) {
             // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request
@@ -233,6 +253,19 @@ impl Session {
                 }
             }
 
+            // 1.5) 把"链路上其实已经没了"的对端标回未连接：
+            // 否则全连上之后会一直停在冷却档，断了也发现不了
+            if let Some(mesh) = self.mesh.as_ref() {
+                let alive = mesh.peer_ips().await;
+                let mut table = self.peers.lock().await;
+                for state in table.values_mut() {
+                    if state.connected && state.virtual_ip.map_or(true, |ip| !alive.contains(&ip)) {
+                        state.connected = false;
+                        state.attempts = 0;
+                    }
+                }
+            }
+
             // 2) 主动发起：node_id 小的一方负责拨号，避免两边同时重复建连
             dial_round(
                 &client,
@@ -242,6 +275,7 @@ impl Session {
                 &self.peers,
                 &self.mesh,
                 &self.notify,
+                forced.take(),
             )
             .await;
 
@@ -299,7 +333,45 @@ impl Session {
                 }
             }
 
-            tokio::time::sleep(POLL).await;
+            // 5) 空闲断链（可选）：移动端省电，桌面默认关
+            if let (Some(mesh), Some(timeout)) = (self.mesh.as_ref(), idle_timeout) {
+                let dropped = mesh.drop_all_idle(timeout).await;
+                if dropped > 0 {
+                    let mut table = self.peers.lock().await;
+                    for state in table.values_mut() {
+                        state.connected = false;
+                        state.attempts = 0;
+                    }
+                    self.notify.say(&format!(
+                        "· 空闲 {}s，断开 {dropped} 条直连（有流量会自动重连）",
+                        timeout.as_secs()
+                    ));
+                }
+            }
+
+            // 6) 等下一轮：按"还有没有事"选档位；TUN 来了包就立刻醒
+            let interval = {
+                let all_connected = {
+                    let table = self.peers.lock().await;
+                    !table.is_empty() && table.values().all(|p| p.connected)
+                };
+                let idle = self.mesh.as_ref().map(|m| m.idle_for()).unwrap_or_default();
+                if !all_connected {
+                    POLL_HOT
+                } else if idle >= IDLE_AFTER {
+                    POLL_COLD
+                } else {
+                    POLL_WARM
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                Some(ip) = wake_rx.recv() => {
+                    // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
+                    while wake_rx.try_recv().is_ok() {}
+                    forced = Some(ip);
+                }
+            }
         }
 
         self.notify.say("· 会话已停止");
@@ -366,6 +438,7 @@ async fn dial_round(
     peers: &SharedPeers,
     mesh: &Option<Arc<MeshLinks>>,
     notify: &Notify,
+    force: Option<Ipv4Addr>,
 ) {
     let targets: Vec<(String, String)> = {
         let mut table = peers.lock().await;
@@ -375,12 +448,24 @@ async fn dial_round(
             if state.connected {
                 continue;
             }
-            // 双方都拨会各建一条连接；固定由 node_id 小的一方发起
-            if node_id.as_str() >= id.as_str() {
+            let forced = force.is_some() && state.virtual_ip == force;
+            if force.is_some() && !forced {
                 continue;
             }
-            if state.attempts > 0 && now.duration_since(state.last_try) < state.backoff() {
-                continue;
+            if forced {
+                // 有包要发：不等退避，但 2 秒内不重复拨同一个对端
+                if state.attempts > 0 && now.duration_since(state.last_try) < Duration::from_secs(2)
+                {
+                    continue;
+                }
+            } else {
+                // 双方都拨会各建一条连接；固定由 node_id 小的一方发起
+                if node_id.as_str() >= id.as_str() {
+                    continue;
+                }
+                if state.attempts > 0 && now.duration_since(state.last_try) < state.backoff() {
+                    continue;
+                }
             }
             state.attempts += 1;
             state.last_try = now;
