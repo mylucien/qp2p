@@ -72,7 +72,7 @@ impl std::fmt::Display for SignalError {
             write!(f, "{detail}（HTTP {} / {}）", self.status, self.code)
         } else if detail.is_empty() {
             write!(f, "{hint}")
-        } else if detail.contains(&hint) {
+        } else if detail.contains(hint) {
             // 服务端的原话已经说清楚了，不必重复一遍
             write!(f, "{detail}")
         } else {
