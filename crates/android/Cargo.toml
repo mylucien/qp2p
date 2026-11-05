@@ -1,0 +1,20 @@
+[package]
+name = "qp2p-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "qp2p 的 Android 外壳：JNI 入口 + VpnService 描述符接管"
+
+# 产物名要和 Kotlin 侧 System.loadLibrary("qp2p_android") 对上
+[lib]
+name = "qp2p_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+qp2p-core = { path = "../core" }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jni = "0.21"

@@ -15,10 +15,23 @@ use anyhow::{bail, Context, Result};
 pub mod flow;
 pub mod ip;
 
+#[cfg(target_os = "android")]
+mod tun_android;
 #[cfg(target_os = "linux")]
 mod tun_linux;
 #[cfg(windows)]
 mod tun_windows;
+
+/// Android：把 VpnService 建好的 tun 描述符包成设备。
+///
+/// fd 的生命周期由 Java 层的 `ParcelFileDescriptor` 管，这里只借用。
+#[cfg(target_os = "android")]
+pub fn from_fd(fd: i32) -> Result<Box<dyn TunDevice>> {
+    if fd < 0 {
+        bail!("VpnService 没给出有效的 tun 描述符（fd={fd}）");
+    }
+    Ok(Box::new(tun_android::FdTun::new(fd)))
+}
 
 /// 一个 IPv4 网段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,10 +149,15 @@ pub fn open(config: &TunConfig) -> Result<Box<dyn TunDevice>> {
     {
         Ok(Box::new(tun_windows::WindowsTun::open(config)?))
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", windows, target_os = "android")))]
     {
         let _ = config;
-        bail!("当前平台还不支持虚拟网卡（只有 Linux 和 Windows）")
+        bail!("当前平台还不支持虚拟网卡（Linux / Windows / Android 之外）")
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = config;
+        bail!("Android 的虚拟网卡由 VpnService 创建，请用 route::from_fd 接管它的描述符")
     }
 }
 

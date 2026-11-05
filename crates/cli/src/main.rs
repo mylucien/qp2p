@@ -8,14 +8,14 @@
 //! 用于手工验证两个地址之间能不能打通。
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use qp2p_core::config::{parse_token, Config, Network};
-use qp2p_core::identity::{Identity, NodeId};
+use qp2p_core::identity::Identity;
 use qp2p_core::link::tun::MeshLinks;
 use qp2p_core::signal::client::{extract_token, normalize_worker, SignalClient};
 use qp2p_core::{link, Engine, Role};
@@ -934,8 +934,6 @@ async fn cmd_delete(args: &[String]) -> Result<()> {
 // up：上线组网
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-
 async fn cmd_up(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
     if flags.flag("help") {
@@ -1099,7 +1097,7 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         },
         engine.clone(),
         mesh.clone(),
-        Arc::new(|msg: &str| println!("{msg}")),
+        qp2p_core::session::Notify::new(|msg: &str| println!("{msg}")),
     );
     let mut task = tokio::spawn(session.run());
 
@@ -1163,12 +1161,6 @@ fn open_tun(
     });
     Ok(links)
 }
-
-/// 对端请求撮合：我们作为 listener 守着，等它打进来。
-
-/// 主动拨号：只对"我该发起"且没连上的成员执行。
-
-/// 服务端明确说"这把令牌不认了"——继续重试只是白烧请求。
 
 /// 服务端只接受能当对端地址的 IPv4：回环、链路本地、组播/保留段一律会被拒，
 /// 混进一个就会让整次注册失败，所以在这里先筛掉。

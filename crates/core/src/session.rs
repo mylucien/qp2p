@@ -26,8 +26,26 @@ const REGISTER_EVERY: Duration = Duration::from_secs(60);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
 
-/// 状态输出回调。可能来自多个 tokio 任务，所以要 Send + Sync。
-pub type Notify = Arc<dyn Fn(&str) + Send + Sync>;
+/// 状态输出回调。
+///
+/// 包一层而不是直接用 `Arc<dyn Fn>`：后者不能直接当函数调，得 `as_ref()`，
+/// 调用点一多就容易写错。这里只暴露 `say`，谁来接都行：
+/// CLI 打成 `println!`，Android 写 logcat。
+#[derive(Clone)]
+pub struct Notify(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl Notify {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    pub fn say(&self, message: &str) {
+        self.0.as_ref()(message);
+    }
+}
 
 /// 一次上线会话里不变的东西：身份、令牌、本机名、网络。
 pub struct SessionConfig {
@@ -101,6 +119,19 @@ impl Session {
             notify,
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 用调用方给的停止开关（Android 的「断开」按钮从这里进来）。
+    pub fn new_with_stop(
+        config: SessionConfig,
+        engine: Arc<RwLock<Engine>>,
+        mesh: Option<Arc<MeshLinks>>,
+        notify: Notify,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        let mut session = Self::new(config, engine, mesh, notify);
+        session.stop = stop;
+        session
     }
 
     /// 拿一个停止开关：置 true 后循环会在下一轮退出（最多 3 秒）。
@@ -190,13 +221,13 @@ impl Session {
                 Err(e) => {
                     // 令牌被换掉 / 网络被删：再轮询也没有意义
                     if token_rejected(&e) {
-                        (self.notify)("⚠ 加入令牌已失效（网络被删除，或管理员换了准入密码）。现有直连还能用，但新节点连不上来了。");
+                        self.notify.say("⚠ 加入令牌已失效（网络被删除，或管理员换了准入密码）。现有直连还能用，但新节点连不上来了。");
                         return;
                     }
                     // 只在不重复的时候喊一声
                     let text = format!("{e:#}");
                     if text != last_error {
-                        (self.notify)(&format!("⚠ 拉取事件失败：{text}"));
+                        self.notify.say(&format!("⚠ 拉取事件失败：{text}"));
                         last_error = text;
                     }
                 }
@@ -271,7 +302,7 @@ impl Session {
             tokio::time::sleep(POLL).await;
         }
 
-        (self.notify)("· 会话已停止");
+        self.notify.say("· 会话已停止");
     }
 }
 
@@ -437,11 +468,11 @@ async fn on_connected(
     }
 
     match ip {
-        Some(ip) => (notify)(&format!(
+        Some(ip) => notify.say(&format!(
             "✓ 直连已建立：{label} ({ip}) rtt={:?}",
             conn.rtt()
         )),
-        None => (notify)(&format!(
+        None => notify.say(&format!(
             "✓ 直连已建立：{label}（服务端没给虚拟地址）rtt={:?}",
             conn.rtt()
         )),
@@ -481,7 +512,7 @@ async fn report_failure(
         }
     };
     if first {
-        (notify)(&format!("· 暂时连不上 {label}：{reason}（会自动重试）"));
+        notify.say(&format!("· 暂时连不上 {label}：{reason}（会自动重试）"));
     } else {
         tracing::debug!("[session] 仍然连不上 {label}: {reason}");
     }

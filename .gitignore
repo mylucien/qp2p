@@ -4,3 +4,10 @@
 *.pdb
 .DS_Store
 .env
+
+# Android：.so 由 cargo-ndk 在 CI 里生成，gradle 产物不入库
+android/.gradle/
+android/build/
+android/app/build/
+android/app/src/main/jniLibs/
+android/local.properties
