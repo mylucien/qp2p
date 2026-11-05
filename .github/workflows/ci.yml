@@ -121,7 +121,11 @@ jobs:
           Expand-Archive wintun.zip -DestinationPath wintun -Force
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/qp2p.exe" dist/
-          Copy-Item "wintun/bin/amd64/wintun.dll" dist/
+          # 压缩包内部的层级可能随版本变，按名字找而不是写死路径
+          $dll = Get-ChildItem -Path wintun -Recurse -Filter 'wintun.dll' |
+            Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1
+          if (-not $dll) { throw '压缩包里没找到 amd64 的 wintun.dll' }
+          Copy-Item $dll.FullName dist/
           Copy-Item USAGE.md dist/
           Get-ChildItem dist | Select-Object Name, Length
 

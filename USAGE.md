@@ -291,7 +291,37 @@ qp2p up --mtu 1280 --route 192.168.1.0/24 --save
 |---|---|---|
 | Linux | ✅ | TUN 需要 root 或 `CAP_NET_ADMIN` |
 | Windows | ✅ | 需要管理员 + `wintun.dll`；非管理员会自动降级为只打洞 |
-| Android | 🚧 | 计划用 VpnService 实现，与上面共用同一套内核 |
+| Android | ✅ | APK 走 VpnService，只接管虚拟网段 |
+
+### Windows 怎么装
+
+1. 下 CI 产物 `qp2p-windows-x86_64`（Actions 里最新一次成功构建的 Artifacts）
+2. 解压，目录里应当有 `qp2p.exe`、`wintun.dll`、`USAGE.md` —— **dll 不要单独挪走**
+3. 右键开始菜单 →「终端(管理员)」，`cd` 到解压目录
+4. 命令和 Linux 完全一样：
+
+```powershell
+.\qp2p.exe init https://你的-worker.workers.dev
+.\qp2p.exe join qp2p1_home_xxxxxxxx
+.\qp2p.exe up
+```
+
+不加管理员也能 `up`，但会降级成「只打洞」：能看到谁连上了，ping 不通。
+这也是判断"打洞成功但网卡没建起来"的办法。
+
+### Android 怎么装
+
+1. 下 `qp2p-android-apk`，安装（需允许「安装未知来源」）
+2. 打开 App，填三项：信令地址、加入令牌、本机名称（留空则用 node_id 前 8 位）
+3. 点「连接」，第一次会弹系统 VPN 授权，同意
+4. 通知栏出现 qp2p 即在线；断开点 App 里的按钮，或在系统设置里关掉 VPN
+
+几点说明：
+
+- **只接管虚拟网段**（例如 `10.78.0.0/16`），手机上网照旧走运营商，不做全局代理
+- 令牌就是电脑上 `qp2p create` / `qp2p token` 打出的那串，和 PC 用同一个
+- 内层 MTU 默认 1280（移动网络更保守），要改就改 `android/app/.../Qp2pVpnService.kt` 里的传参
+- App 自己的信令流量被排除在隧道外，避免绕回自己
 
 `qp2p` 的身份、证书、配置都在 `~/.qp2p/`（Windows 是 `C:\Users\<你>\.qp2p\`）：
 

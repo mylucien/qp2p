@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
@@ -94,8 +94,13 @@ fn stop_flag() -> Arc<AtomicBool> {
 fn log(message: &str) {
     #[cfg(target_os = "android")]
     {
+        // 用 c_char 而不是 i8：Android 的 NDK 在 aarch64 上也是 i8，但这样写不依赖假设
         extern "C" {
-            fn __android_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32;
+            fn __android_log_write(
+                prio: i32,
+                tag: *const std::ffi::c_char,
+                text: *const std::ffi::c_char,
+            ) -> i32;
         }
         if let Ok(text) = std::ffi::CString::new(message.replace('\0', " ")) {
             // priority 4 = INFO
@@ -289,7 +294,7 @@ fn tun_device(fd: i32) -> Result<Box<dyn qp2p_core::route::TunDevice>> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = fd;
-        bail!("tun fd 只在 Android 上有意义")
+        anyhow::bail!("tun fd 只在 Android 上有意义")
     }
 }
 

@@ -1162,9 +1162,7 @@ fn open_tun(
     Ok(links)
 }
 
-/// 服务端只接受能当对端地址的 IPv4：回环、链路本地、组播/保留段一律会被拒，
-/// 混进一个就会让整次注册失败，所以在这里先筛掉。
-
+/// 取网段前缀长度，格式不对时回落到默认值。
 fn cidr_prefix(cidr: &str) -> u8 {
     cidr.split_once('/')
         .and_then(|(_, p)| p.parse().ok())
