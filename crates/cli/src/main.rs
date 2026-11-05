@@ -872,8 +872,8 @@ async fn cmd_nets(args: &[String]) -> Result<()> {
 
     println!("{worker} 上的网络（{} 个）：\n", networks.len());
     println!(
-        "  {:<18} {:<20} {:>6}  {:<8} {}",
-        "名称", "网段", "成员", "准入密码", "备注"
+        "  {:<18} {:<20} {:>6}  {:<8} 备注",
+        "名称", "网段", "成员", "准入密码"
     );
     for net in &networks {
         let me = config
