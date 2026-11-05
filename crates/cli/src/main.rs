@@ -1076,7 +1076,9 @@ async fn cmd_up(args: &[String]) -> Result<()> {
                 mesh = Some(links);
             }
             Err(e) => {
-                println!("虚拟网卡创建失败：{e}");
+                // {e:#} 打完整错误链：Display 只露最外层 context，
+                // LoadLibrary 的真实错误码（126/193/5…）全被吞了，没法排查
+                println!("虚拟网卡创建失败：{e:#}");
                 println!("已降级为「只打洞」模式：能看到谁连上了，但 ping 不通对端。");
                 println!("Linux 需要 sudo（或 CAP_NET_ADMIN），Windows 需要管理员，并让 wintun.dll 和 qp2p.exe 放在一起。");
             }
