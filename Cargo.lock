@@ -746,6 +746,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "qp2p-core",
+ "quinn",
  "tokio",
  "tracing",
  "tracing-subscriber",

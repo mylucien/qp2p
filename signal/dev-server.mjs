@@ -25,7 +25,12 @@ const server = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
 
-  const url = `http://${req.headers.host ?? `127.0.0.1:${port}`}${req.url}`;
+  // 有些客户端在走代理时会用绝对形式（http://host/path）发请求，
+  // 直连时则是 /path。两种都接住，别让调试服务自己 500。
+  const raw = req.url ?? "/";
+  const url = raw.startsWith("http")
+    ? raw
+    : `http://${req.headers.host ?? `127.0.0.1:${port}`}${raw}`;
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(",") : value);

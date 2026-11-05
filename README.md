@@ -14,17 +14,38 @@
 | P1 | 纯逻辑：候选地址、STUN、时钟偏移、状态机、身份 | ✅ |
 | P2 | 单 socket + 同 socket STUN + 角色化打洞 | ✅（探针复用 Initial，D1 魔数分流待补） |
 | P3 | link 复用层（per-flow QUIC 流）+ 端口转发 | ✅ |
-| P4 | CLI：`punch` / `forward` / `doctor` | ✅（控制接口与信令客户端未接） |
+| P4 | CLI：`init` / `create` / `join` / `up` / `status`，以及 `punch` / `forward` / `doctor` | ✅ |
 | P5 | Linux TUN + 路由下发 | ✅ |
-| P6 | Windows TUN（WinTun） | ✅ 代码完成，需管理员 + wintun.dll |
+| P6 | Windows TUN（WinTun） | ✅ 需管理员 + wintun.dll；非管理员自动降级为只打洞 |
 | P7–P8 | Windows 桌面壳 / Android APK | ⬜ |
-| P9 | 信令 Worker（单文件 + D1） | 🟡 代码与本地测试完成，未部署联调 |
+| P9 | 信令 Worker（单文件 + D1）+ 客户端组网联调 | ✅ |
 
-## 快速开始（当前可用）
+## 快速开始
 
-两个终端，各自知道对方的 UDP 地址（同一局域网可直接用内网 IP），
-并且各自知道对方的 `node_id`（在对端运行 `qp2p doctor`，它会打印 `node_id`；
-同一个 `--data-dir` 下重启后不变）：
+一条命令建网，一条命令加入，然后上线：
+
+```bash
+# 建网的机器（一次性，需要部署时设的 ADMIN_SECRET）
+qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+qp2p create home          # 打印一行 qp2p join qp2p1_home_...
+
+# 其它每一台机器
+qp2p join qp2p1_home_...
+
+# 所有人
+sudo qp2p up              # Windows：管理员终端里执行 qp2p up
+```
+
+看到 `✓ 直连已建立：bob (10.78.156.207)` 之后，直接 `ping` 对方的虚拟地址即可。
+`qp2p status` 看成员，`qp2p token` 再看一次邀请令牌，`qp2p rotate` 换令牌。
+
+部署 Worker、平台差异、验收判据和排障表都在 [USAGE.md](USAGE.md)。
+
+## 手工调试（不经过信令服务）
+
+排查"到底能不能打通"时，可以绕过信令，直接指定对端地址和 node_id。
+两个终端各自知道对方的 UDP 地址（同一局域网用内网 IP 即可），
+对方的 `node_id` 用 `qp2p doctor` 查（同一个 `--data-dir` 下重启不变）：
 
 ```bash
 # 终端 1（A 侧）：把本机 8080 经隧道送到 B 侧能访问的 10.0.0.7:22
@@ -42,9 +63,8 @@ qp2p forward --bind 0.0.0.0:51820 --peer 192.168.1.10:51820 --dialer --peer-id <
 - **`--target` 是对端要去连的地址**：流量经隧道送到对端，由对端发起 TCP 连接。写成本机侧的地址不会报错，只会连到对端的同名地址。
 - **`--serve` 是本机允许对端访问的地址**：它必须等于**对端的 `--target`**，两边是交叉对应的。不填就等于拒绝一切入站，命令行会显式警告。
 
-第一次手动试的时候，两边都还不知道对方的 `node_id`，可以先各跑一次
-`qp2p doctor --data-dir <目录>` 把两个值记下来；只想快速验证连通性、暂时不关心对端是谁，
-一侧写 `--any-peer` 也行（它会打印警告，且放开的是"谁能连我"，不要长期这样跑）。
+只想快速验证连通性、暂时不关心对端是谁，一侧写 `--any-peer` 也行
+（它会打印警告，且放开的是"谁能连我"，不要长期这样跑）。
 
 打洞成功后，访问本机 `127.0.0.1:8080` 的流量会经 QUIC 直连送到对端，由对端连它的 `10.0.0.7:22`。
 `--stun host:port` 可重复指定，用同一个 UDP socket 探测公网映射。

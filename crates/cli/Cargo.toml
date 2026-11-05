@@ -14,5 +14,6 @@ path = "src/main.rs"
 qp2p-core = { path = "../core" }
 anyhow.workspace = true
 tokio.workspace = true
+quinn.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

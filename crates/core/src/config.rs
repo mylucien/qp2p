@@ -1,13 +1,19 @@
 //! 配置：单文件 TOML，一个 `data_dir` 对应一个网络归属。
+//!
+//! 这一份配置是**面向用户**的：`qp2p create` / `qp2p join` 把建好的网络写进来，
+//! `qp2p up` 直接读它，用户不需要记任何参数、也不需要手工 curl 接口。
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// 加入密钥前缀，后面是 `<network_id>_<secret>`。
 pub const TOKEN_PREFIX: &str = "qp2p1_";
+
+/// 配置文件在数据目录里的名字。
+pub const CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -23,10 +29,26 @@ pub enum ConfigError {
     EmptyNetworkId,
     #[error("forward.target 为空")]
     EmptyForwardTarget,
+    #[error("worker 地址必须以 http:// 或 https:// 开头：{0}")]
+    BadWorker(String),
+    #[error("读写配置失败 {path}：{source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("序列化配置失败：{0}")]
+    Encode(#[from] toml::ser::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Config {
+    /// 信令 Worker 的地址，例如 `https://p2p.example.com`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// 管理密钥，只在建网/换密钥时用；不填则每次从 `--admin` 或环境变量取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_secret: Option<String>,
     #[serde(default = "default_node_name")]
     pub node_name: String,
     #[serde(default = "default_data_dir")]
@@ -37,7 +59,7 @@ pub struct Config {
     pub listen: String,
     #[serde(default = "default_true")]
     pub upnp: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
     #[serde(default, rename = "forward")]
     pub forwards: Vec<Forward>,
@@ -47,6 +69,12 @@ pub struct Config {
 pub struct Network {
     pub id: String,
     pub token: String,
+    /// 服务端分配的虚拟网段，例如 `10.64.0.0/16`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+    /// 服务端上次分配给我的虚拟地址。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_ip: Option<String>,
     #[serde(default)]
     pub route: RouteMode,
     /// 本机对外通告的局域网网段
@@ -63,9 +91,29 @@ impl std::fmt::Debug for Network {
         f.debug_struct("Network")
             .field("id", &self.id)
             .field("token", &"<redacted>")
+            .field("cidr", &self.cidr)
+            .field("virtual_ip", &self.virtual_ip)
             .field("route", &self.route)
             .field("advertise", &self.advertise)
             .field("deny_inbound", &self.deny_inbound)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("worker", &self.worker)
+            .field(
+                "admin_secret",
+                &self.admin_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("node_name", &self.node_name)
+            .field("data_dir", &self.data_dir)
+            .field("stun", &self.stun)
+            .field("listen", &self.listen)
+            .field("upnp", &self.upnp)
+            .field("network", &self.network)
             .finish()
     }
 }
@@ -115,6 +163,8 @@ fn default_true() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            worker: None,
+            admin_secret: None,
             node_name: default_node_name(),
             data_dir: default_data_dir(),
             stun: default_stun(),
@@ -133,10 +183,59 @@ impl Config {
         Ok(config)
     }
 
+    /// 数据目录：`QP2P_HOME` > `~/.qp2p`（Windows 用 `USERPROFILE`）> 当前目录。
+    pub fn default_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("QP2P_HOME") {
+            return PathBuf::from(dir);
+        }
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|p| PathBuf::from(p).join(".qp2p"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// 读取配置；文件不存在时返回默认值（不是错误——首次使用本来就没有）。
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Self::from_toml(&text)
+    }
+
+    /// 写入配置。里面有加入令牌，按私密文件写（0600）。
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| ConfigError::Io {
+                path: dir.display().to_string(),
+                source: e,
+            })?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        let header = "# qp2p 本地配置（含加入令牌，勿分享）\n\
+                      # 一般不需要手改：用 qp2p init / create / join 生成\n\n";
+        crate::secret_file::write_private(path, format!("{header}{text}").as_bytes()).map_err(|e| {
+            ConfigError::Io {
+                path: path.display().to_string(),
+                source: e,
+            }
+        })
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.listen
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::BadListen(self.listen.clone()))?;
+
+        if let Some(worker) = &self.worker {
+            let trimmed = worker.trim();
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                return Err(ConfigError::BadWorker(worker.clone()));
+            }
+        }
 
         if let Some(network) = &self.network {
             if network.id.trim().is_empty() {

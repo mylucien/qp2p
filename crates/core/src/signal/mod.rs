@@ -1,3 +1,6 @@
-//! 信令面：请求签名规范（客户端尚未接入 HTTP）。
+//! 信令面：签名规范与 HTTP 客户端。
 
 pub mod canonical;
+pub mod client;
+
+pub use client::{SignalClient, SignalError};

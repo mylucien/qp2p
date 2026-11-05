@@ -131,6 +131,19 @@ impl Engine {
         self.identity.node_id()
     }
 
+    /// 本节点的签名身份。信令请求要用它签名，外壳只借用、不复制。
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// 各角色的单轮打洞时长。外壳自己做重试循环时按这个传超时。
+    pub fn attempt_timeout(role: Role) -> Duration {
+        match role {
+            Role::Dialer => DIAL_ATTEMPT,
+            Role::Listener => LISTEN_ATTEMPT,
+        }
+    }
+
     /// 本节点的公钥指纹，可用于人工核对。
     pub fn public_key(&self) -> [u8; 32] {
         self.identity.public_key()
@@ -276,13 +289,28 @@ impl Engine {
         role: Role,
         timeout: Duration,
     ) -> Result<Connection, punch::PunchError> {
+        self.punch_as(peers, role, timeout, self.expected_peer.clone())
+            .await
+    }
+
+    /// 同 [`Engine::punch`]，但本次调用单独指定"必须是对面这个 node_id"。
+    ///
+    /// 组网（多对端）时一台机器同时和多个节点打洞，每个连接的对端都不同，
+    /// 全局的 `expected_peer` 不够用——所以认证目标要按连接传进来。
+    pub async fn punch_as(
+        &self,
+        peers: &[SocketAddr],
+        role: Role,
+        timeout: Duration,
+        expected: Option<NodeId>,
+    ) -> Result<Connection, punch::PunchError> {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return Err(punch::PunchError::Dial("端点不可用".to_string()));
         };
 
         let handles = punch::AuthHandles {
             identity: self.identity.clone(),
-            expected: self.expected_peer.clone(),
+            expected,
         };
 
         let probe = self.spawn_probe(peers, timeout);

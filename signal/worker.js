@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -467,6 +467,10 @@ async function connect(request, env, url) {
   const t = now + 500;
   await pushEvent(env, auth.network.network_id, target, "punch_request", {
     from,
+    // 组网时被叫方要靠这个地址决定"这个包该发给谁"，
+    // 只给候选地址的话，被叫方拿到连接也不知道对端的虚拟 IP
+    from_name: self.name,
+    virtual_ip: self.virtual_ip,
     candidates: JSON.parse(self.candidates || "[]"),
     t,
     server_ms: now,

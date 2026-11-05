@@ -101,6 +101,23 @@ fn download_hint() -> &'static str {
     "把 wintun.dll（https://www.wintun.net/ ，选 amd64）放到 qp2p.exe 同目录或 PATH"
 }
 
+/// 当前进程是否以管理员身份运行。
+///
+/// 用 `net session` 探测而不是查令牌：这个命令只有提升过的进程才能成功，
+/// 而且不需要为 `GetTokenInformation` 再引入一堆 windows-sys 特性。
+/// 只在创建网卡时调用一次，几十毫秒的代价可以接受。
+fn is_elevated() -> bool {
+    use std::process::{Command, Stdio};
+
+    Command::new("net")
+        .arg("session")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub struct WindowsTun {
     api: WintunApi,
     adapter: AdapterHandle,
@@ -115,6 +132,17 @@ unsafe impl Sync for WindowsTun {}
 
 impl WindowsTun {
     pub fn open(config: &TunConfig) -> Result<Self> {
+        // 先看权限：非管理员调用 WintunCreateAdapter 必然失败，而且在某些机器上
+        // 驱动会直接把进程带崩（实测过 access violation）。与其崩掉，不如
+        // 在碰 DLL 之前就把"要以管理员运行"说清楚。
+        if !is_elevated() {
+            bail!(
+                "创建虚拟网卡需要管理员权限。请用「以管理员身份运行」打开终端，\
+                 再执行同一条命令"
+            );
+        }
+
+        tracing::debug!("[tun] 加载 {WINTUN_DLL}");
         let api = WintunApi::load()
             .with_context(|| format!("加载 {WINTUN_DLL} 失败。{}", download_hint()))?;
 
@@ -122,6 +150,7 @@ impl WindowsTun {
         let tunnel_type = wide("qp2p");
 
         // SAFETY: 入参是合法的 NUL 结尾宽字符串，GUID 传 NULL 让驱动自己生成
+        tracing::debug!("[tun] 创建适配器 {}", config.name);
         let adapter =
             unsafe { (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), std::ptr::null()) };
         if adapter == 0 {

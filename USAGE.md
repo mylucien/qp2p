@@ -1,279 +1,317 @@
-# 使用手册
+# qp2p 使用手册
 
-从零到两台机器互访的完整流程。**按顺序做，每一步都有验收判据**，不通过就停下，
-别往下走——后面每一步都依赖前面。
-
-> 先说清楚现状，免得你白折腾：
->
-> | 能力 | 状态 |
-> |---|---|
-> | 打洞（UDP/QUIC）+ 双向身份认证 | ✅ 可用 |
-> | 端口映射（`forward`，不需要 root） | ✅ 可用 |
-> | 虚拟网卡（`tun`，Linux / Windows） | ✅ 可用（Windows 要 wintun.dll + 管理员） |
-> | 信令服务（Worker） | ✅ 服务端可用 |
-> | **客户端接信令（`qp2p join`）** | ❌ **还没实现** |
->
-> 最后一条意味着：**你现在必须手工交换 IP 和 node_id**，加入码（token）暂时用不上。
-> 手册里"第 2 步"仍然要做（把网络建出来），但它现在只是备用。
+从零到多台机器互访。**建网、发密钥、加入、上线全部在客户端里完成**，
+你不需要调用任何 HTTP 接口，也不需要手工交换 IP 和 node_id。
 
 ---
 
-## 第 1 步：部署信令服务（一次性，只做一次）
+## 0. 最快路径
 
-已经有 Worker 且 `/v1/health` 返回 `has_admin_secret: true` 就跳到第 2 步。
+```bash
+# ① 建网的那台机器（只做一次）
+qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+qp2p create home
+
+# ② 其它每一台机器（把 ① 打印出来的那行原样发过去）
+qp2p join qp2p1_home_xxxxxxxx
+
+# ③ 所有人
+sudo qp2p up                 # Linux
+qp2p up                      # Windows：先用「以管理员身份运行」打开终端
+```
+
+`qp2p create` 会打印：
+
+```
+加入令牌（发给其它机器，一条命令就能加入）：
+
+    qp2p join qp2p1_home_4b96...
+```
+
+那一行就是邀请。对方复制粘贴即可，不需要你解释任何东西。
+
+---
+
+## 1. 部署信令服务（一次性，做的人只有你）
+
+信令服务器只做三件事：登记节点、撮合打洞、维持在线状态。**它不转发任何业务流量**，
+所以带宽和额度压力都很小。
 
 1. Cloudflare Dashboard → **Workers & Pages → Create → Worker** → Deploy
-2. 点 **Edit code** → 全选删掉 → 粘贴 `signal/worker.js` 全文 → **Deploy**
-3. （强烈建议）**Storage → D1 → Create database**，名字随意（例 `qp2p`）
-   → 回到 Worker → **Settings → Bindings → Add → D1** → 变量名必须是 **`DB`**
-4. **Settings → Variables and Secrets → Add**：
-   名字 **`ADMIN_SECRET`**，类型选 **Secret**，值用随机串：
+2. **Edit code** → 全选删除 → 粘贴仓库里的 `signal/worker.js` 全文 → **Deploy**
+3. 建议绑定 D1（不绑也能跑，但状态只存在单个实例里，多地域部署会互相看不见）：
+   **Storage → D1 → Create database**（名字随意，例 `qp2p`）
+   → 回到 Worker → **Settings → Bindings → Add → D1**，变量名必须是 **`DB`**
+4. **Settings → Variables and Secrets → Add**：名字 **`ADMIN_SECRET`**，类型 **Secret**，
+   值用随机串（`openssl rand -hex 32`）
 
-   ```bash
-   openssl rand -hex 32
-   ```
-
-**验收**
+### 验收
 
 ```bash
-curl -s https://<你的域名>/v1/health
+qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 ```
 
-期望：
+应当输出：
 
-```json
-{"ok":true,"storage":"d1","has_admin_secret":true,...}
+```
+✓ Worker 可用
+  版本    : 2.2.0
+  存储    : D1（多地域一致）
+  管理密钥: 已配置
 ```
 
-- `storage` 必须是 `d1`；是 `memory` 说明 D1 没绑好（能跑，但多地域节点互相看不见）
-- `has_admin_secret` 必须是 `true`，否则建网一律 503
+- **版本低于 2.2**：请重新粘贴一次 `worker.js`。2.2 起撮合事件里带了对端的虚拟地址，
+  多机组网靠它决定「这个包该发给谁」（旧版客户端会用推导算法兜底，但网络里出现
+  地址冲突时可能连错）。
+- **存储显示"内存"**：没绑 D1，重启 Worker 就丢网络，确认上面第 3 步。
+- **管理密钥: 未配置**：还能加入别人的网络，但建不了网络，确认上面第 4 步。
+
+国内访问 `*.workers.dev` 可能不通，给 Worker 绑定一个自己的域名再填进来即可。
 
 ---
 
-## 第 2 步：建网络，拿加入密钥
+## 2. 安装客户端
+
+从仓库 **Actions → 最新一次 ci → Artifacts** 下载：
+
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Linux x86_64（主流发行版） | `qp2p-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Windows x86_64 | `qp2p-windows-x86_64` | 解压出 `qp2p.exe` |
 
 ```bash
-curl -X POST https://<你的域名>/v1/admin/networks \
-  -H "X-Admin-Secret: <你的 ADMIN_SECRET>" \
-  -H "content-type: application/json" \
-  -d '{"name":"home"}'
+chmod +x qp2p-linux-x86_64-static
+sudo mv qp2p-linux-x86_64-static /usr/local/bin/qp2p
+qp2p -V
 ```
 
-返回：
-
-```json
-{
-  "ok": true,
-  "network": { "id": "home", "cidr": "10.97.0.0/16" },
-  "token": "qp2p1_home_3f8a1c9e..."
-}
-```
-
-- **不填 `join_key` 时服务端随机生成，只回显这一次**，记下来
-- 想自己定就加 `"join_key":"一串至少 16 位的随机字符"`；带同一把重复调用是幂等的
-- 密钥丢了就用 `POST /v1/admin/networks/home/rotate` 换一把（旧令牌立刻失效）
-
-**验收**：返回里有 `token`，格式为 `qp2p1_<网络id>_<密钥>`。
-
-> ⚠️ 这枚 token 现在**没有客户端会用**。留着，等 `qp2p join` 做出来直接能用。
-> 下面第 4 步的连接是手工完成的，不需要它。
+**Windows 的虚拟网卡**还需要 `wintun.dll`：从 <https://www.wintun.net/> 下载 amd64 包，
+把 `bin/amd64/wintun.dll` 放到 `qp2p.exe` 同目录。没有它也能打洞，只是不能 ping 通对端。
 
 ---
 
-## 第 3 步：拿到二进制
+## 3. 建网络（第一台机器）
 
-**方式一：下载 CI 产物**（推荐）
+```bash
+qp2p init https://p2p.example.com --admin <ADMIN_SECRET>   # 如果第 1 步已经做过可跳过
+qp2p create home
+```
 
-GitHub → Actions → 最近一次成功的 run → 页面底部 Artifacts：
+网络名只能用小写字母、数字和连字符。想自己定加入密钥（比如给家人用的口令）可以：
 
-| 产物 | 什么时候用 |
+```bash
+qp2p create home --key "my-family-2026-passphrase"          # 16~128 字符
+```
+
+### 它做了什么
+
+| 动作 | 结果 |
 |---|---|
-| `qp2p-linux-x86_64-static` | **优先用这个**，静态链接，任何发行版都能跑 |
-| `qp2p-linux-x86_64` | 动态链接，要求 glibc ≥ 2.39（Ubuntu 24.04+） |
-| `qp2p-windows-x86_64` | Windows |
+| 在服务端建网络 | 分配一个 `10.x.0.0/16` 网段，全网络共用 |
+| 生成加入密钥 | 默认服务端随机生成；也可以 `--key` 自己定 |
+| 保存到本机 | 写进 `~/.qp2p/config.toml`（权限 0600） |
 
-```bash
-chmod +x qp2p
-```
-
-**方式二：自己编**
-
-```bash
-cargo build --release          # 产物 target/release/qp2p
-```
-
-**Windows 额外一步**：把 [wintun.dll](https://www.wintun.net/)（选 amd64）放到
-`qp2p.exe` 同目录。只有 `tun` 模式需要它，`forward` 不需要。
-
-**验收**
-
-```bash
-./qp2p --version        # qp2p 0.1.0 (protocol 1)
-```
+之后 `qp2p token` 可以随时再显示令牌，`qp2p rotate` 可以换新的。
 
 ---
 
-## 第 4 步：两台机器建立连接
+## 4. 加入（其它每一台机器）
 
-先决定用哪种方式，选一个就行：
+```bash
+qp2p join qp2p1_home_4b96...
+```
 
-| | `forward` 端口映射 | `tun` 虚拟网卡 |
+也可以直接粘贴带令牌的链接（`https://.../?token=qp2p1_home_...`），客户端会自己拆。
+
+它会立刻用这个令牌向服务端登记一次，成功说明令牌有效：
+
+```
+✓ 已加入 home（10.78.0.0/16）
+  本机  : bob  10.78.129.223
+  成员  : 1 个在线/历史节点
+```
+
+虚拟地址是服务端分配的，同一个网络里唯一，重启不变。
+
+---
+
+## 5. 上线
+
+```bash
+sudo qp2p up                    # Linux
+qp2p up                         # Windows（管理员终端）
+```
+
+启动后会依次做：
+
+1. 绑定 UDP（默认 `51820`）、向 STUN 探自己的公网映射、尽量用 UPnP 开端口
+2. 把候选地址登记到信令服务
+3. 拉取事件，和同网络里的每个节点逐个打洞
+4. 打通的节点直接打印出来
+
+```
+qp2p 0.1.0 · 网络 home
+信令 https://p2p.example.com
+本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
+公网映射 120.229.55.68:6923
+虚拟地址 10.78.160.187/16（home）
+成员 2 个（在线 2）
+虚拟网卡 qp2p0 已就绪
+已上线（Ctrl+C 退出）。直连建立时会打印对端名字和延迟。
+✓ 直连已建立：bob (10.78.156.207) rtt=18.4ms
+```
+
+### 验收：ping 对方的虚拟地址
+
+```bash
+ping 10.78.156.207         # Windows: ping 10.78.156.207
+```
+
+能 ping 通就说明整条链路（信令 → 打洞 → 认证 → 虚拟网卡）都通了。
+端口、SSH、文件共享都直接用这个虚拟地址，不需要再做端口映射。
+
+### 常用参数
+
+| 参数 | 用途 |
+|---|---|
+| `--name <名字>` | 成员列表里显示的名字，默认取主机名 |
+| `--punch-only` | 只打洞、不建虚拟网卡；不需要 root，用来先验证能不能连通 |
+| `--bind <addr>` | UDP 监听地址，端口冲突时换一个（默认 `0.0.0.0:51820`） |
+| `--stun <host:port>` | 可重复，覆盖默认的 STUN 服务器 |
+| `--dev <名字>` | 虚拟网卡名，默认 `qp2p0` |
+| `--mtu <n>` | 默认 1400；链路质量差可以降到 1280 |
+| `--route <网段>` | 额外让某个网段走隧道（访问对端背后的局域网） |
+
+> 没有 root 时会**自动降级**成「只打洞」模式：能连上、能看日志，但 ping 不通。
+> 看到提示就加 sudo（Linux）或用管理员终端（Windows）重跑。
+
+---
+
+## 6. 日常操作
+
+| 命令 | 作用 |
+|---|---|
+| `qp2p status` | 本机地址 + 成员列表（在线状态、虚拟地址、候选数） |
+| `qp2p token` | 再显示一次加入令牌，用来发给新机器 |
+| `qp2p rotate` | 换新令牌，旧令牌立刻失效（有人退出群聊时用） |
+| `qp2p leave` | 把本机从网络里注销（不影响本机保存的令牌） |
+| `qp2p up -h` | 看组网的完整选项 |
+
+`qp2p status` 的样子：
+
+```
+网络     : home  10.78.0.0/16
+本机名称 : laptop
+虚拟地址 : 10.78.160.187（网段 10.78.0.0/16）
+
+成员（1 个，不算本机）：
+  名称               虚拟地址             状态      可直连地址
+  bob              10.78.156.207    在线      3
+```
+
+**换密钥的注意事项**：`rotate` 之后，已经在运行的节点**直连不会立刻断**，
+但它们 60 秒后刷新注册会被拒。它们会打印「加入令牌已失效」并停下，
+需要拿新令牌重新 `qp2p join` 一次再 `qp2p up`。
+
+---
+
+## 7. 组网是怎么连的
+
+- **谁连谁**：每个节点都从服务端拿到成员列表；`node_id` 小的一方主动发起，
+  另一方收到撮合事件后在本机守着，两边同时开孔。启动先后无所谓。
+- **连不上会自动重试**：退避 10s → 20s → 40s → 60s，一直连到为止。
+- **多对端**：一台机器同时和多个节点保持独立直连，数据面按**目标虚拟地址**选连接，
+  所以 A↔B、A↔C 之间是同一条虚拟网卡上的不同连接，不需要两套配置。
+- **NAT 变了**：候选地址每 60 秒重新登记一次；长时间一个都连不上时会重建端点重新 STUN。
+- **身份**：每条连接建立后双方交换 Ed25519 签名并互相验签，签名绑定这条 TLS 会话。
+  信令服务只是介绍人，拿不到你的密钥，也无法冒充任何一个节点。
+
+---
+
+## 8. 平台说明
+
+| 平台 | 状态 | 说明 |
 |---|---|---|
-| 需要权限 | **不需要** | Linux 要 root，Windows 要管理员 |
-| 能访问什么 | 你配置的那一个地址 | 整个虚拟网段（`10.64.x.x`） |
-| 适合 | 访问某个 Web / SSH / 数据库 | 想"像在同一局域网"一样用 |
+| Linux | ✅ | TUN 需要 root 或 `CAP_NET_ADMIN` |
+| Windows | ✅ | 需要管理员 + `wintun.dll`；非管理员会自动降级为只打洞 |
+| Android | 🚧 | 计划用 VpnService 实现，与上面共用同一套内核 |
 
-**建议先跑通 `forward`**：不用权限，出错信息也清楚。
+`qp2p` 的身份、证书、配置都在 `~/.qp2p/`（Windows 是 `C:\Users\<你>\.qp2p\`）：
 
-### 4.0 两边都先做这一步
+| 文件 | 内容 |
+|---|---|
+| `identity.key` | 节点私钥（0600）。删掉就等于换了一个新节点 |
+| `tls.crt` / `tls.key.der` | 自签证书，指纹用于对端钉扎 |
+| `config.toml` | 信令地址、网络、加入令牌（0600，**不要分享**） |
 
-在**两台机器**上分别执行：
-
-```bash
-./qp2p doctor --data-dir ~/.qp2p
-```
-
-输出类似：
-
-```
-node_id: 56bcc722ac8270ca25a72ec05a66e26
-pubkey : 259c1ac8...
-udp  local: 0.0.0.0:51820
-candidate host 192.168.1.10:51820
-```
-
-要记下三样：
-
-1. **`node_id`**（32 位十六进制）——填对方的 `--peer-id`
-2. **候选地址**——填对方的 `--peer`
-3. 如果跨网，加 `--stun stun.l.google.com:19302` 再跑一次，
-   拿到 `candidate srflx` 那一行的公网地址，那个才是对方该填的 `--peer`
-
-> `--data-dir` 一定要给，否则默认 `~/.qp2p`。**同一台机器跑两个实例时，两个目录必须不同**，
-> 否则身份和端口会打架。
-
-### 4.1 端口映射：把对端的某个地址变成本机端口
-
-假设：
-
-- A 机 `192.168.1.10`，想访问 B 机所在网络里的 `10.0.0.7:22`（SSH）
-- B 机 `192.168.1.20`，想访问 A 机所在网络里的 `10.0.0.5:80`（网页）
-
-```bash
-# A 机（listener，不加 --dialer）
-./qp2p forward \
-  --bind 0.0.0.0:51820 --peer 192.168.1.20:51820 \
-  --peer-id <B 的 node_id> \
-  --listen 127.0.0.1:2222 --target 10.0.0.7:22 --serve 10.0.0.5:80 \
-  --data-dir ~/.qp2p
-
-# B 机（dialer，加 --dialer）
-./qp2p forward \
-  --bind 0.0.0.0:51820 --peer 192.168.1.10:51820 --dialer \
-  --peer-id <A 的 node_id> \
-  --listen 127.0.0.1:8080 --target 10.0.0.5:80 --serve 10.0.0.7:22 \
-  --data-dir ~/.qp2p
-```
-
-**三个语义，最容易搞错，必须分清：**
-
-| 参数 | 含义 | 谁填什么 |
-|---|---|---|
-| `--listen` | 本机开哪个端口给**自己**用 | 自己决定，随便 |
-| `--target` | 对端要去连的地址（**写对端那边的地址**） | A 填 B 的、B 填 A 的 |
-| `--serve` | 本机允许对端连的地址（**写自己这边的地址**） | A 填自己的、B 填自己的 |
-
-`--target` 和 `--serve` 是**交叉对应**的：A 的 `--target` 必须等于 B 的 `--serve`，反之亦然。
-`--serve` 不填就是**拒绝一切入站**，日志会有警告。
-
-**验收**
-
-日志出现这两行：
-
-```
-[punch] 对端认证通过 peer=<对端 node_id>
-直连已建立 rtt=1.3ms
-```
-
-然后：
-
-```bash
-ssh -p 2222 root@127.0.0.1     # 在 A 上，连到了 B 侧的 10.0.0.7:22
-curl http://127.0.0.1:8080     # 在 B 上，连到了 A 侧的 10.0.0.5:80
-```
-
-### 4.2 虚拟网卡：整网段互访
-
-```bash
-# A 机
-sudo ./qp2p tun --bind 0.0.0.0:51820 --peer 192.168.1.20:51820 \
-  --peer-id <B 的 node_id> --net 10.64.0.0/16 --data-dir /etc/qp2p
-
-# B 机
-sudo ./qp2p tun --bind 0.0.0.0:51820 --peer 192.168.1.10:51820 --dialer \
-  --peer-id <A 的 node_id> --net 10.64.0.0/16 --data-dir /etc/qp2p
-```
-
-启动后会打印各自的虚拟地址（由 `node_id` 派生，重启不变）：
-
-```
-虚拟地址   : 10.64.37.181/16
-隧道已启动：可以 ping 对端的虚拟地址
-```
-
-**验收**
-
-```bash
-ping 10.64.x.y      # 换成对端打印的地址
-```
-
-ping 通说明隧道是通的。**这一步不需要对端开转发**——echo 请求由对端直接应答。
-
-**想访问对端背后的整个局域网**（比如 B 家里的 `192.168.1.0/24`）：
-
-```bash
-# A 机：把那个网段指到隧道
-sudo ./qp2p tun ... --route 192.168.1.0/24
-
-# B 机：需要转发 + SNAT，否则内网设备不知道怎么回到 10.64/16
-sudo sysctl -w net.ipv4.ip_forward=1
-sudo iptables -t nat -A POSTROUTING -s 10.64.0.0/16 -o eth0 -j MASQUERADE
-```
+想彻底重来：`rm -rf ~/.qp2p`，然后重新 `qp2p join`。
 
 ---
 
-## 第 5 步：退出
+## 9. 常见问题
 
-`Ctrl+C` 即可。程序会：
+| 现象 | 原因 / 处理 |
+|---|---|
+| `还没设置信令地址` | 先 `qp2p init https://<域名>` |
+| `建网需要管理密钥` | 用 `qp2p init <地址> --admin <密钥>` 保存一次，或 `--admin` 临时给 |
+| `ADMIN_SECRET 不对` | Cloudflare 里的变量和本机保存的不一致；重新 `qp2p init` 一次 |
+| `加入密钥不正确` | 令牌被 `rotate` 换过，或网络被删了；找管理员要新的 |
+| `本机还没加入任何网络` | 先 `qp2p create` 或 `qp2p join` |
+| `绑定 UDP 失败` | 端口被占用（常见于开了两个实例），用 `--bind 0.0.0.0:51821` |
+| `虚拟网卡创建失败` | Linux 加 sudo；Windows 用管理员终端，并确认 `wintun.dll` 在 exe 旁边 |
+| `暂时连不上 xxx` | 对端没在 `qp2p up`，或对端在线但 NAT 类型太严；双方都开 up 后会自动重试 |
+| ping 不通但显示"直连已建立" | 处在降级模式（没建成虚拟网卡），按上一条处理 |
+| 提示"加入令牌已失效" | 管理员换过密钥；`qp2p join <新令牌>` 后重新 `qp2p up` |
+| 时间相关的签名错误 | 本机时钟偏差超过 2 分钟，校准时间后重试 |
 
-- 关掉 QUIC 连接
-- **删掉路由器上的 UPnP 端口映射**（不做的话，端口会在路由器里挂一小时）
+### 排查顺序
 
-如果进程被强杀（`kill -9`），映射会残留到租约到期，重启一次即可重新建立。
+```bash
+qp2p doctor            # 本地：node_id、公网映射、候选地址、UPnP
+qp2p status            # 服务端视角：成员在线状态、候选数量
+qp2p up --punch-only   # 不建网卡，只验证能不能打通
+```
+
+`--punch-only` 能看到「✓ 直连已建立」就说明打洞没问题，剩下的都是本机网卡权限问题。
 
 ---
 
-## 故障对照表
+## 10. 安全模型（两把密钥不要混）
 
-| 症状 | 最可能的原因 | 怎么确认 |
-|---|---|---|
-| `错误：缺少 --peer-id` | 没写 `--peer-id` 也没写 `--any-peer` | 按提示补上；只在可信网络里试验才用 `--any-peer` |
-| `对端身份不符：期望 … 实际 …` | 两边 `--peer-id` 填错了，或对端换了身份（换了 `--data-dir`） | 在对方跑 `qp2p doctor` 重新抄 node_id |
-| `打洞失败: 超时` | 双方在不同 NAT 后面，但 `--peer` 填的是内网地址 | 加 `--stun` 拿到公网候选，用它当 `--peer` |
-| 连上了但访问超时 | `--serve` 没填，或填的不是对方的 `--target` | 看日志有没有"拒绝未授权目标" |
-| `创建虚拟网卡失败` | 没 root / 没管理员 / 缺 wintun.dll | Linux 用 sudo；Windows 放好 dll 并用管理员终端 |
-| `udp 公网: 未知` | 没配 `--stun` 或 STUN 不可达 | 换一个 STUN 服务器，或确认能出 UDP |
-| Worker 返回 503 `admin_secret_unset` | Worker 没配 `ADMIN_SECRET`，或名字写错 | `/v1/health` 里 `has_admin_secret` 应为 `true` |
+| 密钥 | 谁能拿到 | 作用 | 泄漏后果 |
+|---|---|---|---|
+| `ADMIN_SECRET` | 只有部署者 | 建网络、换加入密钥 | 别人可以建网/换你网络的密钥 |
+| 加入令牌 `qp2p1_<网络>_<密钥>` | 网络成员 | 加入网络、登记节点 | 别人能进这个网络（下次 `rotate` 即可踢掉） |
 
-排障先看日志：`RUST_LOG=qp2p=debug ./qp2p ...`
+- 服务端**只存加入密钥的 sha256**，不存明文；`ADMIN_SECRET` 推不出加入密钥。
+- 换 `ADMIN_SECRET` 不会让成员掉线；换加入密钥才需要大家重新 join。
+- 信令服务看得到：谁在线、候选地址、虚拟地址。看不到：你的私钥、业务流量内容。
+- 直连之后流量是端到端加密的（QUIC + 自签证书钉扎 + 双向签名认证）。
 
 ---
 
-## 还没做到的（别在这上面浪费时间）
+## 11. 开发者：本地跑一遍
 
-- **`qp2p join` 不存在**：加入码拿到了也用不上，连接仍要手工交换 IP 和 node_id
-- **没有中继**：对称 NAT、严格企业防火墙 **100% 连不上**，没有任何兜底
-- **只支持 TCP**：UDP 目标（DNS、游戏）不通
-- **没有后台服务**：关掉终端连接就断；没有开机自启
-- **Android 没有交付**
-- **多跳路由**（A 经 B 访问 C）没做
+```bash
+# 1. 本地信令服务（Node 22，内置 SQLite 冒充 D1，重启即清空）
+ADMIN_SECRET=dev node signal/dev-server.mjs 8787
+
+# 2. 客户端（debug 构建）
+cargo build --bin qp2p
+./target/debug/qp2p init http://127.0.0.1:8787 --admin dev --data-dir /tmp/qa
+./target/debug/qp2p create home --data-dir /tmp/qa
+
+# 3. 第二个节点（另一个 data-dir 就是另一台机器）
+TOKEN=$(./target/debug/qp2p token --data-dir /tmp/qa)
+./target/debug/qp2p join "$TOKEN" --worker http://127.0.0.1:8787 --name bob --data-dir /tmp/qb
+./target/debug/qp2p up --punch-only --bind 0.0.0.0:51822 --data-dir /tmp/qb   # 另开一个终端
+./target/debug/qp2p up --punch-only --bind 0.0.0.0:51821 --data-dir /tmp/qa
+```
+
+两端都打印 `✓ 直连已建立` 就说明整条链路是通的。
+
+```bash
+cargo test --all          # Rust：单测 + e2e 打洞
+node signal/smoke.mjs     # 信令：内存 + D1 两条存储路径
+```

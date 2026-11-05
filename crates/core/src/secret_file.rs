@@ -36,9 +36,75 @@ pub fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     }
 }
 
+/// 覆盖写入私密文件（配置、令牌）。
+///
+/// 和 [`create_private`] 的区别是允许覆盖：先写到同目录的临时文件，
+/// 再 rename 顶上去——中途崩溃不会留下半个文件，也不会出现
+/// "旧文件被截断、新内容还没写完"的窗口。
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp-write");
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+
+    // Windows 的 rename 不覆盖既有文件：先删再改名。配置里有令牌，
+    // 删除与改名之间即使被打断，最坏也只是丢配置（重新 join 一次），不会泄漏。
+    if let Err(first) = std::fs::rename(&tmp, path) {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+            std::fs::rename(&tmp, path)?;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(first);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_private_replaces_content() {
+        let dir = std::env::temp_dir().join(format!("qp2p-secret-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+
+        write_private(&path, b"one").unwrap();
+        write_private(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_keeps_mode_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("qp2p-secret-wm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        write_private(&path, b"x").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn creates_once_then_reports_existing() {
