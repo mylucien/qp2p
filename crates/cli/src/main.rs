@@ -771,14 +771,16 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         let mesh = mesh.clone();
         tokio::spawn(async move {
             signal_loop(
-                client,
-                identity,
-                node_id.clone(),
-                name,
+                Session {
+                    client,
+                    identity,
+                    node_id: node_id.clone(),
+                    name,
+                    net: net_cidr,
+                },
                 engine,
                 peers,
                 mesh,
-                net_cidr,
             )
             .await;
         })
@@ -844,16 +846,30 @@ fn open_tun(
     Ok(links)
 }
 
-async fn signal_loop(
+/// 一次上线会话里不变的东西：身份、令牌、本机名、网络。
+///
+/// 打成一个结构体是为了让 `signal_loop` 的参数保持可读（cli 的 lint 卡在 7 个）。
+struct Session {
     client: SignalClient,
     identity: Identity,
     node_id: NodeId,
     name: String,
+    net: Option<qp2p_core::route::Cidr>,
+}
+
+async fn signal_loop(
+    session: Session,
     engine: Arc<RwLock<Engine>>,
     peers: SharedPeers,
     mesh: Option<Arc<MeshLinks>>,
-    net: Option<qp2p_core::route::Cidr>,
 ) {
+    let Session {
+        client,
+        identity,
+        node_id,
+        name,
+        net,
+    } = session;
     const POLL: Duration = Duration::from_secs(3);
     const REGISTER_EVERY: Duration = Duration::from_secs(60);
     const RENEW_EVERY: Duration = Duration::from_secs(600);
