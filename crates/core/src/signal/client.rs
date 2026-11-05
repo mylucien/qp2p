@@ -57,6 +57,10 @@ impl std::fmt::Display for SignalError {
                 "签名校验失败：最常见原因是本机时钟和真实时间差超过 2 分钟，请先校准时间"
             }
             "node_id_mismatch" => "身份文件和令牌不匹配：换一台机器或删掉 ~/.qp2p/identity.key 重来",
+            "not_found" => {
+                "服务端不认识这个接口：Worker 版本太旧，把 signal/worker.js（2.3.0）重新粘贴部署一次"
+            }
+            "confirm_required" => "删除网络不可撤销，需要在请求里带 confirm=<网络 id>（qp2p delete 会自动带）",
             _ => "",
         };
 
