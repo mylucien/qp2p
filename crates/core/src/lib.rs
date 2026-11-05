@@ -17,6 +17,7 @@ pub mod path;
 pub mod peer;
 pub mod route;
 pub mod secret_file;
+pub mod session;
 pub mod signal;
 pub mod socket;
 pub mod stun;

@@ -12,15 +12,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use qp2p_core::config::{parse_token, Config, Network};
 use qp2p_core::identity::{Identity, NodeId};
 use qp2p_core::link::tun::MeshLinks;
-use qp2p_core::signal::client::{extract_token, normalize_worker, PeerInfo, SignalClient};
+use qp2p_core::signal::client::{extract_token, normalize_worker, SignalClient};
 use qp2p_core::{link, Engine, Role};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 const HELP: &str = "\
 qp2p — 私有组网，没有公网 IP 也能直连
@@ -936,37 +935,6 @@ async fn cmd_delete(args: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct PeerState {
-    name: String,
-    virtual_ip: Option<Ipv4Addr>,
-    connected: bool,
-    /// 尝试过几次（0 表示从没试过，应当立刻连）
-    attempts: u32,
-    last_try: Instant,
-    /// 失败原因只打印一次，避免每 20 秒刷屏
-    reported: bool,
-}
-
-impl PeerState {
-    fn new(peer: &PeerInfo) -> Self {
-        Self {
-            name: peer.name.clone(),
-            virtual_ip: peer.virtual_ip.parse().ok(),
-            connected: false,
-            attempts: 0,
-            last_try: Instant::now(),
-            reported: false,
-        }
-    }
-
-    /// 退避：10s、20s、40s、60s（封顶）。
-    fn backoff(&self) -> Duration {
-        let exp = self.attempts.saturating_sub(1).min(3);
-        Duration::from_secs(10 * (1u64 << exp)).min(Duration::from_secs(60))
-    }
-}
-
-type SharedPeers = Arc<Mutex<HashMap<String, PeerState>>>;
 
 async fn cmd_up(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
@@ -1031,8 +999,8 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         println!("公网映射 未知（STUN 不可达，只能靠内网或 UPnP 建连）");
     }
 
-    let candidates = candidate_strings(&engine);
-    let nat_type = nat_type(&engine);
+    let candidates = qp2p_core::session::candidate_strings(&engine);
+    let nat_type = qp2p_core::session::nat_type(&engine);
     // 配置里存的就是用户上次要求的地址（join --ip 或 config set ip），
     // 每次都带上：服务端会校验并原样保留，用户改配置后也能立刻切过去。
     let wanted_ip: Option<Ipv4Addr> = network.virtual_ip.as_deref().and_then(|s| s.parse().ok());
@@ -1041,7 +1009,7 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         .await
     {
         Ok(reply) => reply,
-        Err(e) if token_rejected(&e) => bail!(
+        Err(e) if qp2p_core::session::token_rejected(&e) => bail!(
             "加入令牌已失效（网络被删除，或管理员执行了 qp2p rotate）。\n\
              找管理员要新令牌，然后重新 qp2p join <新令牌>"
         ),
@@ -1081,14 +1049,6 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         let _ = save_config(&config, &config_path);
     }
 
-    let peers: SharedPeers = Arc::new(Mutex::new(HashMap::new()));
-    {
-        let mut table = peers.lock().await;
-        for peer in &reply.peers {
-            table.insert(peer.node_id.clone(), PeerState::new(peer));
-        }
-    }
-
     // 把这次命令行里的选择固化下来：下次直接 qp2p up 就带同样的参数
     if flags.flag("save") {
         config.node_name = name.clone();
@@ -1126,30 +1086,22 @@ async fn cmd_up(args: &[String]) -> Result<()> {
     }
 
     let engine = Arc::new(RwLock::new(engine));
-    let mut task = {
-        let client = client.clone();
-        let identity = identity.clone();
-        let name = name.clone();
-        let peers = peers.clone();
-        let engine = engine.clone();
-        let mesh = mesh.clone();
-        tokio::spawn(async move {
-            signal_loop(
-                Session {
-                    client,
-                    identity,
-                    node_id: node_id.clone(),
-                    name,
-                    net: net_cidr,
-                    wanted_ip,
-                },
-                engine,
-                peers,
-                mesh,
-            )
-            .await;
-        })
-    };
+    // 会话循环在 core 里：CLI 和 Android 共用同一套打洞/退避/事件应答逻辑
+    let session = qp2p_core::session::Session::new(
+        qp2p_core::session::SessionConfig {
+            client: client.clone(),
+            identity: identity.clone(),
+            node_id: node_id.clone(),
+            name: name.clone(),
+            net: net_cidr,
+            wanted_ip,
+            peers: reply.peers.clone(),
+        },
+        engine.clone(),
+        mesh.clone(),
+        Arc::new(|msg: &str| println!("{msg}")),
+    );
+    let mut task = tokio::spawn(session.run());
 
     println!("\n已上线（Ctrl+C 退出）。直连建立时会打印对端名字和延迟。");
 
@@ -1212,410 +1164,14 @@ fn open_tun(
     Ok(links)
 }
 
-/// 一次上线会话里不变的东西：身份、令牌、本机名、网络。
-///
-/// 打成一个结构体是为了让 `signal_loop` 的参数保持可读（cli 的 lint 卡在 7 个）。
-struct Session {
-    client: SignalClient,
-    identity: Identity,
-    node_id: NodeId,
-    name: String,
-    net: Option<qp2p_core::route::Cidr>,
-    /// 用户指定/上次分配的虚拟地址，重注册时继续沿用
-    wanted_ip: Option<Ipv4Addr>,
-}
-
-async fn signal_loop(
-    session: Session,
-    engine: Arc<RwLock<Engine>>,
-    peers: SharedPeers,
-    mesh: Option<Arc<MeshLinks>>,
-) {
-    let Session {
-        client,
-        identity,
-        node_id,
-        name,
-        net,
-        wanted_ip,
-    } = session;
-    const POLL: Duration = Duration::from_secs(3);
-    const REGISTER_EVERY: Duration = Duration::from_secs(60);
-    const RENEW_EVERY: Duration = Duration::from_secs(600);
-
-    let mut cursor: i64 = 0;
-    let mut last_register = Instant::now();
-    let mut last_renew = Instant::now();
-    let mut last_error = String::new();
-
-    loop {
-        // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request
-        match client.events(&identity, cursor).await {
-            Ok(reply) => {
-                cursor = reply.cursor;
-                for event in reply.events {
-                    if event.kind != "punch_request" {
-                        continue;
-                    }
-                    let Some(from) = event.str("from").and_then(NodeId::parse) else {
-                        continue;
-                    };
-                    let addrs: Vec<SocketAddr> = event
-                        .strings("candidates")
-                        .iter()
-                        .filter_map(|c| c.parse().ok())
-                        .collect();
-                    // 2.2 起的 Worker 会直接给虚拟地址；更早的版本没有这个字段，
-                    // 用和 Worker 完全一致的推导算法兜底，否则组网时没法把包发给它
-                    let ip = event
-                        .str("virtual_ip")
-                        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-                        .or_else(|| {
-                            net.map(|cidr| {
-                                qp2p_core::identity::derive_virtual_ip(
-                                    &from,
-                                    cidr.base,
-                                    cidr.prefix,
-                                    0,
-                                )
-                            })
-                        });
-                    let label = event.str("from_name").unwrap_or("未知节点").to_string();
-
-                    let engine = engine.clone();
-                    let peers = peers.clone();
-                    let mesh = mesh.clone();
-                    tokio::spawn(async move {
-                        answer_punch(engine, peers, mesh, from, label, ip, addrs).await;
-                    });
-                }
-                if !last_error.is_empty() {
-                    last_error.clear();
-                }
-            }
-            Err(e) => {
-                // 令牌被换掉 / 网络被删：再轮询也没有意义，直接说清楚然后停
-                if token_rejected(&e) {
-                    println!("\n⚠ 加入令牌已失效（网络被删除，或管理员执行了 qp2p rotate）。");
-                    println!("  现有直连还能用，但新节点连不上来了。");
-                    println!("  拿到新令牌后：qp2p join <新令牌>，然后重新 qp2p up。");
-                    return;
-                }
-                // 只在不重复的时候喊一声，别每 3 秒刷一行
-                let text = format!("{e:#}");
-                if text != last_error {
-                    println!("⚠ 拉取事件失败：{text}");
-                    last_error = text;
-                }
-            }
-        }
-
-        // 2) 主动发起：node_id 小的一方负责拨号，避免两边同时重复建连
-        dial_round(&client, &identity, &node_id, &engine, &peers, &mesh).await;
-
-        // 3) 定时重新注册：候选地址（STUN 映射）可能变了，顺便刷新成员列表
-        if last_register.elapsed() >= REGISTER_EVERY {
-            last_register = Instant::now();
-            let (candidates, fp, nat) = {
-                let engine = engine.read().await;
-                (
-                    candidate_strings(&engine),
-                    engine.tls_fp(),
-                    nat_type(&engine),
-                )
-            };
-            match client
-                .register(&identity, &name, &fp, &candidates, nat, wanted_ip)
-                .await
-            {
-                Ok(reply) => {
-                    let mut table = peers.lock().await;
-                    for peer in &reply.peers {
-                        match table.get_mut(&peer.node_id) {
-                            Some(state) => {
-                                state.name = peer.name.clone();
-                                if let Ok(ip) = peer.virtual_ip.parse() {
-                                    state.virtual_ip = Some(ip);
-                                }
-                            }
-                            None => {
-                                table.insert(peer.node_id.clone(), PeerState::new(peer));
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::debug!("[signal] 刷新注册失败: {e:#}"),
-            }
-        }
-
-        // 4) 一个都连不上很久了：刷新端点重新做 STUN（有直连时绝不能动，会掐断）
-        if last_renew.elapsed() >= RENEW_EVERY {
-            let alive = match &mesh {
-                Some(mesh) => mesh.peer_count().await > 0,
-                None => peers.lock().await.values().any(|p| p.connected),
-            };
-            if !alive {
-                last_renew = Instant::now();
-                let renewed = {
-                    let mut guard = engine.write().await;
-                    guard.renew().await
-                };
-                match renewed {
-                    Ok(()) => tracing::info!("[signal] 端点已刷新（重新探测 NAT 映射）"),
-                    Err(e) => tracing::debug!("[signal] 端点刷新失败: {e:#}"),
-                }
-            }
-        }
-
-        tokio::time::sleep(POLL).await;
-    }
-}
-
 /// 对端请求撮合：我们作为 listener 守着，等它打进来。
-async fn answer_punch(
-    engine: Arc<RwLock<Engine>>,
-    peers: SharedPeers,
-    mesh: Option<Arc<MeshLinks>>,
-    from: NodeId,
-    label: String,
-    ip: Option<Ipv4Addr>,
-    addrs: Vec<SocketAddr>,
-) {
-    if addrs.is_empty() {
-        return;
-    }
-    {
-        let mut table = peers.lock().await;
-        let state = table.entry(from.to_string()).or_insert_with(|| PeerState {
-            name: label.clone(),
-            virtual_ip: ip,
-            connected: false,
-            attempts: 0,
-            last_try: Instant::now(),
-            reported: false,
-        });
-        if state.connected {
-            return;
-        }
-        if ip.is_some() {
-            state.virtual_ip = ip;
-        }
-    }
-
-    let result = {
-        let engine = engine.read().await;
-        engine
-            .punch_as(
-                &addrs,
-                Role::Listener,
-                Engine::attempt_timeout(Role::Listener),
-                Some(from.clone()),
-            )
-            .await
-    };
-
-    match result {
-        Ok(conn) => on_connected(&peers, &mesh, from, label, ip, conn).await,
-        Err(e) => tracing::debug!("[signal] 应答 {label} 的打洞失败: {e}"),
-    }
-}
 
 /// 主动拨号：只对"我该发起"且没连上的成员执行。
-async fn dial_round(
-    client: &SignalClient,
-    identity: &Identity,
-    node_id: &NodeId,
-    engine: &Arc<RwLock<Engine>>,
-    peers: &SharedPeers,
-    mesh: &Option<Arc<MeshLinks>>,
-) {
-    let targets: Vec<(String, String)> = {
-        let mut table = peers.lock().await;
-        let now = Instant::now();
-        let mut out = Vec::new();
-        for (id, state) in table.iter_mut() {
-            if state.connected {
-                continue;
-            }
-            // 双方都拨会各建一条连接；固定由 node_id 小的一方发起
-            if node_id.as_str() >= id.as_str() {
-                continue;
-            }
-            if state.attempts > 0 && now.duration_since(state.last_try) < state.backoff() {
-                continue;
-            }
-            state.attempts += 1;
-            state.last_try = now;
-            out.push((id.clone(), state.name.clone()));
-        }
-        out
-    };
-
-    for (target_id, label) in targets {
-        let Some(target) = NodeId::parse(&target_id) else {
-            continue;
-        };
-        let client = client.clone();
-        let identity = identity.clone();
-        let engine = engine.clone();
-        let peers = peers.clone();
-        let mesh = mesh.clone();
-
-        // 每个对端一个任务：撮合是 HTTP，打洞要几十秒，串行会把整轮拖长
-        tokio::spawn(async move {
-            let reply = match client.connect(&identity, &target).await {
-                Ok(reply) => reply,
-                Err(e) => {
-                    report_failure(&peers, &target_id, &label, &format!("{e}")).await;
-                    return;
-                }
-            };
-            let addrs = reply.socket_addrs();
-            if addrs.is_empty() {
-                report_failure(&peers, &target_id, &label, "对端没有可用地址").await;
-                return;
-            }
-            let ip = reply.target_virtual_ip.parse::<Ipv4Addr>().ok();
-
-            let result = {
-                let engine = engine.read().await;
-                engine
-                    .punch_as(
-                        &addrs,
-                        Role::Dialer,
-                        Engine::attempt_timeout(Role::Dialer),
-                        Some(target.clone()),
-                    )
-                    .await
-            };
-
-            match result {
-                Ok(conn) => on_connected(&peers, &mesh, target, label, ip, conn).await,
-                Err(e) => {
-                    report_failure(&peers, &target_id, &label, &format!("{e}")).await;
-                }
-            }
-        });
-    }
-}
-
-async fn report_failure(peers: &SharedPeers, node_id: &str, label: &str, reason: &str) {
-    let first = {
-        let mut table = peers.lock().await;
-        match table.get_mut(node_id) {
-            Some(state) => {
-                let first = !state.reported;
-                state.reported = true;
-                first
-            }
-            None => true,
-        }
-    };
-    if first {
-        println!("· 暂时连不上 {label}：{reason}（会自动重试）");
-    } else {
-        tracing::debug!("[signal] 仍然连不上 {label}: {reason}");
-    }
-}
-
-async fn on_connected(
-    peers: &SharedPeers,
-    mesh: &Option<Arc<MeshLinks>>,
-    node_id: NodeId,
-    label: String,
-    ip: Option<Ipv4Addr>,
-    conn: quinn::Connection,
-) {
-    let ip = {
-        let mut table = peers.lock().await;
-        match table.get_mut(node_id.as_str()) {
-            Some(state) => {
-                state.connected = true;
-                state.attempts = 0;
-                state.reported = false;
-                if ip.is_some() {
-                    state.virtual_ip = ip;
-                }
-                state.virtual_ip
-            }
-            None => ip,
-        }
-    };
-
-    if let (Some(mesh), Some(ip)) = (mesh, ip) {
-        mesh.attach(ip, conn.clone()).await;
-    }
-
-    match ip {
-        Some(ip) => println!("✓ 直连已建立：{label} ({ip}) rtt={:?}", conn.rtt()),
-        None => println!(
-            "✓ 直连已建立：{label}（服务端没给虚拟地址）rtt={:?}",
-            conn.rtt()
-        ),
-    }
-
-    // 断开后允许重新拨号
-    let peers = peers.clone();
-    tokio::spawn(async move {
-        let reason = conn.closed().await;
-        let mut table = peers.lock().await;
-        if let Some(state) = table.get_mut(node_id.as_str()) {
-            state.connected = false;
-            // attempts 归零 = 允许立刻重连，不用等退避
-            state.attempts = 0;
-            state.last_try = Instant::now();
-        }
-        tracing::info!("[signal] 与 {label} 的连接断开: {reason}");
-    });
-}
 
 /// 服务端明确说"这把令牌不认了"——继续重试只是白烧请求。
-fn token_rejected(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<qp2p_core::signal::client::SignalError>()
-        .map(|e| {
-            matches!(
-                e.code.as_str(),
-                "wrong_secret" | "invalid_token" | "network_not_found"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn candidate_strings(engine: &Engine) -> Vec<String> {
-    engine
-        .candidates()
-        .iter()
-        .filter(|c| c.is_usable() && dialable(&c.addr))
-        .map(|c| c.addr.to_string())
-        .collect()
-}
 
 /// 服务端只接受能当对端地址的 IPv4：回环、链路本地、组播/保留段一律会被拒，
 /// 混进一个就会让整次注册失败，所以在这里先筛掉。
-fn dialable(addr: &SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            let o = ip.octets();
-            o[0] != 0
-                && o[0] != 127
-                && !(o[0] == 169 && o[1] == 254)
-                && o[0] < 224
-                && addr.port() != 0
-        }
-        IpAddr::V6(_) => false,
-    }
-}
-
-fn nat_type(engine: &Engine) -> &'static str {
-    if engine.upnp().is_some() {
-        "upnp"
-    } else if engine.srflx().is_some() {
-        "srflx"
-    } else {
-        "host"
-    }
-}
 
 fn cidr_prefix(cidr: &str) -> u8 {
     cidr.split_once('/')
@@ -1977,37 +1533,6 @@ mod tests {
         let parsed = flags(&["https://p2p.example.com", "--admin", "s3cret"]);
         assert_eq!(parsed.positional, vec!["https://p2p.example.com"]);
         assert_eq!(parsed.get("admin"), Some("s3cret"));
-    }
-
-    #[test]
-    fn only_dialable_candidates_are_reported() {
-        let ok: SocketAddr = "203.0.113.7:51820".parse().unwrap();
-        assert!(dialable(&ok));
-        for bad in [
-            "127.0.0.1:51820",
-            "0.0.0.0:51820",
-            "169.254.1.1:51820",
-            "224.0.0.1:51820",
-            "[::1]:51820",
-        ] {
-            assert!(!dialable(&bad.parse().unwrap()), "{bad} 不该上报");
-        }
-    }
-
-    #[test]
-    fn backoff_grows_and_caps() {
-        let mk = |attempts| PeerState {
-            name: String::new(),
-            virtual_ip: None,
-            connected: false,
-            attempts,
-            last_try: Instant::now(),
-            reported: false,
-        };
-        assert_eq!(mk(1).backoff(), Duration::from_secs(10));
-        assert_eq!(mk(2).backoff(), Duration::from_secs(20));
-        assert_eq!(mk(3).backoff(), Duration::from_secs(40));
-        assert_eq!(mk(9).backoff(), Duration::from_secs(60));
     }
 
     #[test]

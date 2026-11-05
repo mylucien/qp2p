@@ -110,9 +110,24 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --target ${{ matrix.target }} -p qp2p-cli
 
+      # WinTun 是运行期加载的 dll，不打包进去用户就得自己找，
+      # 版本对不上还会报看不懂的错。这里直接连 dll 一起放进产物目录。
+      - name: 准备 Windows 运行包
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun -Force
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/qp2p.exe" dist/
+          Copy-Item "wintun/bin/amd64/wintun.dll" dist/
+          Copy-Item USAGE.md dist/
+          Get-ChildItem dist | Select-Object Name, Length
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: ${{ runner.os == 'Windows' && 'dist' || format('target/{0}/release/qp2p', matrix.target) }}
           if-no-files-found: error
