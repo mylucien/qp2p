@@ -208,6 +208,22 @@ pub struct EventsReply {
     pub events: Vec<Event>,
 }
 
+/// 管理面看到的一个网络（`qp2p nets`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminNetwork {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub cidr: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub nodes: i64,
+    #[serde(default)]
+    pub has_join_key: bool,
+}
+
 /// 建网 / 换密钥的结果。
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssuedNetwork {
@@ -346,6 +362,49 @@ impl SignalClient {
         parse_issued(value)
     }
 
+    /// 列出所有网络（管理面）。
+    pub async fn list_networks(&self, admin_secret: &str) -> Result<Vec<AdminNetwork>> {
+        let url = format!("{}/v1/admin/networks", self.base);
+        let res = self
+            .http
+            .get(&url)
+            .header("x-admin-secret", admin_secret)
+            .send()
+            .await
+            .with_context(|| format!("连不上 {url}（检查 Worker 地址和网络）"))?;
+        let value = self.read(res).await?;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            networks: Vec<AdminNetwork>,
+        }
+        Ok(serde_json::from_value::<Wrapper>(value)
+            .context("服务端返回的网络列表格式不对")?
+            .networks)
+    }
+
+    /// 删除网络（连同节点与事件）。返回清理掉的节点数。
+    ///
+    /// 服务端要求 `confirm` 与网络 id 一致，这里照做——这一步不可撤销。
+    pub async fn delete_network(&self, admin_secret: &str, network_id: &str) -> Result<i64> {
+        let url = format!("{}/v1/admin/networks/{}", self.base, network_id);
+        let body = serde_json::json!({ "confirm": network_id });
+        let res = self
+            .http
+            .delete(&url)
+            .header("x-admin-secret", admin_secret)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body)?)
+            .send()
+            .await
+            .with_context(|| format!("连不上 {url}（检查 Worker 地址和网络）"))?;
+        let value = self.read(res).await?;
+        Ok(value
+            .get("removed_nodes")
+            .and_then(Value::as_i64)
+            .unwrap_or(0))
+    }
+
     // ---- 数据面 ---------------------------------------------------------
 
     /// 注册（或刷新）本节点，返回服务端分配的虚拟地址和当前成员列表。
@@ -356,6 +415,7 @@ impl SignalClient {
         tls_fp: &str,
         candidates: &[String],
         nat_type: &str,
+        virtual_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<RegisterReply> {
         let node_id = identity.node_id();
         let mut body = Map::new();
@@ -371,6 +431,10 @@ impl SignalClient {
             "candidates".into(),
             Value::Array(candidates.iter().cloned().map(Value::String).collect()),
         );
+        // 只在用户明确指定时带上：不指定就由服务端分配并在重连后保持不变
+        if let Some(ip) = virtual_ip {
+            body.insert("virtual_ip".into(), Value::String(ip.to_string()));
+        }
 
         let value = self
             .post_signed("/v1/register", "register", identity, body)
@@ -379,7 +443,12 @@ impl SignalClient {
     }
 
     /// 只加入、不要求候选地址；用来验证令牌、刷新在线状态、拿成员列表。
-    pub async fn join(&self, identity: &Identity, name: &str) -> Result<RegisterReply> {
+    pub async fn join(
+        &self,
+        identity: &Identity,
+        name: &str,
+        virtual_ip: Option<std::net::Ipv4Addr>,
+    ) -> Result<RegisterReply> {
         let node_id = identity.node_id();
         let mut body = Map::new();
         body.insert("node_id".into(), Value::String(node_id.to_string()));
@@ -390,6 +459,9 @@ impl SignalClient {
         body.insert("name".into(), Value::String(name.to_string()));
         // 空数组不会覆盖服务端已有的候选，只更新心跳
         body.insert("candidates".into(), Value::Array(Vec::new()));
+        if let Some(ip) = virtual_ip {
+            body.insert("virtual_ip".into(), Value::String(ip.to_string()));
+        }
 
         let value = self.post_signed("/v1/join", "join", identity, body).await?;
         serde_json::from_value(value).context("服务端返回的加入结果格式不对")

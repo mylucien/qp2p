@@ -55,12 +55,12 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 ```
 ✓ Worker 可用
-  版本    : 2.2.0
+  版本    : 2.3.0
   存储    : D1（多地域一致）
   管理密钥: 已配置
 ```
 
-- **版本低于 2.2**：请重新粘贴一次 `worker.js`。2.2 起撮合事件里带了对端的虚拟地址，
+- **版本低于 2.3**：请重新粘贴一次 `worker.js`（2.3 才有删网、列网络、自定义 IP）。2.2 起撮合事件里带了对端的虚拟地址，
   多机组网靠它决定「这个包该发给谁」（旧版客户端会用推导算法兜底，但网络里出现
   地址冲突时可能连错）。
 - **存储显示"内存"**：没绑 D1，重启 Worker 就丢网络，确认上面第 3 步。
@@ -196,7 +196,17 @@ ping 10.78.156.207         # Windows: ping 10.78.156.207
 | `qp2p token` | 再显示一次加入令牌，用来发给新机器 |
 | `qp2p rotate` | 换新令牌，旧令牌立刻失效（有人退出群聊时用） |
 | `qp2p leave` | 把本机从网络里注销（不影响本机保存的令牌） |
+| `qp2p config` | 查看/修改本机配置（MTU、网卡名、路由、虚拟地址…） |
 | `qp2p up -h` | 看组网的完整选项 |
+
+管理员命令（需要 `ADMIN_SECRET`）：
+
+| 命令 | 作用 |
+|---|---|
+| `qp2p nets` | 列出这台 Worker 上的所有网络（成员数、网段、准入密码是否设置） |
+| `qp2p rotate --network <名字>` | 换某个网络的准入密码；不给 `--network` 就是本机所在的网络 |
+| `qp2p rotate --network x --key <新密码>` | 自己指定新密码（16~128 字符） |
+| `qp2p delete <名字> --yes` | 删除网络，成员和事件一并清除，**不可恢复** |
 
 `qp2p status` 的样子：
 
@@ -215,6 +225,52 @@ ping 10.78.156.207         # Windows: ping 10.78.156.207
 需要拿新令牌重新 `qp2p join` 一次再 `qp2p up`。
 
 ---
+
+## 6.5 自定义：虚拟地址 / MTU / 网卡名 / 路由
+
+用户级的东西改一次就记住，不用每次 `up` 都带参数。
+
+### 加入时固定自己的地址
+
+```bash
+qp2p join <令牌> --ip 10.78.0.20
+qp2p join <令牌>                 # 不给就由服务端分配
+```
+
+服务端会校验：必须落在本网络网段内、不能是网段地址或广播地址、不能和别人重复。
+冲突时直接报错并告诉你是谁占了：
+
+```
+10.78.0.20 已经被节点「nas」占用，换一个
+```
+
+想改已经在用的地址：
+
+```bash
+qp2p config set ip 10.78.0.30    # 下次 up 生效
+```
+
+### 其它本机配置
+
+```bash
+qp2p config                      # 看当前生效的全部配置
+qp2p config set mtu 1280
+qp2p config set dev qp2p1
+qp2p config set stun stun.cloudflare.com:3478,stun.l.google.com:19302
+qp2p config set routes 192.168.1.0/24,192.168.2.0/24
+qp2p config unset mtu            # 回到默认
+```
+
+可用项：`worker` `admin_secret` `node_name` `listen` `mtu` `dev` `stun` `routes` `ip`。
+
+**取值顺序**：命令行 > 配置文件 > 默认值。
+想让这次的命令行选择长期生效，加 `--save`：
+
+```bash
+qp2p up --mtu 1280 --route 192.168.1.0/24 --save
+```
+
+也可以直接 `qp2p config set`，两者等价。
 
 ## 7. 组网是怎么连的
 

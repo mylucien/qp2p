@@ -32,6 +32,7 @@ qp2p — 私有组网，没有公网 IP 也能直连
 
 其它机器加入：
   qp2p join qp2p1_home_xxxxxxxx                # 用建网时打印的令牌
+  qp2p join <令牌> --ip 10.78.0.20             # 顺便指定自己的虚拟地址
   qp2p up
 
 日常命令：
@@ -39,7 +40,14 @@ qp2p — 私有组网，没有公网 IP 也能直连
   qp2p token           重新显示加入令牌（发给别人）
   qp2p rotate          换新令牌，旧令牌立刻失效
   qp2p leave           从网络里注销本机
+  qp2p config          查看本机保存的配置（MTU、网卡名、路由、STUN…）
+  qp2p config set mtu 1280     改一项并保存，下次 up 直接生效
   qp2p up -h           看组网的详细选项
+
+管理员（需要 ADMIN_SECRET，只有建网的人有）：
+  qp2p nets            列出这台 Worker 上的所有网络
+  qp2p rotate          换准入密码，旧令牌立刻失效
+  qp2p delete <网络>   删除网络（连带成员和事件），需加 --yes 确认
 
 调试/兼容命令（不需要信令服务器）：
   qp2p punch   --bind <addr> --peer <addr> [--dialer] (--peer-id <id> | --any-peer)
@@ -105,6 +113,9 @@ async fn run(args: &[String]) -> Result<()> {
         Some("token") => cmd_token(&args[1..]),
         Some("rotate") => cmd_rotate(&args[1..]).await,
         Some("leave") | Some("down") => cmd_leave(&args[1..]).await,
+        Some("config") => cmd_config(&args[1..]),
+        Some("nets") => cmd_nets(&args[1..]).await,
+        Some("delete") | Some("rm") => cmd_delete(&args[1..]).await,
         Some("doctor") => cmd_doctor(&args[1..]).await,
         Some("punch") => cmd_punch(&args[1..]).await,
         Some("forward") => cmd_forward(&args[1..]).await,
@@ -445,8 +456,20 @@ async fn cmd_join(args: &[String]) -> Result<()> {
     let identity = load_identity(&flags)?;
     let name = node_name(&config, &flags);
 
+    // 想固定地址就自己给；不给由服务端分配，之后重连也保持不变
+    let requested_ip: Option<Ipv4Addr> = match flags.get("ip").or(flags.get("tun-addr")) {
+        Some(raw) => Some(
+            raw.parse()
+                .with_context(|| format!("--ip 不是合法 IPv4：{raw}"))?,
+        ),
+        None => None,
+    };
+
     println!("正在加入 {network_id}（{worker}）…");
-    let reply = client.join(&identity, &name).await.context("加入失败")?;
+    let reply = client
+        .join(&identity, &name, requested_ip)
+        .await
+        .context("加入失败")?;
 
     config.worker = Some(worker.clone());
     config.network = Some(Network {
@@ -503,7 +526,7 @@ async fn cmd_status(args: &[String]) -> Result<()> {
     println!("配置     : {}", path.display());
 
     // join 只刷新在线状态，不需要候选地址，也不会影响正在跑的 up
-    let reply = client.join(&identity, &name).await?;
+    let reply = client.join(&identity, &name, None).await?;
     println!(
         "虚拟地址 : {}（网段 {}）",
         reply.node.virtual_ip, reply.network.cidr
@@ -558,16 +581,29 @@ async fn cmd_rotate(args: &[String]) -> Result<()> {
     let admin = admin_of(&config, &flags)
         .context("换密钥需要管理密钥（ADMIN_SECRET），见 qp2p create 的说明")?;
 
+    // 可以显式指定要改哪个网络；不指定就改本机所在的那个
+    let target_id = flags
+        .get("network")
+        .map(str::to_string)
+        .unwrap_or_else(|| network.id.clone());
     let client = SignalClient::admin(&worker)?;
     let issued = client
-        .rotate_join_key(&admin, &network.id, flags.get("key"))
+        .rotate_join_key(&admin, &target_id, flags.get("key"))
         .await?;
 
-    let mut updated = network.clone();
-    updated.token = issued.token.clone();
-    updated.cidr = Some(issued.network.cidr.clone());
-    config.network = Some(updated);
-    save_config(&config, &path)?;
+    // 只有改的就是本机这个网络时才更新本机令牌，别把别人的网络写进自己配置
+    if target_id == network.id {
+        let mut updated = network.clone();
+        updated.token = issued.token.clone();
+        updated.cidr = Some(issued.network.cidr.clone());
+        config.network = Some(updated);
+        save_config(&config, &path)?;
+    } else {
+        println!(
+            "注意：改的是网络「{target_id}」，本机所在的「{}」没有变化",
+            network.id
+        );
+    }
 
     if !issued.warning.is_empty() {
         println!("注意：{}", issued.warning);
@@ -592,6 +628,306 @@ async fn cmd_leave(args: &[String]) -> Result<()> {
         Err(e) => println!("注销请求没成功（服务端可能已经把本机当成离线清掉了）：{e}"),
     }
     println!("本机令牌仍在，随时可以 qp2p up 重新上线。");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 本机配置：查看 / 修改 / 撤销
+// ---------------------------------------------------------------------------
+
+fn cmd_config(args: &[String]) -> Result<()> {
+    let flags = Flags::parse(args)?;
+    let (mut config, path) = load_config(&flags)?;
+
+    match flags
+        .positional
+        .first()
+        .map(String::as_str)
+        .unwrap_or("list")
+    {
+        "list" | "show" => {
+            print_config(&config, &path);
+            Ok(())
+        }
+        "set" => {
+            let key = flags
+                .positional
+                .get(1)
+                .map(String::as_str)
+                .context("用法：qp2p config set <项> <值>，例如 qp2p config set mtu 1280")?;
+            let value = flags
+                .positional
+                .get(2)
+                .map(String::as_str)
+                .or_else(|| flags.get("value"))
+                .context("缺少值：qp2p config set mtu 1280")?;
+            set_config(&mut config, key, value)?;
+            save_config(&config, &path)?;
+            println!("✓ 已保存 {key} = {value}");
+            println!("  写到 {}", path.display());
+            Ok(())
+        }
+        "unset" => {
+            let key = flags
+                .positional
+                .get(1)
+                .map(String::as_str)
+                .context("用法：qp2p config unset <项>")?;
+            unset_config(&mut config, key)?;
+            save_config(&config, &path)?;
+            println!("✓ 已清除 {key}，回到默认值");
+            Ok(())
+        }
+        other => bail!("config 只支持 list / set / unset，不认识 {other}"),
+    }
+}
+
+fn print_config(config: &Config, path: &std::path::Path) {
+    let show = |value: Option<&str>, default: &str| match value {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => format!("{default}（默认）"),
+    };
+
+    println!("配置文件 : {}", path.display());
+    println!(
+        "信令服务 : {}",
+        config
+            .worker
+            .as_deref()
+            .unwrap_or("未设置（qp2p init <地址>）")
+    );
+    println!(
+        "管理密钥 : {}",
+        if config.admin_secret.is_some() {
+            "已保存（建网/换密码用）"
+        } else {
+            "未保存"
+        }
+    );
+    println!(
+        "本机名称 : {}",
+        show(Some(config.node_name.as_str()), "主机名")
+    );
+    println!("UDP 监听 : {}", config.listen);
+    println!("虚拟网卡 : {}", show(config.dev.as_deref(), "qp2p0"));
+    println!(
+        "MTU      : {}",
+        config
+            .mtu
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "1400（默认）".into())
+    );
+    println!(
+        "额外路由 : {}",
+        if config.routes.is_empty() {
+            "无".to_string()
+        } else {
+            config.routes.join(", ")
+        }
+    );
+    println!("STUN     : {}", config.stun.join(", "));
+    match &config.network {
+        Some(net) => {
+            println!(
+                "网络     : {}  {}",
+                net.id,
+                net.cidr.as_deref().unwrap_or("（未知网段）")
+            );
+            println!(
+                "虚拟地址 : {}",
+                net.virtual_ip.as_deref().unwrap_or("由服务端分配")
+            );
+            println!("加入令牌 : {}", mask_token(&net.token));
+        }
+        None => println!("网络     : 未加入（qp2p create / qp2p join）"),
+    }
+    println!("\n改一项：qp2p config set <项> <值>   撤销：qp2p config unset <项>");
+    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / ip");
+}
+
+fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
+    match key {
+        "worker" => config.worker = Some(normalize_worker(value)?),
+        "admin_secret" => config.admin_secret = Some(value.to_string()),
+        "node_name" | "name" => config.node_name = value.to_string(),
+        "listen" | "bind" => {
+            value
+                .parse::<SocketAddr>()
+                .with_context(|| format!("listen 不是合法地址：{value}"))?;
+            config.listen = value.to_string();
+        }
+        "mtu" => {
+            let mtu: u16 = value
+                .parse()
+                .with_context(|| format!("mtu 不是数字：{value}"))?;
+            if mtu < 576 {
+                bail!("MTU 太小（{mtu}），隧道内层至少 576");
+            }
+            config.mtu = Some(mtu);
+        }
+        "dev" => config.dev = Some(value.to_string()),
+        "stun" => {
+            let list = split_list(value);
+            if list.is_empty() {
+                bail!("stun 不能为空，例如 qp2p config set stun stun.cloudflare.com:3478");
+            }
+            config.stun = list;
+        }
+        "routes" | "route" => {
+            let list = split_list(value);
+            for raw in &list {
+                raw.parse::<qp2p_core::route::Cidr>()
+                    .with_context(|| format!("不是合法网段：{raw}"))?;
+            }
+            config.routes = list;
+        }
+        "ip" | "virtual_ip" => {
+            let network = config
+                .network
+                .as_mut()
+                .context("还没加入网络，先 qp2p join <令牌>")?;
+            let ip: Ipv4Addr = value
+                .parse()
+                .with_context(|| format!("不是合法 IPv4：{value}"))?;
+            if let Some(cidr_text) = network.cidr.as_deref() {
+                let cidr: qp2p_core::route::Cidr = cidr_text
+                    .parse()
+                    .with_context(|| format!("网络网段不合法：{cidr_text}"))?;
+                if !cidr.contains(ip) {
+                    bail!("{ip} 不在本网络网段 {cidr} 里");
+                }
+            }
+            network.virtual_ip = Some(ip.to_string());
+        }
+        other => bail!(
+            "不认识的配置项：{other}\n\
+             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / ip"
+        ),
+    }
+    Ok(())
+}
+
+fn unset_config(config: &mut Config, key: &str) -> Result<()> {
+    match key {
+        "worker" => config.worker = None,
+        "admin_secret" => config.admin_secret = None,
+        "node_name" | "name" => config.node_name = String::new(),
+        "listen" => config.listen = format!("0.0.0.0:{}", qp2p_core::DEFAULT_PORT),
+        "mtu" => config.mtu = None,
+        "dev" => config.dev = None,
+        "stun" => {
+            config.stun = vec![
+                "stun.cloudflare.com:3478".to_string(),
+                "stun.l.google.com:19302".to_string(),
+            ]
+        }
+        "routes" | "route" => config.routes.clear(),
+        "ip" | "virtual_ip" => {
+            if let Some(network) = config.network.as_mut() {
+                network.virtual_ip = None;
+            }
+        }
+        other => bail!("不认识的配置项：{other}"),
+    }
+    Ok(())
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 令牌只露头尾，避免截图/录屏时整串泄漏。
+fn mask_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= 16 {
+        return token.to_string();
+    }
+    let head: String = chars.iter().take(12).collect();
+    let tail: String = chars.iter().skip(chars.len() - 4).collect();
+    format!("{head}…{tail}")
+}
+
+// ---------------------------------------------------------------------------
+// 管理面：列网络 / 删网络
+// ---------------------------------------------------------------------------
+
+async fn cmd_nets(args: &[String]) -> Result<()> {
+    let flags = Flags::parse(args)?;
+    let (config, _) = load_config(&flags)?;
+    let worker = worker_of(&config, &flags)?;
+    let admin = admin_of(&config, &flags)
+        .context("列网络需要管理密钥（ADMIN_SECRET）：\n  qp2p init <地址> --admin <密钥>")?;
+
+    let client = SignalClient::admin(&worker)?;
+    let networks = client.list_networks(&admin).await?;
+
+    if networks.is_empty() {
+        println!("{worker} 上还没有网络。建一个：qp2p create home");
+        return Ok(());
+    }
+
+    println!("{worker} 上的网络（{} 个）：\n", networks.len());
+    println!(
+        "  {:<18} {:<20} {:>6}  {:<8} {}",
+        "名称", "网段", "成员", "准入密码", "备注"
+    );
+    for net in &networks {
+        let me = config
+            .network
+            .as_ref()
+            .map(|n| n.id == net.id)
+            .unwrap_or(false);
+        println!(
+            "  {:<18} {:<20} {:>6}  {:<8} {}",
+            truncate(&net.name, 18),
+            net.cidr,
+            net.nodes,
+            if net.has_join_key {
+                "已设置"
+            } else {
+                "旧版"
+            },
+            if me { "本机所在" } else { "" }
+        );
+    }
+    println!("\n换准入密码：qp2p rotate --network <名称>");
+    println!("删网络    ：qp2p delete <名称> --yes");
+    Ok(())
+}
+
+async fn cmd_delete(args: &[String]) -> Result<()> {
+    let flags = Flags::parse(args)?;
+    let (mut config, path) = load_config(&flags)?;
+    let worker = worker_of(&config, &flags)?;
+
+    let name = flags
+        .positional
+        .first()
+        .cloned()
+        .or_else(|| config.network.as_ref().map(|n| n.id.clone()))
+        .context("用法：qp2p delete <网络名> [--yes]")?;
+
+    if !flags.flag("yes") {
+        println!("将删除网络「{name}」：成员、事件、加入密钥一并清除，不可恢复。");
+        println!("确认无误后加 --yes 再执行一次：\n\n    qp2p delete {name} --yes\n");
+        return Ok(());
+    }
+
+    let admin = admin_of(&config, &flags)
+        .context("删除网络需要管理密钥（ADMIN_SECRET）：\n  qp2p init <地址> --admin <密钥>")?;
+    let client = SignalClient::admin(&worker)?;
+    let removed = client.delete_network(&admin, &name).await?;
+
+    println!("✓ 已删除网络 {name}，清理 {removed} 个节点");
+    if config.network.as_ref().map(|n| n.id.as_str()) == Some(name.as_str()) {
+        config.network = None;
+        save_config(&config, &path)?;
+        println!("本机配置里的网络已清除，可以 qp2p join 新令牌");
+    }
     Ok(())
 }
 
@@ -645,7 +981,8 @@ async fn cmd_up(args: &[String]) -> Result<()> {
              --dev <名字>      虚拟网卡名，默认 qp2p0\n  \
              --mtu <n>         虚拟网卡 MTU，默认 1400\n  \
              --route <网段>    额外让某个网段走隧道，可重复\n  \
-             --data-dir <dir>  身份目录，默认 ~/.qp2p\n"
+             --save            把这次给的 --name/--mtu/--dev/--route/--bind/--stun 存进配置\n  \
+             --data-dir <dir>  身份目录，默认 ~/.qp2p\n\n             没给的选项会沿用 qp2p config 里保存的值。\n"
         );
         return Ok(());
     }
@@ -661,11 +998,21 @@ async fn cmd_up(args: &[String]) -> Result<()> {
     } else {
         flags.many("stun")
     };
-    let mtu: u16 = flags
-        .get("mtu")
-        .unwrap_or("1400")
-        .parse()
-        .context("--mtu 不是数字")?;
+    // 取值顺序：命令行 > 配置文件 > 默认值。用户改过一次就该一直生效。
+    let mtu: u16 = match flags.get("mtu") {
+        Some(raw) => raw.parse().context("--mtu 不是数字")?,
+        None => config.mtu.unwrap_or(1400),
+    };
+    let dev = flags
+        .get("dev")
+        .map(str::to_string)
+        .or_else(|| config.dev.clone())
+        .unwrap_or_else(|| "qp2p0".to_string());
+    let routes = if flags.many("route").is_empty() {
+        config.routes.clone()
+    } else {
+        flags.many("route")
+    };
 
     println!("qp2p {} · 网络 {}", env!("CARGO_PKG_VERSION"), network.id);
     println!("信令 {worker}");
@@ -686,8 +1033,11 @@ async fn cmd_up(args: &[String]) -> Result<()> {
 
     let candidates = candidate_strings(&engine);
     let nat_type = nat_type(&engine);
+    // 配置里存的就是用户上次要求的地址（join --ip 或 config set ip），
+    // 每次都带上：服务端会校验并原样保留，用户改配置后也能立刻切过去。
+    let wanted_ip: Option<Ipv4Addr> = network.virtual_ip.as_deref().and_then(|s| s.parse().ok());
     let reply = match client
-        .register(&identity, &name, &tls_fp, &candidates, nat_type)
+        .register(&identity, &name, &tls_fp, &candidates, nat_type, wanted_ip)
         .await
     {
         Ok(reply) => reply,
@@ -739,18 +1089,32 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         }
     }
 
+    // 把这次命令行里的选择固化下来：下次直接 qp2p up 就带同样的参数
+    if flags.flag("save") {
+        config.node_name = name.clone();
+        config.mtu = Some(mtu);
+        config.dev = Some(dev.clone());
+        config.routes = routes.clone();
+        config.listen = bind.to_string();
+        if !stun.is_empty() {
+            config.stun = stun.clone();
+        }
+        save_config(&config, &config_path)?;
+        println!(
+            "已把这次的选择保存到 {}（下次 up 直接沿用）",
+            config_path.display()
+        );
+    }
+
     let net_cidr: Option<qp2p_core::route::Cidr> = reply.network.cidr.parse().ok();
 
     // 虚拟网卡：默认开；建不起来就降级成"只打洞"，不让整条命令失败
     let want_tun = !(flags.flag("punch-only") || flags.flag("no-tun"));
     let mut mesh: Option<Arc<MeshLinks>> = None;
     if want_tun {
-        match open_tun(&flags, &reply.network.cidr, virtual_ip, mtu) {
+        match open_tun(&dev, &routes, &reply.network.cidr, virtual_ip, mtu) {
             Ok(links) => {
-                println!(
-                    "虚拟网卡 {} 已就绪：可以 ping {virtual_ip} 之外的成员地址",
-                    flags.get("dev").unwrap_or("qp2p0")
-                );
+                println!("虚拟网卡 {dev} 已就绪：可以 ping 其它成员的虚拟地址");
                 mesh = Some(links);
             }
             Err(e) => {
@@ -777,6 +1141,7 @@ async fn cmd_up(args: &[String]) -> Result<()> {
                     node_id: node_id.clone(),
                     name,
                     net: net_cidr,
+                    wanted_ip,
                 },
                 engine,
                 peers,
@@ -809,7 +1174,8 @@ async fn cmd_up(args: &[String]) -> Result<()> {
 
 /// 建虚拟网卡并启动数据面，返回连接表。
 fn open_tun(
-    flags: &Flags,
+    dev: &str,
+    routes: &[String],
     network_cidr: &str,
     virtual_ip: Ipv4Addr,
     mtu: u16,
@@ -819,14 +1185,14 @@ fn open_tun(
         .with_context(|| format!("服务端给的网段不合法：{network_cidr}"))?;
 
     let config = qp2p_core::route::TunConfig {
-        name: flags.get("dev").unwrap_or("qp2p0").to_string(),
+        name: dev.to_string(),
         address: virtual_ip,
         prefix: cidr.prefix,
         mtu,
     };
     let device = qp2p_core::route::open(&config)?;
 
-    for raw in flags.many("route") {
+    for raw in routes {
         let extra: qp2p_core::route::Cidr = raw
             .parse()
             .with_context(|| format!("--route 不是合法网段：{raw}"))?;
@@ -855,6 +1221,8 @@ struct Session {
     node_id: NodeId,
     name: String,
     net: Option<qp2p_core::route::Cidr>,
+    /// 用户指定/上次分配的虚拟地址，重注册时继续沿用
+    wanted_ip: Option<Ipv4Addr>,
 }
 
 async fn signal_loop(
@@ -869,6 +1237,7 @@ async fn signal_loop(
         node_id,
         name,
         net,
+        wanted_ip,
     } = session;
     const POLL: Duration = Duration::from_secs(3);
     const REGISTER_EVERY: Duration = Duration::from_secs(60);
@@ -956,7 +1325,7 @@ async fn signal_loop(
                 )
             };
             match client
-                .register(&identity, &name, &fp, &candidates, nat)
+                .register(&identity, &name, &fp, &candidates, nat, wanted_ip)
                 .await
             {
                 Ok(reply) => {

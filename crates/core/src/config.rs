@@ -31,6 +31,8 @@ pub enum ConfigError {
     EmptyForwardTarget,
     #[error("worker 地址必须以 http:// 或 https:// 开头：{0}")]
     BadWorker(String),
+    #[error("routes 里的网段不合法（要写成 192.168.1.0/24）：{0}")]
+    BadRoute(String),
     #[error("读写配置失败 {path}：{source}")]
     Io {
         path: String,
@@ -57,6 +59,15 @@ pub struct Config {
     pub stun: Vec<String>,
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// 虚拟网卡 MTU。命令行没给时用这里的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// 虚拟网卡名。Windows 上就是适配器名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<String>,
+    /// 额外走隧道的网段，等价于命令行重复写 `--route`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
     #[serde(default = "default_true")]
     pub upnp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +123,9 @@ impl std::fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("stun", &self.stun)
             .field("listen", &self.listen)
+            .field("mtu", &self.mtu)
+            .field("dev", &self.dev)
+            .field("routes", &self.routes)
             .field("upnp", &self.upnp)
             .field("network", &self.network)
             .finish()
@@ -169,6 +183,9 @@ impl Default for Config {
             data_dir: default_data_dir(),
             stun: default_stun(),
             listen: default_listen(),
+            mtu: None,
+            dev: None,
+            routes: Vec::new(),
             upnp: true,
             network: None,
             forwards: Vec::new(),
@@ -235,6 +252,12 @@ impl Config {
             if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
                 return Err(ConfigError::BadWorker(worker.clone()));
             }
+        }
+
+        for route in &self.routes {
+            route
+                .parse::<crate::route::Cidr>()
+                .map_err(|_| ConfigError::BadRoute(route.clone()))?;
         }
 
         if let Some(network) = &self.network {

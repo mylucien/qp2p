@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -113,9 +113,12 @@ async function route(request, url, env, ctx) {
 
   if (path === "/") return landing();
   if (path === "/v1/health") return health(request, env);
+  if (path === "/v1/admin/networks" && method === "GET") return listNetworks(request, env);
   if (path === "/v1/admin/networks" && method === "POST") return createNetwork(request, env);
   const rotate = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/rotate$/.exec(path);
   if (rotate && method === "POST") return rotateJoinKey(request, env, rotate[1]);
+  const remove = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})$/.exec(path);
+  if (remove && method === "DELETE") return deleteNetwork(request, env, remove[1]);
 
   const isRead = method === "GET";
   if (path === "/v1/join" && method === "POST") return joinOrRegister(request, env, url, false);
@@ -283,6 +286,97 @@ async function rotateJoinKey(request, env, networkId) {
   });
 }
 
+/** 列出所有网络（管理面）：用于管理员决定要不要删、要不要换密钥。 */
+async function listNetworks(request, env) {
+  const admin = checkAdmin(request, env);
+  if (admin) return admin;
+
+  const networks = await allNetworks(env);
+  const counts = await nodeCounts(env);
+  return json({
+    ok: true,
+    networks: networks.map((n) => ({
+      id: n.network_id,
+      name: n.name,
+      cidr: n.cidr,
+      created_at: n.created_at,
+      nodes: counts[n.network_id] ?? 0,
+      has_join_key: Boolean(n.join_hash),
+    })),
+  });
+}
+
+/**
+ * 删除网络。
+ *
+ * 必须带 `confirm` 且与网络 id 完全一致：这是不可撤销操作，
+ * 加一道"你得说出名字"的门槛，避免脚本里一个手滑把整个网络清掉。
+ */
+async function deleteNetwork(request, env, networkId) {
+  const admin = checkAdmin(request, env);
+  if (admin) return admin;
+
+  const body = (await readJson(request)) ?? {};
+  if (String(body.confirm ?? "") !== networkId) {
+    return err(
+      400,
+      "confirm_required",
+      `删除网络不可撤销。请在请求体里带 {"confirm": "${networkId}"} 确认`,
+    );
+  }
+
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  const removed = await purgeNetwork(env, networkId);
+  console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
+
+  return json({ ok: true, network: { id: networkId, name: net.name }, removed_nodes: removed });
+}
+
+async function allNetworks(env) {
+  if ((await ready(env)) === "memory") return [...memory.networks.values()];
+  const { results } = await env.DB.prepare("SELECT * FROM networks").all();
+  return results ?? [];
+}
+
+async function nodeCounts(env) {
+  if ((await ready(env)) === "memory") {
+    const out = {};
+    for (const node of memory.nodes.values()) {
+      out[node.network_id] = (out[node.network_id] ?? 0) + 1;
+    }
+    return out;
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT network_id, COUNT(*) AS n FROM nodes GROUP BY network_id",
+  ).all();
+  const out = {};
+  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  return out;
+}
+
+/** 删掉一个网络及其节点、事件、nonce，返回清理掉的节点数。 */
+async function purgeNetwork(env, networkId) {
+  if ((await ready(env)) === "memory") {
+    const before = [...memory.nodes.values()].filter((n) => n.network_id === networkId).length;
+    for (const [k, node] of [...memory.nodes.entries()]) {
+      if (node.network_id === networkId) memory.nodes.delete(k);
+    }
+    memory.events = memory.events.filter((e) => e.network_id !== networkId);
+    memory.networks.delete(networkId);
+    return before;
+  }
+
+  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes WHERE network_id = ?")
+    .bind(networkId)
+    .first();
+  await env.DB.prepare("DELETE FROM nodes WHERE network_id = ?").bind(networkId).run();
+  await env.DB.prepare("DELETE FROM events WHERE network_id = ?").bind(networkId).run();
+  await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
+  return Number(count?.n ?? 0);
+}
+
 function checkAdmin(request, env) {
   if (!env.ADMIN_SECRET) {
     return err(
@@ -393,7 +487,18 @@ async function joinOrRegister(request, env, url, needCandidates) {
   }
 
   const others = await listNodes(env, network.network_id);
-  const virtualIp = existing?.virtual_ip || (await assignIp(network, nodeId, others));
+
+  // 用户可以在加入时自己指定虚拟地址（家庭里想固定 IP 的典型需求）。
+  // 只校验、不自动改：撞车就报错，别让人以为生效了其实是别的地址。
+  const requested = body.virtual_ip === undefined || body.virtual_ip === null
+    ? null
+    : String(body.virtual_ip).trim();
+  if (requested !== null) {
+    const bad = validateVirtualIp(network, requested, nodeId, others);
+    if (bad) return bad;
+  }
+
+  const virtualIp = requested ?? existing?.virtual_ip ?? (await assignIp(network, nodeId, others));
 
   const record = {
     network_id: network.network_id,
@@ -815,6 +920,42 @@ function key(networkId, nodeId) {
 // ---------------------------------------------------------------------------
 // 地址分配：与客户端 derive_virtual_ip 完全一致
 // ---------------------------------------------------------------------------
+
+/**
+ * 校验用户指定的虚拟地址。
+ *
+ * 服务端是唯一权威：客户端算出来的地址可能有冲突，这里必须拒绝而不是"帮它改"。
+ * 返回错误响应，或 null 表示可用。
+ */
+function validateVirtualIp(network, text, nodeId, others) {
+  if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(text)) {
+    return err(400, "invalid_virtual_ip", `虚拟地址必须是 a.b.c.d 形式：${text}`);
+  }
+  if (text.split(".").some((part) => Number(part) > 255)) {
+    return err(400, "invalid_virtual_ip", `虚拟地址每段必须在 0~255：${text}`);
+  }
+
+  const [base, prefixRaw] = String(network.cidr).split("/");
+  const prefix = Math.min(30, Math.max(8, Number(prefixRaw) || 16));
+  const hostBits = 32 - prefix;
+  const mask = (0xffffffff << hostBits) >>> 0;
+  const value = ipv4ToInt(text);
+
+  if ((value & mask) >>> 0 !== (ipv4ToInt(base) & mask) >>> 0) {
+    return err(400, "virtual_ip_not_in_network", `${text} 不在网段 ${network.cidr} 里`);
+  }
+
+  const hostMask = (~mask) >>> 0;
+  const host = (value & hostMask) >>> 0;
+  if (host === 0) return err(400, "invalid_virtual_ip", `${text} 是网段地址，不能给节点用`);
+  if (host === hostMask) return err(400, "invalid_virtual_ip", `${text} 是广播地址，不能给节点用`);
+
+  const taken = others.find((n) => n.node_id !== nodeId && n.virtual_ip === text);
+  if (taken) {
+    return err(409, "virtual_ip_taken", `${text} 已经被节点「${taken.name}」占用，换一个`);
+  }
+  return null;
+}
 
 async function assignIp(network, nodeId, others) {
   const used = new Set(others.map((n) => n.virtual_ip).filter(Boolean));

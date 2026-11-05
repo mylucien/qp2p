@@ -282,6 +282,80 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   check("拿到虚拟地址", /^10\.\d+\.\d+\.\d+$/.test(aliceIp ?? ""), aliceIp);
   check("虚拟地址落在网段内", aliceIp?.startsWith(`${prefix}.`), { aliceIp, cidr: created.body.network.cidr });
 
+  // 用户自定义虚拟地址：加入时自带一个，服务端校验后原样保留
+  const customIp = `${prefix}.1.240`;
+  const carol = await identity();
+  const withCustom = await call("POST", "/v1/join", {
+    token,
+    body: await signed(carol, "join", net, {
+      node_id: carol.nodeId,
+      pubkey: carol.pubkey,
+      name: "carol",
+      virtual_ip: customIp,
+    }),
+  });
+  check(
+    "可以指定自己的虚拟地址",
+    withCustom.status === 200 && withCustom.body.node?.virtual_ip === customIp,
+    withCustom.body,
+  );
+
+  const carolAgain = await call("POST", "/v1/join", {
+    token,
+    body: await signed(carol, "join", net, { node_id: carol.nodeId, pubkey: carol.pubkey }),
+  });
+  check(
+    "不指定时沿用上次的地址",
+    carolAgain.body.node?.virtual_ip === customIp,
+    carolAgain.body.node,
+  );
+
+  const dave = await identity();
+  const takenIp = await call("POST", "/v1/join", {
+    token,
+    body: await signed(dave, "join", net, {
+      node_id: dave.nodeId,
+      pubkey: dave.pubkey,
+      virtual_ip: customIp,
+    }),
+  });
+  check(
+    "地址被占用时拒绝",
+    takenIp.status === 409 && takenIp.body.error === "virtual_ip_taken",
+    takenIp.body,
+  );
+
+  const outside = await call("POST", "/v1/join", {
+    token,
+    body: await signed(dave, "join", net, {
+      node_id: dave.nodeId,
+      pubkey: dave.pubkey,
+      virtual_ip: "10.250.0.5",
+    }),
+  });
+  check("网段外的地址被拒", outside.status === 400, outside.body);
+
+  const netBase = created.body.network.cidr.split("/")[0];
+  const netAddr = await call("POST", "/v1/join", {
+    token,
+    body: await signed(dave, "join", net, {
+      node_id: dave.nodeId,
+      pubkey: dave.pubkey,
+      virtual_ip: netBase,
+    }),
+  });
+  check("网段地址不能给节点", netAddr.status === 400, netAddr.body);
+
+  const broadcast = await call("POST", "/v1/join", {
+    token,
+    body: await signed(dave, "join", net, {
+      node_id: dave.nodeId,
+      pubkey: dave.pubkey,
+      virtual_ip: `${prefix}.255.255`,
+    }),
+  });
+  check("广播地址不能给节点", broadcast.status === 400, broadcast.body);
+
   const badId = await call("POST", "/v1/join", {
     token,
     body: await signed(alice, "join", net, { node_id: "0".repeat(32), pubkey: alice.pubkey }),
@@ -556,6 +630,59 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       res,
     );
   }
+
+  console.log("\nN. 管理面：列网络与删网络");
+  const listed = await call("GET", "/v1/admin/networks", { admin: secret });
+  check(
+    "列出网络",
+    listed.status === 200 && (listed.body.networks ?? []).some((n) => n.id === net),
+    listed.status,
+  );
+  check(
+    "列表带成员数",
+    typeof (listed.body.networks ?? []).find((n) => n.id === net)?.nodes === "number",
+    listed.body.networks,
+  );
+  const noAuth = await call("GET", "/v1/admin/networks");
+  check("列网络需要管理密钥", noAuth.status === 401, noAuth.body);
+
+  const delNoConfirm = await call("DELETE", `/v1/admin/networks/${net}`, {
+    admin: secret,
+    body: {},
+  });
+  check(
+    "删除必须带 confirm",
+    delNoConfirm.status === 400 && delNoConfirm.body.error === "confirm_required",
+    delNoConfirm.body,
+  );
+
+  // 用一次性网络验证删除，别把 net 删掉影响别的用例
+  const tmp = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "delete-me" },
+  });
+  const tmpId = tmp.body.network.id;
+  const del = await call("DELETE", `/v1/admin/networks/${tmpId}`, {
+    admin: secret,
+    body: { confirm: tmpId },
+  });
+  check("删除网络成功", del.status === 200 && del.body.ok === true, del.body);
+
+  const afterDel = await call("GET", "/v1/admin/networks", { admin: secret });
+  check(
+    "删除后列表里不再出现",
+    !(afterDel.body.networks ?? []).some((n) => n.id === tmpId),
+    afterDel.body.networks,
+  );
+
+  const goneToken = await call("POST", "/v1/join", {
+    token: tmp.body.token,
+    body: await signed(alice, "join", tmpId, {
+      node_id: alice.nodeId,
+      pubkey: alice.pubkey,
+    }),
+  });
+  check("已删网络的令牌立即失效", [401, 403].includes(goneToken.status), goneToken.body);
 
   console.log(`  ${label}：${passed} 通过，${failed} 失败`);
   totals.passed += passed;
