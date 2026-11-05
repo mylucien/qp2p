@@ -135,7 +135,7 @@ async function route(request, url, env, ctx) {
   if (path === "/admin") return adminPage();
   if (path === "/v1/health") return health(request, env);
   if (path === "/v1/admin/login" && method === "POST") return adminLogin(request, env);
-  if (path === "/v1/admin/logout" && method === "POST") return adminLogout();
+  if (path === "/v1/admin/logout" && method === "POST") return adminLogout(request);
   if (path === "/v1/admin/audit" && method === "GET") return auditLog(request, env, url);
   if (path === "/v1/admin/networks" && method === "GET") return listNetworks(request, env);
   if (path === "/v1/admin/networks" && method === "POST") return createNetwork(request, env);
@@ -702,21 +702,24 @@ async function adminLogin(request, env) {
   const expiresAt = Date.now() + ADMIN_SESSION_MS;
   const value = await adminCookieFor(env, expiresAt);
   await audit(env, "login.ok", "admin", "");
+  // 线上是 https 才加 Secure；本地 dev-server 跑 http，加了会导致 cookie 存不下来
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
   return new Response(JSON.stringify({ ok: true, expires_at: expiresAt }), {
     status: 200,
     headers: {
       ...JSON_HEADERS,
-      "set-cookie": `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ADMIN_SESSION_MS / 1000}`,
+      "set-cookie": `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ADMIN_SESSION_MS / 1000}${secure}`,
     },
   });
 }
 
-async function adminLogout() {
+async function adminLogout(request) {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: {
       ...JSON_HEADERS,
-      "set-cookie": `${ADMIN_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+      "set-cookie": `${ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`,
     },
   });
 }

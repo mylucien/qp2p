@@ -826,6 +826,30 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const goodLogin = await call("POST", "/v1/admin/login", { body: { secret } });
   check("正确密钥登录成功", goodLogin.status === 200 && goodLogin.body.ok === true, goodLogin.body);
 
+  const rawLogin = new Request(`${base}/v1/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ secret }),
+  });
+  const loginRes = remote ? await fetch(rawLogin) : await worker.fetch(rawLogin, env, ctx);
+  const setCookie = loginRes.headers.get("set-cookie") ?? "";
+  check(
+    "登录下发 HttpOnly cookie",
+    /qp2p_admin=/.test(setCookie) && /HttpOnly/.test(setCookie),
+    setCookie,
+  );
+
+  const cookieHeader = setCookie.split(";")[0];
+  const cookieReq = new Request(`${base}/v1/admin/networks`, { headers: { cookie: cookieHeader } });
+  const cookieRes = remote ? await fetch(cookieReq) : await worker.fetch(cookieReq, env, ctx);
+  check("cookie 可以访问管理接口", cookieRes.status === 200, cookieRes.status);
+
+  const forgedReq = new Request(`${base}/v1/admin/networks`, {
+    headers: { cookie: "qp2p_admin=9999999999999.deadbeef" },
+  });
+  const forgedRes = remote ? await fetch(forgedReq) : await worker.fetch(forgedReq, env, ctx);
+  check("伪造 cookie 被拒", forgedRes.status === 401, forgedRes.status);
+
   const page = remote
     ? await fetch(`${base}/admin`)
     : await worker.fetch(new Request(`${base}/admin`), env, ctx);
