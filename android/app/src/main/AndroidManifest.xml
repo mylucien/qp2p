@@ -25,10 +25,15 @@
         <service
             android:name=".Qp2pVpnService"
             android:exported="false"
+            android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <!-- Android 14 起前台服务必须声明类型，VPN 归到 specialUse 并说明用途 -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="p2p vpn tunnel: keep the virtual interface and peer connections alive" />
         </service>
     </application>
 </manifest>

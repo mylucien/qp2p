@@ -178,7 +178,14 @@ jobs:
 
       - name: 打 APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        env:
+          # AGP 默认往 ~/.config/.android 写 debug keystore，runner 上不可写，
+          # 指到临时目录省得跟权限较劲
+          ANDROID_USER_HOME: ${{ runner.temp }}/android-user-home
+          ANDROID_SDK_HOME: ${{ runner.temp }}
+        run: |
+          mkdir -p "$ANDROID_USER_HOME"
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
