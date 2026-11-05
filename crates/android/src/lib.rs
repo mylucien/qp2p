@@ -90,6 +90,22 @@ fn stop_flag() -> Arc<AtomicBool> {
         .clone()
 }
 
+/// 第一次进 JNI 时装一个 panic 钩子（只在 Android 侧用得上）。
+#[cfg(target_os = "android")]
+///
+/// Rust 的 panic 跨过 FFI 边界会直接 abort 进程——在 Android 上就是闪退，
+/// 而且 Kotlin 接不住。这里先把消息写进 logcat，再由 catch_unwind 兜住。
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            log(&format!("内核 panic: {info}"));
+            default(info);
+        }));
+    });
+}
+
 /// 写 Android 日志（logcat 标签 `qp2p`）。桌面编译时退化成 stderr。
 fn log(message: &str) {
     #[cfg(target_os = "android")]
@@ -345,13 +361,19 @@ mod jni_bridge {
             Ok(v) => v,
             Err(e) => return reply(&mut env, &err_json(&format!("配置格式不对：{e}"))),
         };
-        match prepare(parsed) {
-            Ok(info) => {
+        install_panic_hook();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(parsed)));
+        match outcome {
+            Err(_) => reply(
+                &mut env,
+                &err_json("内核崩溃（panic），详情见 logcat 里 qp2p 标记的日志"),
+            ),
+            Ok(Ok(info)) => {
                 let json = serde_json::to_string(&info)
                     .unwrap_or_else(|e| err_json(&format!("序列化失败：{e}")));
                 reply(&mut env, &json)
             }
-            Err(e) => reply(&mut env, &err_json(&format!("{e:#}"))),
+            Ok(Err(e)) => reply(&mut env, &err_json(&format!("{e:#}"))),
         }
     }
 
@@ -362,9 +384,15 @@ mod jni_bridge {
         _class: JClass<'local>,
         fd: jint,
     ) -> jstring {
-        match start(fd) {
-            Ok(()) => std::ptr::null_mut(),
-            Err(e) => reply(&mut env, &format!("{e:#}")),
+        install_panic_hook();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(fd)));
+        match outcome {
+            Ok(Ok(())) => std::ptr::null_mut(),
+            Ok(Err(e)) => reply(&mut env, &format!("{e:#}")),
+            Err(_) => reply(
+                &mut env,
+                "内核崩溃（panic），详情见 logcat 里 qp2p 标记的日志",
+            ),
         }
     }
 

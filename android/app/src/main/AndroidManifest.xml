@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- VpnService 需要前台服务权限，否则 Android 8+ 会把服务掐掉 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 起，声明了 foregroundServiceType 就必须有对应的权限，
+         少了它 startForeground 会抛 SecurityException，表现为点了连接就闪退 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application

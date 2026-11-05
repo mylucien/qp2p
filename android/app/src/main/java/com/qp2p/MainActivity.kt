@@ -38,6 +38,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(buildLayout())
         loadSettings()
+        checkNative()
 
         connectButton.setOnClickListener {
             if (Qp2pVpnService.connected) {
@@ -111,6 +112,15 @@ class MainActivity : Activity() {
         setSingleLine()
     }
 
+    /** 本地库加载不了的话，后面点什么都没用，先把原因摆出来 */
+    private fun checkNative() {
+        try {
+            Native.isPrepared()
+        } catch (t: Throwable) {
+            Qp2pVpnService.status = "本地库加载失败：${t.javaClass.simpleName} ${t.message ?: ""}"
+        }
+    }
+
     private fun loadSettings() {
         workerInput.setText(prefs.getString("worker", ""))
         tokenInput.setText(prefs.getString("token", ""))
@@ -160,16 +170,24 @@ class MainActivity : Activity() {
             action = Qp2pVpnService.ACTION_CONNECT
             putExtra(Qp2pVpnService.EXTRA_CONFIG, config)
         }
-        startService(intent)
+        try {
+            startService(intent)
+        } catch (t: Throwable) {
+            Qp2pVpnService.status = "启动服务失败：${t.javaClass.simpleName} ${t.message ?: ""}"
+        }
     }
 
     private fun disconnect() {
-        Native.stop()
-        startService(
-            Intent(this, Qp2pVpnService::class.java).apply {
-                action = Qp2pVpnService.ACTION_DISCONNECT
-            }
-        )
+        try {
+            Native.stop()
+            startService(
+                Intent(this, Qp2pVpnService::class.java).apply {
+                    action = Qp2pVpnService.ACTION_DISCONNECT
+                }
+            )
+        } catch (t: Throwable) {
+            Qp2pVpnService.status = "断开失败：${t.message}"
+        }
         Qp2pVpnService.status = "正在断开…"
     }
 

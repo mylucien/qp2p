@@ -37,6 +37,18 @@ class Qp2pVpnService : VpnService() {
     private var worker: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 任何异常都要变成界面上的文字，不能让进程崩掉——
+        // 崩一次用户就再也不敢点了，而且拿不到原因
+        return try {
+            handleStart(intent)
+        } catch (t: Throwable) {
+            status = "启动失败：${t.javaClass.simpleName}: ${t.message}"
+            stopSelf()
+            START_NOT_STICKY
+        }
+    }
+
+    private fun handleStart(intent: Intent?): Int {
         when (intent?.action) {
             ACTION_DISCONNECT -> {
                 Native.stop()
@@ -51,11 +63,21 @@ class Qp2pVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
-        ensureChannel()
-        startForeground(NOTIFICATION_ID, notification("正在连接…"))
+        // 前台服务只是"别被系统杀掉"的作用，起不来也不该影响隧道本身
+        try {
+            ensureChannel()
+            startForeground(NOTIFICATION_ID, notification("正在连接…"))
+        } catch (t: Throwable) {
+            status = "前台服务没起来（不影响连接）：${t.javaClass.simpleName}"
+            logLine("startForeground 失败: ${t.message}")
+        }
 
         worker = Thread({ runTunnel(config) }, "qp2p-vpn").also { it.start() }
         return START_STICKY
+    }
+
+    private fun logLine(message: String) {
+        android.util.Log.w("qp2p", message)
     }
 
     private fun runTunnel(config: String) {
@@ -162,7 +184,11 @@ class Qp2pVpnService : VpnService() {
     }
 
     private fun updateNotification(text: String) {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        manager.notify(NOTIFICATION_ID, notification(text))
+        try {
+            val manager = getSystemService(NotificationManager::class.java) ?: return
+            manager.notify(NOTIFICATION_ID, notification(text))
+        } catch (t: Throwable) {
+            logLine("更新通知失败: ${t.message}")
+        }
     }
 }
