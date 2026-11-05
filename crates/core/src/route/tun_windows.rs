@@ -86,10 +86,11 @@ impl WintunApi {
 
 /// 按名字取导出函数；缺失时给出「版本太老」的提示而不是裸的GetProcAddress 错误。
 ///
-/// 顺带 `copied()` 把 `&T` 变 `T`：函数指针都是 Copy，字段直接存值。
+/// `lib.get` 返回 `Symbol<T>`（Deref 到 T），函数指针都是 Copy，
+/// `map(|s| *s)` 取值后字段直接存值，dll 生命周期由 self._lib 兜住。
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
     unsafe { lib.get(name) }
-        .copied()
+        .map(|s| *s)
         .with_context(|| {
             format!(
                 "wintun.dll 里没有 {}。多半是版本太老（wintun 0.10 的导出名带 X 后缀），请换 wintun.net 的 0.14+ amd64 版",
