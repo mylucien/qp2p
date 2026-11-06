@@ -1935,7 +1935,8 @@ h1{font-size:16px;margin:0;font-weight:600}
 main{max-width:1080px;margin:0 auto;padding:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
 label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+select{width:auto;min-width:180px}
 button{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.danger{color:var(--danger);border-color:var(--danger)}
@@ -1977,7 +1978,13 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;
     </section>
 
     <section class="card hide" id="nodesCard">
-      <h2 style="margin:0 0 10px;font-size:15px">节点 <span class="muted" id="nodesFor"></span></h2>
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <h2 style="margin:0;font-size:15px">成员 <span class="muted" id="nodesFor"></span></h2>
+        <div class="row">
+          <select id="netPick" title="选择要查看的网络"></select>
+          <button id="refreshNodes" class="sm">刷新</button>
+        </div>
+      </div>
       <table><thead><tr><th>状态</th><th>名称</th><th>虚拟 IP</th><th>NAT</th><th>最后心跳</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table>
       <h2 style="margin:18px 0 10px;font-size:15px">IP 预留</h2>
       <table><thead><tr><th>IP</th><th>节点</th><th>类型</th><th>备注</th><th>操作</th></tr></thead><tbody id="resv"></tbody></table>
@@ -1997,6 +2004,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;
 </main>
 <script>
 var current = null;
+var nets = [];
 function $(id){return document.getElementById(id)}
 function api(path, method, body){
   var opt = {method: method||'GET', credentials:'same-origin', headers:{}};
@@ -2019,9 +2027,26 @@ function showLogin(){ $('dash').classList.add('hide'); $('login').classList.remo
 function load(){
   api('/v1/admin/networks').then(function(j){ renderNets(j.networks) }).catch(function(e){ if(/401/.test(e.message)) showLogin(); });
   api('/v1/admin/audit?limit=50').then(function(j){ renderAudit(j.actions) }).catch(function(){});
-  if (current) loadNodes(current);
 }
 function renderNets(list){
+  nets = list || [];
+  var pick = $('netPick');
+  var keep = current || (pick.value || null);
+  pick.innerHTML='';
+  nets.forEach(function(n){
+    var opt=document.createElement('option');
+    opt.value=n.id; opt.textContent=n.name+' · '+n.cidr+'（在线 '+n.online+'/'+n.nodes+'）';
+    pick.appendChild(opt);
+  });
+  if (keep && nets.some(function(n){return n.id===keep;})) {
+    pick.value = keep;
+  } else if (nets.length) {
+    pick.value = nets[0].id;
+    current = nets[0].id;
+  }
+  // 有网络就自动展开选中的那个，省一次点击
+  if (current) loadNodes(current);
+
   var t = $('nets'); t.innerHTML='';
   if (!list.length) t.innerHTML = '<tr><td colspan="6" class="muted">还没有网络，先新建一个</td></tr>';
   list.forEach(function(n){
@@ -2029,7 +2054,7 @@ function renderNets(list){
     tr.innerHTML = '<td><b>'+esc(n.name)+'</b><div class="muted" style="font-size:12px">'+esc(n.id)+'</div></td>'+
       '<td>'+esc(n.cidr)+'</td><td>'+n.nodes+'</td><td>'+n.online+'</td><td>'+n.reservations+'</td>';
     var td=document.createElement('td'); td.className='row';
-    td.appendChild(btn('节点','sm',function(){ current=n.id; loadNodes(n.id); }));
+    td.appendChild(btn('查看','sm',function(){ current=n.id; $('netPick').value=n.id; loadNodes(n.id); }));
     td.appendChild(btn('改网段','sm',function(){
       var v=prompt('新网段（10.x.0.0/16）。落在网段外的节点会被重新分配地址', n.cidr);
       if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(function(){ load(); }).catch(function(e){alert(e.message)});
@@ -2051,11 +2076,19 @@ function renderNets(list){
 }
 function btn(text, cls, fn){ var b=document.createElement('button'); b.textContent=text; b.className=cls; b.onclick=fn; return b; }
 function loadNodes(id){
-  $('nodesCard').classList.remove('hide'); $('nodesFor').textContent='· '+id;
+  current = id;
+  $('nodesCard').classList.remove('hide');
+  $('nodesFor').textContent='· '+id;
   api('/v1/admin/networks/'+id+'/nodes').then(function(j){
+    var online = j.nodes.filter(function(n){return n.online}).length;
+    $('nodesFor').textContent='· '+j.network.name+' '+j.network.cidr+
+      '　在线 '+online+' / 共 '+j.nodes.length;
     var t=$('nodes'); t.innerHTML='';
     if(!j.nodes.length) t.innerHTML='<tr><td colspan="6" class="muted">还没有节点</td></tr>';
-    j.nodes.forEach(function(n){
+    j.nodes.slice().sort(function(a,b){
+      if (a.online !== b.online) return a.online ? -1 : 1;
+      return 0;
+    }).forEach(function(n){
       var tr=document.createElement('tr');
       tr.innerHTML='<td><span class="dot '+(n.online?'on':'off')+'"></span>'+(n.online?'在线':'离线')+'</td>'+
         '<td>'+esc(n.name)+(n.reserved?' <span class="muted" style="font-size:12px">已固定</span>':'')+'</td>'+
@@ -2100,6 +2133,8 @@ $('doLogin').onclick=function(){
   }).catch(function(e){ $('loginMsg').textContent='登录失败：'+e.message; });
 };
 $('secret').addEventListener('keydown',function(e){ if(e.key==='Enter') $('doLogin').click(); });
+$('netPick').onchange=function(){ if(this.value) loadNodes(this.value); };
+$('refreshNodes').onclick=function(){ if(current) loadNodes(current); };
 $('refresh').onclick=load;
 $('logout').onclick=function(){ api('/v1/admin/logout','POST',{}).then(showLogin).catch(showLogin); };
 $('createNet').onclick=function(){
