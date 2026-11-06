@@ -19,6 +19,9 @@ const VERSION = "2.4.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
+// 心跳超过这个时间就算"可能刚换网"：120 秒 > 两轮 60 秒轮询，
+// 正常节点不会到这个数，宁可让发起方等 10 秒重试，也别拿旧地址打 35 秒空炮
+const STALE_MS = 120_000;
 const HEARTBEAT_MS = 60_000; // last_seen 最快多久写一次（省 D1 写额度）
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_NODES = 256; // 每个网络的上限
@@ -934,6 +937,17 @@ async function connect(request, env, url) {
   if (!peer) return err(404, "target_not_found", "对端不在这个网络里");
   if (now - peer.last_seen > OFFLINE_MS) return err(410, "target_offline", "对端心跳已超时");
 
+  // 对端可能刚从 WiFi 切到 4G：它的新端口还没上报，拿旧地址打是白费
+  const targetAge = now - peer.last_seen;
+  const staleMs = Number(env.STALE_MS ?? STALE_MS);
+  if (targetAge > staleMs) {
+    return err(
+      409,
+      "target_stale",
+      `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
+    );
+  }
+
   const peerCandidates = JSON.parse(peer.candidates || "[]");
   if (peerCandidates.length === 0) {
     return err(409, "target_no_candidates", "对端还没有上报候选地址");
@@ -954,6 +968,7 @@ async function connect(request, env, url) {
   return json({
     ok: true,
     t,
+    target_last_seen: peer.last_seen,
     target_candidates: peerCandidates,
     target_virtual_ip: peer.virtual_ip,
     target_tls_fp: peer.tls_fp,

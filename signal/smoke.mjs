@@ -495,6 +495,27 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const connected = await call("POST", "/v1/connect", { token, body: connectBody });
   check("撮合成功", connected.status === 200 && connected.body.ok === true, connected.body);
   check(
+    "撮合返回对端心跳时间",
+    Number(connected.body.target_last_seen) > 0,
+    connected.body.target_last_seen,
+  );
+
+  if (!remote) {
+    // STALE_MS 可覆盖是为了这里能测：压到 1 毫秒，立刻判定"可能刚换网"
+    env.STALE_MS = 1;
+    const staleRes = await call("POST", "/v1/connect", {
+      token,
+      body: await signed(alice, "connect", net, { from: alice.nodeId, target: bob.nodeId }),
+    });
+    delete env.STALE_MS;
+    check(
+      "对端心跳过期时拒绝撮合",
+      staleRes.status === 409 && staleRes.body.error === "target_stale",
+      staleRes.body,
+    );
+  }
+
+  check(
     "拿到对端候选",
     JSON.stringify(connected.body.target_candidates) === JSON.stringify(candidates),
     connected.body.target_candidates,

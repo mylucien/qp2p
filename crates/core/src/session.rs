@@ -32,6 +32,9 @@ const POLL_COLD: Duration = Duration::from_secs(60);
 const REGISTER_EVERY: Duration = Duration::from_secs(300);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
+/// 两次"重绑端口 + 重探 STUN"之间的最小间隔。
+/// 对端不可达时不能每轮都重绑，否则端口一直在变，打洞永远开不了。
+const RENEW_MIN: Duration = Duration::from_secs(30);
 /// 数据面静默多久算「彻底空闲」。
 const IDLE_AFTER: Duration = Duration::from_secs(120);
 
@@ -193,6 +196,8 @@ impl Session {
         let mut forced: Option<Ipv4Addr> = None;
         // 空闲断链之后进入休眠：不主动拨号、也不高频轮询，等 TUN 里有包再来叫醒
         let mut sleeping = false;
+        // 上一轮是否有直连：用来识别"原本连着、现在全断了"（多半是换网）
+        let mut had_links = false;
 
         while !self.stop.load(Ordering::Relaxed) {
             // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request
@@ -289,8 +294,56 @@ impl Session {
                 .await;
             }
 
-            // 3) 定时重新注册：候选地址可能变了，顺便刷新成员列表
-            if last_register.elapsed() >= REGISTER_EVERY {
+            // 2.5) 换网检测：原本有直连、现在一条不剩，或连续 3 次打洞失败
+            //      → 立刻重绑端口 + 重探 STUN，紧接着用新候选注册。
+            //      这是"换网后最坏等 10 分钟"的解药：谁换了网，谁自己马上重报。
+            let (live, worst_streak) = {
+                let table = self.peers.lock().await;
+                (
+                    table.values().filter(|p| p.connected).count(),
+                    table.values().map(|p| p.attempts).max().unwrap_or(0),
+                )
+            };
+            // 空闲休眠造成的断开是有意的，不能当成换网去重绑端口
+            let all_lost = !sleeping && had_links && live == 0;
+            had_links = live > 0 && !sleeping;
+            let mut force_register = all_lost || (!sleeping && worst_streak >= 3);
+            let switch_detected = force_register;
+            if force_register {
+                // 先清退避：不清的话每轮都会判定"连续失败"，把注册打成连发
+                for state in self.peers.lock().await.values_mut() {
+                    state.attempts = 0;
+                }
+                // 刚重绑过就别再动端口，否则映射一直在变，谁也打不进来
+                if last_renew.elapsed() < RENEW_MIN {
+                    force_register = false;
+                }
+            }
+            if force_register || (last_renew.elapsed() >= RENEW_EVERY && live == 0) {
+                last_renew = Instant::now();
+                let renewed = {
+                    let mut guard = self.engine.write().await;
+                    guard.renew().await
+                };
+                match renewed {
+                    Ok(()) => {
+                        tracing::info!("[session] 端点已刷新（换网或长时间不通）");
+                        if switch_detected {
+                            self.notify
+                                .say("· 网络可能变了：已重新探测公网地址，正在重报");
+                        }
+                        // 换了端口就必须立刻上报，否则对端还拿着旧地址打空炮
+                        force_register = true;
+                    }
+                    Err(e) => {
+                        tracing::debug!("[session] 端点刷新失败: {e:#}");
+                        force_register = false;
+                    }
+                }
+            }
+
+            // 3) 重新注册：定时刷新，或刚换过端口要马上让对端知道
+            if force_register || last_register.elapsed() >= REGISTER_EVERY {
                 last_register = Instant::now();
                 let (candidates, fp, nat) = {
                     let engine = self.engine.read().await;
@@ -321,25 +374,6 @@ impl Session {
                         }
                     }
                     Err(e) => tracing::debug!("[session] 刷新注册失败: {e:#}"),
-                }
-            }
-
-            // 4) 一个都连不上很久了：刷新端点重新做 STUN（有直连时绝不能动）
-            if last_renew.elapsed() >= RENEW_EVERY {
-                let alive = match &self.mesh {
-                    Some(mesh) => mesh.peer_count().await > 0,
-                    None => self.peers.lock().await.values().any(|p| p.connected),
-                };
-                if !alive {
-                    last_renew = Instant::now();
-                    let renewed = {
-                        let mut guard = self.engine.write().await;
-                        guard.renew().await
-                    };
-                    match renewed {
-                        Ok(()) => tracing::info!("[session] 端点已刷新（重新探测 NAT 映射）"),
-                        Err(e) => tracing::debug!("[session] 端点刷新失败: {e:#}"),
-                    }
                 }
             }
 
