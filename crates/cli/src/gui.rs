@@ -81,7 +81,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 std::thread::sleep(Duration::from_secs(3600));
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -93,6 +93,7 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 /// 托盘悬停提示：状态 + 直连条数。
+#[cfg(windows)]
 pub(crate) fn status_text(state: &State) -> String {
     let guard = state.lock().expect("state 锁中毒");
     let links = guard.links.len();

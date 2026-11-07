@@ -111,7 +111,7 @@ thread_local! {
 fn write_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
     let units: Vec<u16> = text.encode_utf16().take(127).collect();
     let len = units.len();
-    for (slot, unit) in nid.szTip.iter_mut().zip(units.into_iter()) {
+    for (slot, unit) in nid.szTip.iter_mut().zip(units) {
         *slot = unit;
     }
     if let Some(last) = nid.szTip.get_mut(len) {
@@ -125,7 +125,7 @@ fn refresh_tip(_hwnd: HWND) {
     };
     let text = gui::status_text(state);
     TRAY.with(|t| {
-        if let Some(mut nid) = t.borrow_mut().clone() {
+        if let Some(mut nid) = *t.borrow_mut() {
             write_tip(&mut nid, &text);
             nid.uFlags = NIF_TIP;
             unsafe {
