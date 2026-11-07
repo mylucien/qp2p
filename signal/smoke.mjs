@@ -400,10 +400,13 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
 
   const firstUse = await call("POST", "/v1/join", { token, body: tamperBase });
   check("首次提交合法", firstUse.status === 200, firstUse.body);
+  // join / register 是幂等的，不再占 nonce（省两行写入）：重放同一报文只会写入同样的内容。
+  // 破坏性的 leave 和有副作用的 connect 仍然防重放，见下面对应的测试。
   const replayJoin = await call("POST", "/v1/join", { token, body: tamperBase });
   check(
-    "同报文重放被拒",
-    replayJoin.status === 403 && String(replayJoin.body.detail).includes("重放"),
+    "join 同报文重放是幂等的（结果与首次一致）",
+    replayJoin.status === 200 &&
+      replayJoin.body.node?.virtual_ip === firstUse.body.node?.virtual_ip,
     replayJoin.body,
   );
 
@@ -533,9 +536,16 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const evBody = await signed(bob, "events", net, { node_id: bob.nodeId, since: 0 });
   const { sig: evSig, ...evQuery } = evBody;
   const firstPull = await call("GET", "/v1/events", { token, query: { ...evQuery, sig: evSig } });
-  check("bob 收到一条事件", firstPull.body.events?.length === 1, firstPull.body);
-  check("事件类型是 punch_request", firstPull.body.events?.[0]?.type === "punch_request", firstPull.body.events?.[0]);
-  check("事件里带发起方的候选", Array.isArray(firstPull.body.events?.[0]?.candidates), firstPull.body.events?.[0]);
+  // 事件流里除了发给 bob 的 punch_request，还有全网广播的 peer_online：按类型分开断言
+  const punches = (firstPull.body.events ?? []).filter((e) => e.type === "punch_request");
+  const presence = (firstPull.body.events ?? []).filter((e) => e.type === "peer_online");
+  check("bob 收到一条 punch_request", punches.length === 1, firstPull.body);
+  check("事件里带发起方的候选", Array.isArray(punches[0]?.candidates), punches[0]);
+  check(
+    "bob 能读到自己注册时的上线广播",
+    presence.some((e) => e.node_id === bob.nodeId && e.candidates?.length > 0),
+    presence,
+  );
   check("返回游标", typeof firstPull.body.cursor === "number" && firstPull.body.cursor > 0, firstPull.body.cursor);
 
   const pull2 = await signed(bob, "events", net, { node_id: bob.nodeId, since: firstPull.body.cursor });
@@ -555,7 +565,13 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const aliceEv = await signed(alice, "events", net, { node_id: alice.nodeId, since: 0 });
   const { sig: aSig, ...aQuery } = aliceEv;
   const alicePull = await call("GET", "/v1/events", { token, query: { ...aQuery, sig: aSig } });
-  check("alice 没有收到事件", alicePull.body.events?.length === 0, alicePull.body);
+  const alicePunches = (alicePull.body.events ?? []).filter((e) => e.type === "punch_request");
+  check("alice 没有收到撮合请求", alicePunches.length === 0, alicePull.body);
+  check(
+    "alice 通过广播得知 bob 上线",
+    (alicePull.body.events ?? []).some((e) => e.type === "peer_online" && e.node_id === bob.nodeId),
+    alicePull.body,
+  );
 
   console.log("\n6. 离线");
   const wrongLeave = await call("POST", "/v1/leave", {
@@ -572,11 +588,15 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     check("远端清理 alice", dropAlice.status === 200, dropAlice.body);
   }
 
-  const left = await call("POST", "/v1/leave", {
-    token,
-    body: await signed(bob, "leave", net, { node_id: bob.nodeId, pubkey: bob.pubkey }),
-  });
+  const leaveBody = await signed(bob, "leave", net, { node_id: bob.nodeId, pubkey: bob.pubkey });
+  const left = await call("POST", "/v1/leave", { token, body: leaveBody });
   check("下线成功", left.status === 200 && left.body.ok === true, left.body);
+  const replayLeave = await call("POST", "/v1/leave", { token, body: leaveBody });
+  check(
+    "leave 重放被拒（破坏性操作仍然防重放）",
+    replayLeave.status === 403 && String(replayLeave.body.detail).includes("重放"),
+    replayLeave.body,
+  );
 
   const afterLeave = await call("POST", "/v1/connect", {
     token,

@@ -22,7 +22,10 @@ const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
 // 心跳超过这个时间就算"可能刚换网"：120 秒 > 两轮 60 秒轮询，
 // 正常节点不会到这个数，宁可让发起方等 10 秒重试，也别拿旧地址打 35 秒空炮
 const STALE_MS = 120_000;
-const HEARTBEAT_MS = 60_000; // last_seen 最快多久写一次（省 D1 写额度）
+// last_seen 最快多久写一次（省 D1 写额度）。
+// 取 55 秒而不是 60：客户端空闲时 60 秒一轮询，紧贴 60 秒的话请求间隔稍有抖动
+// （比如 59.9 秒）就会跳过这次写入，last_seen 的实际年龄会被拖到 ~120 秒，贴着 STALE_MS。
+const HEARTBEAT_MS = 55_000;
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_NODES = 256; // 每个网络的上限
 const MAX_CANDIDATES = 16;
@@ -31,7 +34,12 @@ const EVENT_TTL_MS = 300_000;
 const NODE_TTL_MS = 600_000; // 10 分钟没心跳就删，否则僵尸节点会占满 MAX_NODES
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 240; // 每 IP 每分钟请求数，防止误用把 D1 额度打满
-const SWEEP_INTERVAL_MS = 60_000;
+// 清理是 4 条全表扫描的 DELETE，每个 isolate 各跑各的。TTL 本身是 5~10 分钟，
+// 清理晚几分钟不影响正确性，却能把扫描量降到五分之一。
+// （不要给这些表加 created_at / last_seen 索引：每次 INSERT 会多写一行，得不偿失。）
+const SWEEP_INTERVAL_MS = 300_000;
+// 发给全网所有节点的广播事件用这个 node_id（真实 node_id 是 32 位十六进制，不会冲突）
+const BROADCAST = "*";
 
 // 逐条执行：D1 的 exec() 对多行语句的行为不同版本不一致，不赌它
 const DDL_STATEMENTS = [
@@ -814,27 +822,30 @@ async function joinOrRegister(request, env, url, needCandidates) {
     body,
     pubkey,
     now,
-    trackReplay: true,
+    // register / join 是幂等的：重放同一份签名报文只会写入同样的内容。
+    // 不占 nonce 能省掉每次 2 行写入（nonces 表 + 它的主键索引）。
+    // 破坏性操作（leave）和有副作用的操作（connect 成功路径）仍然防重放。
+    trackReplay: false,
   });
   if (bad) return err(403, "bad_signature", bad);
 
-  const existing = await getNode(env, network.network_id, nodeId);
-  if (!existing) {
-    const peersNow = await listNodes(env, network.network_id);
-    if (peersNow.length >= MAX_NODES) {
-      // 满了先淘汰最久没心跳的离线节点，否则僵尸节点会把网络永久占死
-      const victim = peersNow
-        .filter((n) => now - n.last_seen > OFFLINE_MS)
-        .sort((a, b) => a.last_seen - b.last_seen)[0];
-      if (!victim) {
-        return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);
-      }
-      await deleteNode(env, network.network_id, victim.node_id);
-      console.warn(`[signal] 淘汰僵尸节点 ${victim.node_id}`);
+  // 一次读出全部成员：既判断是否已注册、网络是否满员，也用来算地址和返回成员列表。
+  // 原来 getNode + 两次 listNodes（新节点是三次）+ 提交后再读一次，是 register 最大的开销。
+  let others = await listNodes(env, network.network_id);
+  const existing = others.find((n) => n.node_id === nodeId) ?? null;
+  if (!existing && others.length >= MAX_NODES) {
+    // 满了先淘汰最久没心跳的离线节点，否则僵尸节点会把网络永久占死
+    const victim = others
+      .filter((n) => now - n.last_seen > OFFLINE_MS)
+      .sort((a, b) => a.last_seen - b.last_seen)[0];
+    if (!victim) {
+      return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);
     }
+    await deleteNode(env, network.network_id, victim.node_id);
+    console.warn(`[signal] 淘汰僵尸节点 ${victim.node_id}`);
+    others = others.filter((n) => n.node_id !== victim.node_id);
   }
 
-  const others = await listNodes(env, network.network_id);
   const reservations = await listReservations(env, network.network_id);
 
   // 用户可以在加入时自己指定虚拟地址（家庭里想固定 IP 的典型需求）。
@@ -863,15 +874,17 @@ async function joinOrRegister(request, env, url, needCandidates) {
   // 记录预留：用户手填的永久保留，自动分配的跟着节点走（节点清理时一起删）
   const oldRes = reservations.find((r) => r.node_id === nodeId && r.ip !== virtualIp);
   if (oldRes) await deleteReservation(env, network.network_id, oldRes.ip);
-  await putReservation(env, {
-    network_id: network.network_id,
-    ip: virtualIp,
-    node_id: nodeId,
-    kind: reservations.find((r) => r.ip === virtualIp && r.node_id === nodeId)?.kind ??
-      (requested !== null ? "user" : "auto"),
-    note: reservations.find((r) => r.ip === virtualIp)?.note ?? "",
-    created_at: Date.now(),
-  });
+  // 已经有一模一样的预留就不再写：原来每次定时 register 都会无意义地覆盖一遍
+  if (!reservations.some((r) => r.ip === virtualIp && r.node_id === nodeId)) {
+    await putReservation(env, {
+      network_id: network.network_id,
+      ip: virtualIp,
+      node_id: nodeId,
+      kind: requested !== null ? "user" : "auto",
+      note: reservations.find((r) => r.ip === virtualIp)?.note ?? "",
+      created_at: Date.now(),
+    });
+  }
 
   const record = {
     network_id: network.network_id,
@@ -890,9 +903,15 @@ async function joinOrRegister(request, env, url, needCandidates) {
 
   await putNode(env, record);
 
-  const peers = (await listNodes(env, network.network_id))
-    .filter((n) => n.node_id !== nodeId)
-    .map((n) => publicNode(n, now));
+  // 对端靠这条广播感知"它上线了 / 换地址了"，不用再盲目重试 /connect，也不用等下一次 register。
+  // 只在状态真的变了才发：新节点、离线后回来、候选地址变了。
+  const wasOnline = existing !== null && now - existing.last_seen <= OFFLINE_MS;
+  const moved = existing !== null && existing.candidates !== record.candidates;
+  if ((!wasOnline || moved) && safeParseArray(record.candidates).length > 0) {
+    await pushEvent(env, network.network_id, BROADCAST, "peer_online", publicNode(record, now));
+  }
+
+  const peers = others.filter((n) => n.node_id !== nodeId).map((n) => publicNode(n, now));
 
   return json({
     ok: true,
@@ -929,7 +948,10 @@ async function connect(request, env, url) {
     body,
     pubkey: self.pubkey,
     now,
-    trackReplay: true,
+    // 先只验签；nonce 等对端校验都通过、真要写 punch_request 之前再占。
+    // 对端离线 / 不存在 / 过期这几条失败路径本来就没有副作用，重放无害，
+    // 却占了一行 nonce 写入——对端关机时客户端每分钟都会撞上这条路径。
+    trackReplay: false,
   });
   if (bad) return err(403, "bad_signature", bad);
 
@@ -951,6 +973,12 @@ async function connect(request, env, url) {
   const peerCandidates = JSON.parse(peer.candidates || "[]");
   if (peerCandidates.length === 0) {
     return err(409, "target_no_candidates", "对端还没有上报候选地址");
+  }
+
+  // 到这里才有副作用（写一条 punch_request），重放会让对端被重复打扰：此时占 nonce
+  const nonce = String(body.nonce ?? "").toLowerCase();
+  if (!(await consumeNonce(env, `${auth.network.network_id}:${nonce}`, now))) {
+    return err(403, "bad_signature", "nonce 已用过（疑似重放）");
   }
 
   const t = now + 500;
@@ -1011,6 +1039,7 @@ async function events(request, env, url) {
   if (bad) return err(403, "bad_signature", bad);
 
   // 轮询即心跳，但按 HEARTBEAT_MS 节流，避免把 D1 写额度烧在心跳上
+  const wasOffline = now - node.last_seen > OFFLINE_MS;
   if (now - node.last_seen >= HEARTBEAT_MS) {
     await touchNode(env, auth.network.network_id, nodeId, now);
   }
@@ -1020,6 +1049,18 @@ async function events(request, env, url) {
   const minCreatedAt = since === 0 ? now - 30_000 : 0;
   const rows = await pullEvents(env, auth.network.network_id, nodeId, since, MAX_EVENTS, minCreatedAt);
   const cursor = rows.length > 0 ? rows[rows.length - 1].id : since;
+
+  // 睡眠 / 断网后回来、没换地址也没重新注册的节点：对端早就把它标成离线了，
+  // 只有这里知道它回来了，补发一条上线广播（否则对端要等到下一次定时 register 才会重试）
+  if (wasOffline && safeParseArray(node.candidates).length > 0) {
+    await pushEvent(
+      env,
+      auth.network.network_id,
+      BROADCAST,
+      "peer_online",
+      publicNode({ ...node, last_seen: now }, now),
+    );
+  }
 
   return json({
     ok: true,
@@ -1385,7 +1426,7 @@ async function pullEvents(env, networkId, nodeId, since, limit, minCreatedAt = 0
       .filter(
         (e) =>
           e.network_id === networkId &&
-          e.node_id === nodeId &&
+          (e.node_id === nodeId || e.node_id === BROADCAST) &&
           e.id > since &&
           e.created_at >= minCreatedAt,
       )
@@ -1393,7 +1434,7 @@ async function pullEvents(env, networkId, nodeId, since, limit, minCreatedAt = 0
   }
   const { results } = await env.DB.prepare(
     `SELECT id, type, payload FROM events
-      WHERE network_id = ? AND node_id = ? AND id > ? AND created_at >= ?
+      WHERE network_id = ? AND node_id IN (?, '*') AND id > ? AND created_at >= ?
       ORDER BY id LIMIT ?`,
   )
     .bind(networkId, nodeId, since, minCreatedAt, limit)

@@ -123,8 +123,14 @@ pub struct PeerInfo {
     pub candidates: Vec<String>,
     #[serde(default)]
     pub last_seen: i64,
-    #[serde(default)]
+    /// 服务端判定的在线状态。老版本 Worker 不返回这个字段：缺省按"在线"处理，
+    /// 保持旧行为（照常尝试拨号），而不是把所有人都当成离线。
+    #[serde(default = "default_online")]
     pub online: bool,
+}
+
+fn default_online() -> bool {
+    true
 }
 
 impl PeerInfo {

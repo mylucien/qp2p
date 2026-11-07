@@ -18,6 +18,8 @@ pub const HEADER_LEN: usize = 20;
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_RESPONSE: u16 = 0x0101;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// 旧式（RFC 3489）映射地址。个别服务器只回这个，不回 XOR 版本。
+const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum StunError {
@@ -125,6 +127,7 @@ pub fn parse_binding_response(buf: &[u8]) -> Result<SocketAddr, StunError> {
     let body_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     let end = (HEADER_LEN + body_len).min(buf.len());
 
+    let mut fallback: Option<SocketAddr> = None;
     let mut pos = HEADER_LEN;
     while pos + 4 <= end {
         let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
@@ -138,12 +141,82 @@ pub fn parse_binding_response(buf: &[u8]) -> Result<SocketAddr, StunError> {
         if attr_type == ATTR_XOR_MAPPED_ADDRESS {
             return parse_xor_mapped(&buf[pos..value_end]);
         }
+        if attr_type == ATTR_MAPPED_ADDRESS && fallback.is_none() {
+            fallback = parse_mapped(&buf[pos..value_end]).ok();
+        }
 
         // 属性值按 4 字节对齐填充
         pos = value_end + (4 - attr_len % 4) % 4;
     }
 
-    Err(StunError::NoMappedAddress)
+    // 没有 XOR 版本就用旧式的；两个都没有才算失败
+    fallback.ok_or(StunError::NoMappedAddress)
+}
+
+/// 取响应里的事务 ID（调用方先确认过 `is_stun`）。
+pub fn txid_of(buf: &[u8]) -> Option<[u8; 12]> {
+    buf.get(8..20)?.try_into().ok()
+}
+
+fn parse_mapped(value: &[u8]) -> Result<SocketAddr, StunError> {
+    if value.len() < 4 {
+        return Err(StunError::BadAttribute);
+    }
+    let port = u16::from_be_bytes([value[2], value[3]]);
+    match value[1] {
+        0x01 => {
+            if value.len() < 8 {
+                return Err(StunError::BadAttribute);
+            }
+            let octets = [value[4], value[5], value[6], value[7]];
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
+        }
+        other => Err(StunError::UnsupportedFamily(other)),
+    }
+}
+
+/// 本机 NAT 的映射行为（只看"映射"，不判断过滤行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatKind {
+    /// 观测不足：只有一台服务器回应，或服务器地址相同
+    Unknown,
+    /// 对不同目的地用同一个公网映射（endpoint-independent mapping）
+    Cone,
+    /// 对不同目的地给不同映射（endpoint-dependent mapping）。
+    /// 两端都是这种时，打洞几乎不可能成功。
+    Symmetric,
+}
+
+impl NatKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Cone => "cone",
+            Self::Symmetric => "symmetric",
+        }
+    }
+}
+
+/// 由"同一个本地 socket 对不同服务器得到的映射"判定 NAT 映射行为。
+///
+/// 输入是 `(服务器 IP, 观测到的映射)`。必须来自**不同的服务器 IP**，
+/// 否则两次观测对应同一个五元组，什么也证明不了。
+pub fn classify(observations: &[(IpAddr, SocketAddr)]) -> NatKind {
+    let mut seen: Vec<(IpAddr, SocketAddr)> = Vec::new();
+    for (server, mapped) in observations {
+        if !seen.iter().any(|(s, _)| s == server) {
+            seen.push((*server, *mapped));
+        }
+    }
+    if seen.len() < 2 {
+        return NatKind::Unknown;
+    }
+    let first = seen[0].1;
+    if seen.iter().all(|(_, m)| *m == first) {
+        NatKind::Cone
+    } else {
+        NatKind::Symmetric
+    }
 }
 
 fn parse_xor_mapped(value: &[u8]) -> Result<SocketAddr, StunError> {
@@ -189,6 +262,94 @@ mod tests {
             buf.push(byte ^ MAGIC_COOKIE[i]);
         }
         buf
+    }
+
+    fn response_with_plain_mapped(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        buf.extend_from_slice(&12u16.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE);
+        buf.extend_from_slice(&[9u8; 12]);
+        buf.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00);
+        buf.push(0x01);
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf.extend_from_slice(&ip);
+        buf
+    }
+
+    #[test]
+    fn plain_mapped_address_is_accepted_as_fallback() {
+        let resp = response_with_plain_mapped([203, 0, 113, 9], 40001);
+        assert_eq!(
+            parse_binding_response(&resp).unwrap(),
+            "203.0.113.9:40001".parse().unwrap()
+        );
+        assert_eq!(txid_of(&resp), Some([9u8; 12]));
+    }
+
+    #[test]
+    fn xor_version_wins_over_plain_when_both_present() {
+        let mut resp = response_with_plain_mapped([1, 1, 1, 1], 1111);
+        // 追加一个 XOR 属性，并把长度改成 24
+        resp.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        resp.extend_from_slice(&8u16.to_be_bytes());
+        resp.push(0x00);
+        resp.push(0x01);
+        resp.extend_from_slice(&(2222u16 ^ 0x2112).to_be_bytes());
+        for (i, b) in [2u8, 2, 2, 2].iter().enumerate() {
+            resp.push(b ^ MAGIC_COOKIE[i]);
+        }
+        resp[2..4].copy_from_slice(&24u16.to_be_bytes());
+        assert_eq!(
+            parse_binding_response(&resp).unwrap(),
+            "2.2.2.2:2222".parse().unwrap()
+        );
+    }
+
+    fn obs(server: &str, mapped: &str) -> (IpAddr, SocketAddr) {
+        (server.parse().unwrap(), mapped.parse().unwrap())
+    }
+
+    #[test]
+    fn classify_needs_two_distinct_servers() {
+        assert_eq!(classify(&[]), NatKind::Unknown);
+        assert_eq!(classify(&[obs("1.1.1.1", "9.9.9.9:1")]), NatKind::Unknown);
+        // 同一台服务器回两次不算两次观测
+        assert_eq!(
+            classify(&[obs("1.1.1.1", "9.9.9.9:1"), obs("1.1.1.1", "9.9.9.9:2")]),
+            NatKind::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_cone_when_mapping_is_stable() {
+        assert_eq!(
+            classify(&[
+                obs("1.1.1.1", "9.9.9.9:5000"),
+                obs("2.2.2.2", "9.9.9.9:5000")
+            ]),
+            NatKind::Cone
+        );
+    }
+
+    #[test]
+    fn classify_symmetric_when_port_or_ip_differs() {
+        assert_eq!(
+            classify(&[
+                obs("1.1.1.1", "9.9.9.9:5000"),
+                obs("2.2.2.2", "9.9.9.9:5001")
+            ]),
+            NatKind::Symmetric
+        );
+        assert_eq!(
+            classify(&[
+                obs("1.1.1.1", "9.9.9.9:5000"),
+                obs("2.2.2.2", "9.9.9.8:5000")
+            ]),
+            NatKind::Symmetric
+        );
     }
 
     #[test]
@@ -240,9 +401,10 @@ mod tests {
     #[test]
     fn reports_missing_attribute() {
         let mut buf = response_with_xor_mapped([1, 2, 3, 4], 1);
-        // 把属性类型改成 MAPPED-ADDRESS，使 XOR-MAPPED-ADDRESS 缺失
-        buf[20] = 0x00;
-        buf[21] = 0x01;
+        // 把属性类型改成无关的 SOFTWARE(0x8022)，使任何映射地址都缺失。
+        // （不能再用 MAPPED-ADDRESS：它现在是被接受的回退）
+        buf[20] = 0x80;
+        buf[21] = 0x22;
         assert_eq!(
             parse_binding_response(&buf).unwrap_err(),
             StunError::NoMappedAddress

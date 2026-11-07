@@ -4,7 +4,7 @@
 //! 任何一处走样都会出现"PC 能连、手机连不上"的怪问题），所以下沉到这里。
 //! 面向用户的状态输出用回调，CLI 打 `println!`，Android 塞进通知栏或日志。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,26 +17,49 @@ use crate::identity::{Identity, NodeId};
 use crate::link::tun::MeshLinks;
 use crate::peer::Role;
 use crate::route::Cidr;
-use crate::signal::client::{PeerInfo, SignalClient};
+use crate::signal::client::{PeerInfo, SignalClient, SignalError};
+use crate::stun::NatKind;
 
 /// 事件轮询间隔：三档自适应。
 ///
-/// 固定 3 秒时，一台常开机器每天要 2.9 万次请求——Workers 免费额度
-/// （10 万/日）三台就打满。这里按"有没有事"分档：还有对端没连上就
-/// 3 秒（要尽快应答撮合）；全连上了 20 秒；彻底静默 60 秒。
+/// 档位只看"现在有没有值得抢时间的事"，而不是"还有没有人没连上"：
+/// - **HOT 3 秒**：只在刚发生了值得抢时间的事之后的 [`HOT_WINDOW`] 内——
+///   启动、收到对端上线/撮合请求、链路刚断、TUN 来包唤醒、公网映射变化。
+/// - **WARM 20 秒**：还有在线且值得尝试的对端没连上；或者一个对端都还不认识（等人加入）；
+///   或者全连上了但数据面还在用。
+/// - **COLD 60 秒**：全连上且数据面空闲，或休眠。
+///
+/// 旧版本"只要有一个对端没连上就永远 3 秒"：一台关机的对端，就能让每个在线节点
+/// 每天白打 2.9 万次请求（Workers 免费额度 10 万/日）。
 const POLL_HOT: Duration = Duration::from_secs(3);
 const POLL_WARM: Duration = Duration::from_secs(20);
 const POLL_COLD: Duration = Duration::from_secs(60);
-/// 重新注册间隔：候选地址可能因 NAT 重新映射而变化。5 分钟足够，
-/// 地址真变了也会在打洞时通过对端回报的 candidates 自愈。
-const REGISTER_EVERY: Duration = Duration::from_secs(300);
+/// 事件触发后保持高频轮询的时长。
+const HOT_WINDOW: Duration = Duration::from_secs(45);
+/// 兜底的重新注册间隔。
+///
+/// 对端上线靠 `peer_online` 广播事件感知、公网映射变化靠周期 STUN 发现，
+/// 这里只是防漏的安全网（register 是最贵的请求：8 次查询 + 3 次写入）。
+const REGISTER_EVERY: Duration = Duration::from_secs(1800);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
 /// 两次"重绑端口 + 重探 STUN"之间的最小间隔。
 /// 对端不可达时不能每轮都重绑，否则端口一直在变，打洞永远开不了。
 const RENEW_MIN: Duration = Duration::from_secs(30);
+/// 没有任何直连时，连续这么多次拨号失败就怀疑是自己的映射过期，重绑一次。
+const RENEW_AFTER_STREAK: u32 = 3;
+/// 没有任何直连时，周期 STUN 保活连续这么多轮零回应，说明映射或网络已经死了。
+const STUN_MISS_RENEW: u32 = 3;
 /// 数据面静默多久算「彻底空闲」。
 const IDLE_AFTER: Duration = Duration::from_secs(120);
+
+/// 对一个"在线却连不上"的对端：首轮连续失败几次后进入冷却。
+const COOL_AFTER_FIRST: u32 = 6;
+/// 冷却结束后的再次尝试只给这么几次机会，不行就继续冷却。
+const COOL_AFTER_REPEAT: u32 = 2;
+/// 冷却时长：5 分钟起步，每冷却一轮翻倍，封顶 30 分钟。
+const COOLDOWN_BASE: Duration = Duration::from_secs(300);
+const COOLDOWN_MAX: Duration = Duration::from_secs(1800);
 
 /// 状态输出回调。
 ///
@@ -79,22 +102,47 @@ struct PeerState {
     name: String,
     virtual_ip: Option<Ipv4Addr>,
     connected: bool,
-    /// 尝试过几次（0 表示从没试过，应当立刻连）
+    /// 尝试过几次（0 表示从没试过，应当立刻连）。换端口后会清零，用来驱动退避。
     attempts: u32,
     last_try: Instant,
     /// 失败原因只打印一次，避免每 20 秒刷屏
     reported: bool,
+    /// 服务端最近一次告诉我们的在线状态；拨号返回"对端离线"时也会置 false
+    online: bool,
+    /// 对端的 NAT 类型（register 回包里的 `nat_type`）
+    nat: String,
+    /// 连续失败次数。与 `attempts` 不同，换端口不清零，专门用来决定何时冷却。
+    fails: u32,
+    /// 冷却到这个时刻之前不主动拨号（在线但打不通的对端，比如双方都是对称 NAT）
+    cool_until: Option<Instant>,
+    /// 已经冷却过几轮，决定下一次冷却多久
+    cool_count: u32,
 }
 
 impl PeerState {
     fn new(peer: &PeerInfo) -> Self {
+        let mut state = Self::from_parts(
+            peer.name.clone(),
+            peer.virtual_ip.parse().ok(),
+            peer.nat_type.clone(),
+        );
+        state.online = peer.online;
+        state
+    }
+
+    fn from_parts(name: String, virtual_ip: Option<Ipv4Addr>, nat: String) -> Self {
         Self {
-            name: peer.name.clone(),
-            virtual_ip: peer.virtual_ip.parse().ok(),
+            name,
+            virtual_ip,
             connected: false,
             attempts: 0,
             last_try: Instant::now(),
             reported: false,
+            online: true,
+            nat,
+            fails: 0,
+            cool_until: None,
+            cool_count: 0,
         }
     }
 
@@ -102,6 +150,227 @@ impl PeerState {
     fn backoff(&self) -> Duration {
         let exp = self.attempts.saturating_sub(1).min(3);
         Duration::from_secs(10 * (1u64 << exp)).min(Duration::from_secs(60))
+    }
+
+    fn cooling(&self, now: Instant) -> bool {
+        self.cool_until.is_some_and(|t| now < t)
+    }
+
+    /// 对端刚上线（或刚恢复）：之前积累的失败、冷却、退避统统作废，立刻重试。
+    fn mark_online(&mut self) {
+        self.online = true;
+        self.attempts = 0;
+        self.fails = 0;
+        self.cool_until = None;
+        self.cool_count = 0;
+        self.reported = false;
+    }
+
+    fn mark_offline(&mut self) {
+        self.online = false;
+        self.attempts = 0;
+        self.fails = 0;
+    }
+
+    fn mark_connected(&mut self) {
+        self.connected = true;
+        self.online = true;
+        self.attempts = 0;
+        self.fails = 0;
+        self.cool_until = None;
+        self.cool_count = 0;
+        self.reported = false;
+    }
+
+    /// 记一次"对端在线却没打通"。连续失败到阈值就进入冷却。
+    ///
+    /// `hopeless`：已知两端都是对称 NAT，打洞基本不可能成功，试一次就进入最长冷却。
+    fn note_failure(&mut self, now: Instant, hopeless: bool) {
+        self.fails += 1;
+        let limit = if hopeless {
+            1
+        } else if self.cool_count == 0 {
+            COOL_AFTER_FIRST
+        } else {
+            COOL_AFTER_REPEAT
+        };
+        if self.fails >= limit {
+            let span = if hopeless {
+                COOLDOWN_MAX
+            } else {
+                cooldown(self.cool_count)
+            };
+            self.cool_until = Some(now + span);
+            self.cool_count = self.cool_count.saturating_add(1);
+            self.fails = 0;
+            self.attempts = 0;
+        }
+    }
+}
+
+/// 第 n 轮冷却的时长：5 分钟起步，每轮翻倍，封顶 30 分钟。
+fn cooldown(round: u32) -> Duration {
+    COOLDOWN_BASE
+        .saturating_mul(1u32 << round.min(6))
+        .min(COOLDOWN_MAX)
+}
+
+/// 拨号失败的性质：决定是"对端不在线"还是"在线但没打通"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailKind {
+    /// 服务端明确说对端离线 / 不在网络里：不再盲连，等它上线的通知
+    Offline,
+    /// 其它：撮合失败、没有候选、打洞超时……
+    Other,
+}
+
+fn error_code(error: &anyhow::Error) -> Option<&str> {
+    error.downcast_ref::<SignalError>().map(|e| e.code.as_str())
+}
+
+fn fail_kind(error: &anyhow::Error) -> FailKind {
+    match error_code(error) {
+        Some("target_offline" | "target_not_found") => FailKind::Offline,
+        _ => FailKind::Other,
+    }
+}
+
+/// 是否该主动对这个对端发起一轮拨号。
+fn should_dial(state: &PeerState, my_id: &str, peer_id: &str, now: Instant, forced: bool) -> bool {
+    if state.connected {
+        return false;
+    }
+    if forced {
+        // 有包要发：不等退避、不看在线/冷却，但 2 秒内不重复拨同一个对端
+        return !(state.attempts > 0
+            && now.duration_since(state.last_try) < Duration::from_secs(2));
+    }
+    // 双方都拨会各建一条连接；固定由 node_id 小的一方发起
+    if my_id >= peer_id {
+        return false;
+    }
+    // 已知离线的不盲连（它上线时会有 peer_online 通知）；冷却中的不打扰
+    if !state.online || state.cooling(now) {
+        return false;
+    }
+    !(state.attempts > 0 && now.duration_since(state.last_try) < state.backoff())
+}
+
+struct ListChange {
+    /// 有对端从"不在"变成"在线"：值得马上抢时间连接
+    new_online: bool,
+}
+
+/// 以服务端返回的成员列表为准更新本地对端表。
+///
+/// - 列表里没有、又没连着的对端删掉（服务端 10 分钟没心跳就清掉了，客户端留着只会白白拨号）
+/// - `online` 以服务端为准；离线→在线时清空失败与冷却
+/// - 已连着的对端不因为服务端说它离线就丢，链路本身才是事实
+fn apply_peer_list(table: &mut HashMap<String, PeerState>, list: &[PeerInfo]) -> ListChange {
+    let mut new_online = false;
+    for peer in list {
+        match table.get_mut(&peer.node_id) {
+            Some(state) => {
+                state.name = peer.name.clone();
+                if let Ok(ip) = peer.virtual_ip.parse() {
+                    state.virtual_ip = Some(ip);
+                }
+                state.nat = peer.nat_type.clone();
+                if peer.online && !state.online {
+                    state.mark_online();
+                    new_online = true;
+                } else if !peer.online && state.online && !state.connected {
+                    state.mark_offline();
+                }
+            }
+            None => {
+                let state = PeerState::new(peer);
+                new_online |= state.online;
+                table.insert(peer.node_id.clone(), state);
+            }
+        }
+    }
+    let known: HashSet<&str> = list.iter().map(|p| p.node_id.as_str()).collect();
+    table.retain(|id, state| state.connected || known.contains(id.as_str()));
+    ListChange { new_online }
+}
+
+/// 选轮询档位用的输入。
+struct PollInputs {
+    sleeping: bool,
+    /// 还在 [`HOT_WINDOW`] 内
+    hot: bool,
+    /// 有在线、没在冷却、却没连上的对端
+    wanted_unconnected: bool,
+    /// 一个对端都还不认识（等人加入）
+    alone: bool,
+    /// 数据面已经静默 [`IDLE_AFTER`] 以上
+    idle: bool,
+}
+
+fn poll_interval(i: &PollInputs) -> Duration {
+    if i.sleeping {
+        // 休眠时只保留最低频的轮询：新节点加入最多晚 60 秒发现
+        POLL_COLD
+    } else if i.hot {
+        POLL_HOT
+    } else if i.wanted_unconnected || i.alone {
+        POLL_WARM
+    } else if i.idle {
+        POLL_COLD
+    } else {
+        POLL_WARM
+    }
+}
+
+/// 信令连续出错时的轮询退避：10、20、40、80、160、300 秒（封顶）。
+fn error_backoff(streak: u32) -> Duration {
+    if streak == 0 {
+        return Duration::ZERO;
+    }
+    let secs = 10u64 << (streak - 1).min(5);
+    Duration::from_secs(secs.min(300))
+}
+
+struct RenewInputs {
+    live: usize,
+    all_lost: bool,
+    /// 在线且没在冷却的对端里最大的连续尝试次数
+    worst_streak: u32,
+    sleeping: bool,
+    since_renew: Duration,
+    stun_misses: u32,
+}
+
+struct RenewPlan {
+    renew: bool,
+    /// 触发了"可能换网/映射失效"的判定：把各对端的退避清零，让它们马上重试
+    clear_backoff: bool,
+    switch_detected: bool,
+}
+
+/// 要不要重绑端口 + 重探 STUN。
+///
+/// **`renew()` 会关闭端点，所有直连一起断**，所以只要还有活链路就绝不能走这条路。
+/// 旧版本的 `worst_streak >= 3` 没有这个前提：表里只要有一个关机的对端，
+/// 每隔几十秒就会把所有健康直连打断一次。
+fn plan_renew(i: &RenewInputs) -> RenewPlan {
+    let none = RenewPlan {
+        renew: false,
+        clear_backoff: false,
+        switch_detected: false,
+    };
+    if i.live > 0 {
+        return none;
+    }
+    let trigger = i.all_lost
+        || (!i.sleeping && i.worst_streak >= RENEW_AFTER_STREAK)
+        || (!i.sleeping && i.stun_misses >= STUN_MISS_RENEW);
+    let guarded = i.since_renew < RENEW_MIN;
+    RenewPlan {
+        renew: i.since_renew >= RENEW_EVERY || (trigger && !guarded),
+        clear_backoff: trigger,
+        switch_detected: trigger && !guarded,
     }
 }
 
@@ -186,6 +455,13 @@ impl Session {
         let mut last_register = Instant::now();
         let mut last_renew = Instant::now();
         let mut last_error = String::new();
+        // 信令连续出错的轮数：用来退避轮询、暂停拨号与注册
+        let mut err_streak: u32 = 0;
+        // 高频轮询窗口：只有刚发生了值得抢时间的事才打开
+        let mut hot_until = Instant::now() + HOT_WINDOW;
+        // 上一轮的直连数：变少了说明链路刚断，要抢时间重连
+        let mut last_live: usize = 0;
+        let mut seen_generation = self.engine.read().await.stun_generation();
 
         // TUN 收到"目标没连上"的包时会往这里塞一个虚拟地址：
         // 立刻针对这个对端拨号，不用等下一轮定时器
@@ -200,50 +476,102 @@ impl Session {
         let mut had_links = false;
 
         while !self.stop.load(Ordering::Relaxed) {
-            // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request
+            // 本轮是否需要马上重新登记（事件、STUN 观测都可能置位）
+            let mut need_register = false;
+
+            // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request；
+            //    对端上线 / 换地址时会塞 peer_online 广播
             match client.events(&identity, cursor).await {
                 Ok(reply) => {
                     cursor = reply.cursor;
                     for event in reply.events {
-                        if event.kind != "punch_request" {
-                            continue;
-                        }
-                        let Some(from) = event.str("from").and_then(NodeId::parse) else {
-                            continue;
-                        };
-                        let addrs: Vec<SocketAddr> = event
-                            .strings("candidates")
-                            .iter()
-                            .filter_map(|c| c.parse().ok())
-                            .collect();
-                        // 2.2 起的 Worker 直接给虚拟地址；更早的版本没有这个字段，
-                        // 用和 Worker 一致的推导算法兜底
-                        let ip = event
-                            .str("virtual_ip")
-                            .and_then(|s| s.parse::<Ipv4Addr>().ok())
-                            .or_else(|| {
-                                net.map(|cidr| {
-                                    crate::identity::derive_virtual_ip(
-                                        &from,
-                                        cidr.base,
-                                        cidr.prefix,
-                                        0,
-                                    )
-                                })
-                            });
-                        let label = event.str("from_name").unwrap_or("未知节点").to_string();
+                        match event.kind.as_str() {
+                            "punch_request" => {
+                                let Some(from) = event.str("from").and_then(NodeId::parse) else {
+                                    continue;
+                                };
+                                let addrs: Vec<SocketAddr> = event
+                                    .strings("candidates")
+                                    .iter()
+                                    .filter_map(|c| c.parse().ok())
+                                    .collect();
+                                // 2.2 起的 Worker 直接给虚拟地址；更早的版本没有这个字段，
+                                // 用和 Worker 一致的推导算法兜底
+                                let ip = event
+                                    .str("virtual_ip")
+                                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                                    .or_else(|| {
+                                        net.map(|cidr| {
+                                            crate::identity::derive_virtual_ip(
+                                                &from,
+                                                cidr.base,
+                                                cidr.prefix,
+                                                0,
+                                            )
+                                        })
+                                    });
+                                let label =
+                                    event.str("from_name").unwrap_or("未知节点").to_string();
+                                // 对方马上要打进来：这段时间要尽快应答后续事件
+                                hot_until = Instant::now() + HOT_WINDOW;
 
-                        let engine = self.engine.clone();
-                        let peers = self.peers.clone();
-                        let mesh = self.mesh.clone();
-                        let notify = self.notify.clone();
-                        tokio::spawn(async move {
-                            answer_punch(engine, peers, mesh, notify, from, label, ip, addrs).await;
-                        });
+                                let engine = self.engine.clone();
+                                let peers = self.peers.clone();
+                                let mesh = self.mesh.clone();
+                                let notify = self.notify.clone();
+                                tokio::spawn(async move {
+                                    answer_punch(
+                                        engine, peers, mesh, notify, from, label, ip, addrs,
+                                    )
+                                    .await;
+                                });
+                            }
+                            "peer_online" => {
+                                let Some(id) = event.str("node_id") else {
+                                    continue;
+                                };
+                                if id == node_id.as_str() {
+                                    continue;
+                                }
+                                let ip = event.str("virtual_ip").and_then(|s| s.parse().ok());
+                                let label = event.str("name").unwrap_or("").to_string();
+                                let nat = event.str("nat_type").unwrap_or("").to_string();
+                                let mut table = self.peers.lock().await;
+                                match table.get_mut(id) {
+                                    Some(state) => {
+                                        if !label.is_empty() {
+                                            state.name = label;
+                                        }
+                                        if ip.is_some() {
+                                            state.virtual_ip = ip;
+                                        }
+                                        state.nat = nat;
+                                        if !state.connected {
+                                            state.mark_online();
+                                        }
+                                    }
+                                    None => {
+                                        table.insert(
+                                            id.to_string(),
+                                            PeerState::from_parts(label, ip, nat),
+                                        );
+                                    }
+                                }
+                                // 它马上会来连我，或者我这一轮就能去连它
+                                hot_until = Instant::now() + HOT_WINDOW;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if err_streak >= 2 {
+                        // 信令断了一阵子：期间的 peer_online 可能已经被服务端清掉，补一次全量同步
+                        need_register = true;
                     }
                     if !last_error.is_empty() {
+                        self.notify.say("· 信令已恢复");
                         last_error.clear();
                     }
+                    err_streak = 0;
                 }
                 Err(e) => {
                     // 令牌被换掉 / 网络被删：再轮询也没有意义
@@ -251,11 +579,18 @@ impl Session {
                         self.notify.say("⚠ 加入令牌已失效（网络被删除，或管理员换了准入密码）。现有直连还能用，但新节点连不上来了。");
                         return;
                     }
-                    // 只在不重复的时候喊一声
-                    let text = format!("{e:#}");
-                    if text != last_error {
-                        self.notify.say(&format!("⚠ 拉取事件失败：{text}"));
-                        last_error = text;
+                    if error_code(&e) == Some("unknown_node") {
+                        // 服务端已经把本节点清掉了（睡眠 / 离线超过 10 分钟）：
+                        // 马上重新登记。这不是信令故障，不进退避。
+                        need_register = true;
+                    } else {
+                        err_streak = err_streak.saturating_add(1);
+                        // 只在不重复的时候喊一声
+                        let text = format!("{e:#}");
+                        if text != last_error {
+                            self.notify.say(&format!("⚠ 拉取事件失败：{text}"));
+                            last_error = text;
+                        }
                     }
                 }
             }
@@ -273,14 +608,43 @@ impl Session {
                 }
             }
 
+            // 1.6) 直连数变化 + 周期 STUN 保活
+            let live_now = {
+                let table = self.peers.lock().await;
+                table.values().filter(|p| p.connected).count()
+            };
+            if live_now < last_live && !sleeping {
+                // 链路刚断：对端多半马上会重拨，这段时间要快
+                hot_until = Instant::now() + HOT_WINDOW;
+            }
+            last_live = live_now;
+            {
+                let engine = self.engine.read().await;
+                // 有直连时 QUIC 自己的 keepalive 在刷新映射，不必让射频多醒一次
+                engine.stun_set_active(live_now == 0 && !sleeping);
+                let generation = engine.stun_generation();
+                if generation != seen_generation {
+                    seen_generation = generation;
+                    need_register = true;
+                    hot_until = Instant::now() + HOT_WINDOW;
+                    tracing::info!("[session] 公网映射变化，重新登记");
+                }
+            }
+
             // 2) 主动发起：node_id 小的一方负责拨号，避免两边同时重复建连
             if sleeping {
                 // 休眠中不主动连，否则刚断开又立刻拨回去，空闲断链毫无意义
                 if forced.is_some() {
                     sleeping = false;
+                    hot_until = Instant::now() + HOT_WINDOW;
                 }
             }
-            if !sleeping {
+            // 信令不通时撮合必然失败，别白白打请求、耗电
+            if !sleeping && err_streak < 2 {
+                let my_symmetric = {
+                    let engine = self.engine.read().await;
+                    engine.upnp().is_none() && engine.nat_kind() == NatKind::Symmetric
+                };
                 dial_round(
                     &client,
                     &identity,
@@ -290,36 +654,47 @@ impl Session {
                     &self.mesh,
                     &self.notify,
                     forced.take(),
+                    my_symmetric,
                 )
                 .await;
             }
 
-            // 2.5) 换网检测：原本有直连、现在一条不剩，或连续 3 次打洞失败
+            // 2.5) 换网检测：原本有直连、现在一条不剩，或没有直连时连续拨号失败 / STUN 无回应
             //      → 立刻重绑端口 + 重探 STUN，紧接着用新候选注册。
             //      这是"换网后最坏等 10 分钟"的解药：谁换了网，谁自己马上重报。
             let (live, worst_streak) = {
                 let table = self.peers.lock().await;
+                let now = Instant::now();
                 (
                     table.values().filter(|p| p.connected).count(),
-                    table.values().map(|p| p.attempts).max().unwrap_or(0),
+                    table
+                        .values()
+                        .filter(|p| p.online && !p.cooling(now))
+                        .map(|p| p.attempts)
+                        .max()
+                        .unwrap_or(0),
                 )
             };
             // 空闲休眠造成的断开是有意的，不能当成换网去重绑端口
             let all_lost = !sleeping && had_links && live == 0;
             had_links = live > 0 && !sleeping;
-            let mut force_register = all_lost || (!sleeping && worst_streak >= 3);
-            let switch_detected = force_register;
-            if force_register {
+            let stun_misses = self.engine.read().await.stun_misses();
+            let plan = plan_renew(&RenewInputs {
+                live,
+                all_lost,
+                worst_streak,
+                sleeping,
+                since_renew: last_renew.elapsed(),
+                stun_misses,
+            });
+            let mut force_register = need_register;
+            if plan.clear_backoff {
                 // 先清退避：不清的话每轮都会判定"连续失败"，把注册打成连发
                 for state in self.peers.lock().await.values_mut() {
                     state.attempts = 0;
                 }
-                // 刚重绑过就别再动端口，否则映射一直在变，谁也打不进来
-                if last_renew.elapsed() < RENEW_MIN {
-                    force_register = false;
-                }
             }
-            if force_register || (last_renew.elapsed() >= RENEW_EVERY && live == 0) {
+            if plan.renew {
                 last_renew = Instant::now();
                 let renewed = {
                     let mut guard = self.engine.write().await;
@@ -328,22 +703,26 @@ impl Session {
                 match renewed {
                     Ok(()) => {
                         tracing::info!("[session] 端点已刷新（换网或长时间不通）");
-                        if switch_detected {
+                        if plan.switch_detected {
                             self.notify
                                 .say("· 网络可能变了：已重新探测公网地址，正在重报");
                         }
                         // 换了端口就必须立刻上报，否则对端还拿着旧地址打空炮
                         force_register = true;
+                        hot_until = Instant::now() + HOT_WINDOW;
+                        // renew 之后 generation 会变，这里先对齐，免得下一轮重复登记
+                        seen_generation = self.engine.read().await.stun_generation();
                     }
                     Err(e) => {
                         tracing::debug!("[session] 端点刷新失败: {e:#}");
-                        force_register = false;
+                        // 没换成就没必要强制登记；定时登记照旧
+                        force_register = need_register;
                     }
                 }
             }
 
-            // 3) 重新注册：定时刷新，或刚换过端口要马上让对端知道
-            if force_register || last_register.elapsed() >= REGISTER_EVERY {
+            // 3) 重新注册：兜底定时，或候选地址变了要马上让对端知道
+            if (force_register || last_register.elapsed() >= REGISTER_EVERY) && err_streak < 2 {
                 last_register = Instant::now();
                 let (candidates, fp, nat) = {
                     let engine = self.engine.read().await;
@@ -359,21 +738,17 @@ impl Session {
                 {
                     Ok(reply) => {
                         let mut table = self.peers.lock().await;
-                        for peer in &reply.peers {
-                            match table.get_mut(&peer.node_id) {
-                                Some(state) => {
-                                    state.name = peer.name.clone();
-                                    if let Ok(ip) = peer.virtual_ip.parse() {
-                                        state.virtual_ip = Some(ip);
-                                    }
-                                }
-                                None => {
-                                    table.insert(peer.node_id.clone(), PeerState::new(peer));
-                                }
-                            }
+                        if apply_peer_list(&mut table, &reply.peers).new_online {
+                            hot_until = Instant::now() + HOT_WINDOW;
                         }
                     }
-                    Err(e) => tracing::debug!("[session] 刷新注册失败: {e:#}"),
+                    Err(e) => {
+                        tracing::debug!("[session] 刷新注册失败: {e:#}");
+                        // 失败了别等 30 分钟：一分钟后再试
+                        last_register = Instant::now()
+                            .checked_sub(REGISTER_EVERY - Duration::from_secs(60))
+                            .unwrap_or_else(Instant::now);
+                    }
                 }
             }
 
@@ -394,23 +769,28 @@ impl Session {
                 }
             }
 
-            // 6) 等下一轮：按"还有没有事"选档位；TUN 来了包就立刻醒
+            // 6) 等下一轮：按"现在有没有值得抢时间的事"选档位；TUN 来了包就立刻醒
             let interval = {
-                let all_connected = {
+                let now = Instant::now();
+                let (wanted_unconnected, alone) = {
                     let table = self.peers.lock().await;
-                    !table.is_empty() && table.values().all(|p| p.connected)
+                    (
+                        table
+                            .values()
+                            .any(|p| !p.connected && p.online && !p.cooling(now)),
+                        table.is_empty(),
+                    )
                 };
                 let idle = self.mesh.as_ref().map(|m| m.idle_for()).unwrap_or_default();
-                if sleeping {
-                    // 休眠时只保留最低频的轮询：新节点加入最多晚 60 秒发现
-                    POLL_COLD
-                } else if !all_connected {
-                    POLL_HOT
-                } else if idle >= IDLE_AFTER {
-                    POLL_COLD
-                } else {
-                    POLL_WARM
-                }
+                poll_interval(&PollInputs {
+                    sleeping,
+                    hot: now < hot_until,
+                    wanted_unconnected,
+                    alone,
+                    idle: idle >= IDLE_AFTER,
+                })
+                // 信令出错时只会更慢，不会更快
+                .max(error_backoff(err_streak))
             };
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -418,6 +798,7 @@ impl Session {
                     // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
                     while wake_rx.try_recv().is_ok() {}
                     forced = Some(ip);
+                    hot_until = Instant::now() + HOT_WINDOW;
                 }
             }
         }
@@ -443,14 +824,9 @@ async fn answer_punch(
     }
     {
         let mut table = peers.lock().await;
-        let state = table.entry(from.to_string()).or_insert_with(|| PeerState {
-            name: label.clone(),
-            virtual_ip: ip,
-            connected: false,
-            attempts: 0,
-            last_try: Instant::now(),
-            reported: false,
-        });
+        let state = table
+            .entry(from.to_string())
+            .or_insert_with(|| PeerState::from_parts(label.clone(), ip, String::new()));
         if state.connected {
             return;
         }
@@ -488,42 +864,30 @@ async fn dial_round(
     mesh: &Option<Arc<MeshLinks>>,
     notify: &Notify,
     force: Option<Ipv4Addr>,
+    my_symmetric: bool,
 ) {
-    let targets: Vec<(String, String)> = {
+    let targets: Vec<(String, String, bool)> = {
         let mut table = peers.lock().await;
         let now = Instant::now();
         let mut out = Vec::new();
         for (id, state) in table.iter_mut() {
-            if state.connected {
-                continue;
-            }
             let forced = force.is_some() && state.virtual_ip == force;
             if force.is_some() && !forced {
                 continue;
             }
-            if forced {
-                // 有包要发：不等退避，但 2 秒内不重复拨同一个对端
-                if state.attempts > 0 && now.duration_since(state.last_try) < Duration::from_secs(2)
-                {
-                    continue;
-                }
-            } else {
-                // 双方都拨会各建一条连接；固定由 node_id 小的一方发起
-                if node_id.as_str() >= id.as_str() {
-                    continue;
-                }
-                if state.attempts > 0 && now.duration_since(state.last_try) < state.backoff() {
-                    continue;
-                }
+            if !should_dial(state, node_id.as_str(), id, now, forced) {
+                continue;
             }
             state.attempts += 1;
             state.last_try = now;
-            out.push((id.clone(), state.name.clone()));
+            // 两端都是对称 NAT：打洞几乎不可能成功，失败一次就进入最长冷却
+            let hopeless = my_symmetric && state.nat == "symmetric";
+            out.push((id.clone(), state.name.clone(), hopeless));
         }
         out
     };
 
-    for (target_id, label) in targets {
+    for (target_id, label, hopeless) in targets {
         let Some(target) = NodeId::parse(&target_id) else {
             continue;
         };
@@ -539,13 +903,32 @@ async fn dial_round(
             let reply = match client.connect(&identity, &target).await {
                 Ok(reply) => reply,
                 Err(e) => {
-                    report_failure(&peers, &notify, &target_id, &label, &format!("{e}")).await;
+                    let kind = fail_kind(&e);
+                    report_failure(
+                        &peers,
+                        &notify,
+                        &target_id,
+                        &label,
+                        &format!("{e}"),
+                        kind,
+                        hopeless,
+                    )
+                    .await;
                     return;
                 }
             };
             let addrs = reply.socket_addrs();
             if addrs.is_empty() {
-                report_failure(&peers, &notify, &target_id, &label, "对端没有可用地址").await;
+                report_failure(
+                    &peers,
+                    &notify,
+                    &target_id,
+                    &label,
+                    "对端没有可用地址",
+                    FailKind::Other,
+                    hopeless,
+                )
+                .await;
                 return;
             }
             let ip = reply.target_virtual_ip.parse::<Ipv4Addr>().ok();
@@ -565,7 +948,16 @@ async fn dial_round(
             match result {
                 Ok(conn) => on_connected(&peers, &mesh, &notify, target, label, ip, conn).await,
                 Err(e) => {
-                    report_failure(&peers, &notify, &target_id, &label, &format!("{e}")).await;
+                    report_failure(
+                        &peers,
+                        &notify,
+                        &target_id,
+                        &label,
+                        &format!("{e}"),
+                        FailKind::Other,
+                        hopeless,
+                    )
+                    .await;
                 }
             }
         });
@@ -585,9 +977,7 @@ async fn on_connected(
         let mut table = peers.lock().await;
         match table.get_mut(node_id.as_str()) {
             Some(state) => {
-                state.connected = true;
-                state.attempts = 0;
-                state.reported = false;
+                state.mark_connected();
                 if ip.is_some() {
                     state.virtual_ip = ip;
                 }
@@ -633,11 +1023,18 @@ async fn report_failure(
     node_id: &str,
     label: &str,
     reason: &str,
+    kind: FailKind,
+    hopeless: bool,
 ) {
     let first = {
         let mut table = peers.lock().await;
         match table.get_mut(node_id) {
             Some(state) => {
+                match kind {
+                    // 对端不在线：不再盲连，等 peer_online 通知或下一次注册带回它
+                    FailKind::Offline => state.mark_offline(),
+                    FailKind::Other => state.note_failure(Instant::now(), hopeless),
+                }
                 let first = !state.reported;
                 state.reported = true;
                 first
@@ -645,17 +1042,24 @@ async fn report_failure(
             None => true,
         }
     };
-    if first {
-        notify.say(&format!("· 暂时连不上 {label}：{reason}（会自动重试）"));
-    } else {
+    if !first {
         tracing::debug!("[session] 仍然连不上 {label}: {reason}");
+        return;
+    }
+    match kind {
+        FailKind::Offline => notify.say(&format!("· {label} 当前不在线，它上线后会自动连接")),
+        FailKind::Other if hopeless => notify.say(&format!(
+            "· 暂时连不上 {label}：两端都是对称 NAT，直连基本打不通（会低频重试）"
+        )),
+        FailKind::Other => notify.say(&format!("· 暂时连不上 {label}：{reason}（会自动重试）")),
     }
 }
 
 /// 可用来打洞的候选地址（过滤掉回环、链路本地之类）。
 pub fn candidate_strings(engine: &Engine) -> Vec<String> {
+    // live_candidates：带着周期 STUN 观测到的最新公网映射，而不是启动时那份
     engine
-        .candidates()
+        .live_candidates()
         .iter()
         .filter(|c| c.is_usable() && dialable(&c.addr))
         .map(|c| c.addr.to_string())
@@ -663,13 +1067,19 @@ pub fn candidate_strings(engine: &Engine) -> Vec<String> {
 }
 
 /// 注册时报给服务端的 NAT 类型。
+///
+/// `upnp`：路由器上有确定的端口映射，等同开放；
+/// `cone` / `symmetric`：两台以上 STUN 服务器观测后的映射行为；
+/// `srflx`：只有一台服务器回应，判不了；`host`：STUN 全都不通。
 pub fn nat_type(engine: &Engine) -> &'static str {
     if engine.upnp().is_some() {
-        "upnp"
-    } else if engine.srflx().is_some() {
-        "srflx"
-    } else {
-        "host"
+        return "upnp";
+    }
+    match engine.nat_kind() {
+        NatKind::Cone => "cone",
+        NatKind::Symmetric => "symmetric",
+        NatKind::Unknown if engine.srflx().is_some() => "srflx",
+        NatKind::Unknown => "host",
     }
 }
 
@@ -719,19 +1129,351 @@ mod tests {
         }
     }
 
+    fn state(attempts: u32) -> PeerState {
+        let mut s = PeerState::from_parts(String::new(), None, String::new());
+        s.attempts = attempts;
+        s
+    }
+
+    fn peer(id: &str, online: bool) -> PeerInfo {
+        PeerInfo {
+            node_id: id.to_string(),
+            name: id.to_string(),
+            virtual_ip: String::new(),
+            nat_type: "cone".to_string(),
+            tls_fp: String::new(),
+            candidates: Vec::new(),
+            last_seen: 0,
+            online,
+        }
+    }
+
     #[test]
     fn backoff_grows_and_caps() {
-        let mk = |attempts| PeerState {
-            name: String::new(),
-            virtual_ip: None,
-            connected: false,
-            attempts,
-            last_try: Instant::now(),
-            reported: false,
+        assert_eq!(state(1).backoff(), Duration::from_secs(10));
+        assert_eq!(state(2).backoff(), Duration::from_secs(20));
+        assert_eq!(state(3).backoff(), Duration::from_secs(40));
+        assert_eq!(state(9).backoff(), Duration::from_secs(60));
+    }
+
+    // ---------- 轮询档位 ----------
+
+    fn inputs() -> PollInputs {
+        PollInputs {
+            sleeping: false,
+            hot: false,
+            wanted_unconnected: false,
+            alone: false,
+            idle: false,
+        }
+    }
+
+    #[test]
+    fn unconnected_peer_no_longer_pins_polling_at_hot() {
+        // 旧行为：只要有对端没连上就永远 3 秒。现在要靠"刚发生了事"才进 HOT
+        let wanting = PollInputs {
+            wanted_unconnected: true,
+            ..inputs()
         };
-        assert_eq!(mk(1).backoff(), Duration::from_secs(10));
-        assert_eq!(mk(2).backoff(), Duration::from_secs(20));
-        assert_eq!(mk(3).backoff(), Duration::from_secs(40));
-        assert_eq!(mk(9).backoff(), Duration::from_secs(60));
+        assert_eq!(poll_interval(&wanting), POLL_WARM);
+        let hot = PollInputs {
+            hot: true,
+            wanted_unconnected: true,
+            ..inputs()
+        };
+        assert_eq!(poll_interval(&hot), POLL_HOT);
+    }
+
+    #[test]
+    fn healthy_idle_goes_cold_and_active_stays_warm() {
+        assert_eq!(
+            poll_interval(&PollInputs {
+                idle: true,
+                ..inputs()
+            }),
+            POLL_COLD
+        );
+        assert_eq!(poll_interval(&inputs()), POLL_WARM);
+    }
+
+    #[test]
+    fn alone_polls_warm_not_hot() {
+        // 网络里只有自己：等别人加入，但没必要每 3 秒问一次
+        assert_eq!(
+            poll_interval(&PollInputs {
+                alone: true,
+                idle: true,
+                ..inputs()
+            }),
+            POLL_WARM
+        );
+    }
+
+    #[test]
+    fn sleeping_is_always_cold_even_inside_hot_window() {
+        assert_eq!(
+            poll_interval(&PollInputs {
+                sleeping: true,
+                hot: true,
+                wanted_unconnected: true,
+                ..inputs()
+            }),
+            POLL_COLD
+        );
+    }
+
+    #[test]
+    fn error_backoff_grows_and_caps_at_five_minutes() {
+        let secs: Vec<u64> = (0..9).map(|n| error_backoff(n).as_secs()).collect();
+        assert_eq!(secs, vec![0, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
+
+    // ---------- renew 规划：活链路不能被打断 ----------
+
+    fn renew_inputs() -> RenewInputs {
+        RenewInputs {
+            live: 0,
+            all_lost: false,
+            worst_streak: 0,
+            sleeping: false,
+            since_renew: Duration::from_secs(120),
+            stun_misses: 0,
+        }
+    }
+
+    #[test]
+    fn live_links_are_never_torn_down_by_a_failing_peer() {
+        // 回归：旧代码里，表里有一个打不通的对端 + 其它直连都健康时，
+        // worst_streak >= 3 会触发 renew()，把所有健康直连一起关掉。
+        let plan = plan_renew(&RenewInputs {
+            live: 2,
+            worst_streak: 5,
+            stun_misses: 9,
+            since_renew: Duration::from_secs(10_000),
+            ..renew_inputs()
+        });
+        assert!(!plan.renew);
+        assert!(!plan.clear_backoff);
+    }
+
+    #[test]
+    fn no_links_and_repeated_failures_trigger_renew() {
+        let plan = plan_renew(&RenewInputs {
+            worst_streak: 3,
+            ..renew_inputs()
+        });
+        assert!(plan.renew && plan.clear_backoff && plan.switch_detected);
+    }
+
+    #[test]
+    fn network_switch_triggers_renew() {
+        let plan = plan_renew(&RenewInputs {
+            all_lost: true,
+            ..renew_inputs()
+        });
+        assert!(plan.renew && plan.switch_detected);
+    }
+
+    #[test]
+    fn silent_stun_keepalive_triggers_renew_when_idle() {
+        let plan = plan_renew(&RenewInputs {
+            stun_misses: STUN_MISS_RENEW,
+            ..renew_inputs()
+        });
+        assert!(plan.renew);
+        // 休眠时 STUN 保活是关着的，misses 是陈旧值，不能据此重绑
+        let sleeping = plan_renew(&RenewInputs {
+            stun_misses: STUN_MISS_RENEW,
+            sleeping: true,
+            ..renew_inputs()
+        });
+        assert!(!sleeping.renew);
+    }
+
+    #[test]
+    fn renew_is_rate_limited_but_still_clears_backoff() {
+        let plan = plan_renew(&RenewInputs {
+            all_lost: true,
+            since_renew: Duration::from_secs(5),
+            ..renew_inputs()
+        });
+        assert!(!plan.renew, "刚重绑过，不能连着再绑");
+        assert!(plan.clear_backoff, "但要让对端重试");
+    }
+
+    #[test]
+    fn periodic_renew_only_when_idle_for_long_enough() {
+        let due = plan_renew(&RenewInputs {
+            since_renew: RENEW_EVERY,
+            ..renew_inputs()
+        });
+        assert!(due.renew && !due.switch_detected);
+        assert!(!plan_renew(&renew_inputs()).renew);
+    }
+
+    // ---------- 拨号判定 ----------
+
+    #[test]
+    fn dial_skips_offline_cooling_and_listener_side() {
+        let now = Instant::now();
+        let mut s = state(0);
+        assert!(should_dial(&s, "aaa", "bbb", now, false), "我小，我拨");
+        assert!(!should_dial(&s, "bbb", "aaa", now, false), "我大，等对方拨");
+
+        s.online = false;
+        assert!(!should_dial(&s, "aaa", "bbb", now, false), "离线不盲连");
+        assert!(should_dial(&s, "aaa", "bbb", now, true), "但有包要发时照连");
+
+        s.online = true;
+        s.cool_until = Some(now + Duration::from_secs(60));
+        assert!(!should_dial(&s, "aaa", "bbb", now, false), "冷却中不打扰");
+        assert!(should_dial(
+            &s,
+            "aaa",
+            "bbb",
+            now + Duration::from_secs(61),
+            false
+        ));
+    }
+
+    #[test]
+    fn dial_respects_backoff_and_connected() {
+        let now = Instant::now();
+        let mut s = state(2);
+        s.last_try = now;
+        assert!(!should_dial(&s, "aaa", "bbb", now, false), "退避期内");
+        assert!(should_dial(
+            &s,
+            "aaa",
+            "bbb",
+            now + Duration::from_secs(21),
+            false
+        ));
+        s.connected = true;
+        assert!(!should_dial(
+            &s,
+            "aaa",
+            "bbb",
+            now + Duration::from_secs(99),
+            false
+        ));
+    }
+
+    // ---------- 失败与冷却 ----------
+
+    #[test]
+    fn failures_lead_to_cooldown_with_growing_spans() {
+        let now = Instant::now();
+        let mut s = state(0);
+        for _ in 0..COOL_AFTER_FIRST - 1 {
+            s.note_failure(now, false);
+            assert!(!s.cooling(now));
+        }
+        s.note_failure(now, false);
+        assert!(s.cooling(now));
+        assert_eq!(s.cool_until, Some(now + Duration::from_secs(300)));
+        assert_eq!((s.fails, s.attempts), (0, 0));
+
+        // 冷却过后只给 2 次机会，下一轮冷却翻倍
+        let later = now + Duration::from_secs(301);
+        for _ in 0..COOL_AFTER_REPEAT {
+            s.note_failure(later, false);
+        }
+        assert_eq!(s.cool_until, Some(later + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn cooldown_caps_at_thirty_minutes() {
+        assert_eq!(cooldown(0), Duration::from_secs(300));
+        assert_eq!(cooldown(1), Duration::from_secs(600));
+        assert_eq!(cooldown(2), Duration::from_secs(1200));
+        assert_eq!(cooldown(3), Duration::from_secs(1800));
+        assert_eq!(cooldown(40), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn hopeless_pair_gets_one_try_then_longest_cooldown() {
+        let now = Instant::now();
+        let mut s = state(1);
+        s.note_failure(now, true);
+        assert_eq!(s.cool_until, Some(now + COOLDOWN_MAX));
+    }
+
+    #[test]
+    fn coming_online_or_connecting_clears_penalties() {
+        let now = Instant::now();
+        let mut s = state(4);
+        s.note_failure(now, true);
+        s.mark_offline();
+        s.mark_online();
+        assert!(!s.cooling(now) && s.cool_count == 0 && s.attempts == 0 && s.fails == 0);
+
+        s.note_failure(now, true);
+        s.mark_connected();
+        assert!(s.connected && !s.cooling(now) && s.cool_count == 0);
+    }
+
+    // ---------- 对端表合并 ----------
+
+    #[test]
+    fn peer_list_prunes_vanished_peers_but_keeps_live_links() {
+        let mut table: HashMap<String, PeerState> = HashMap::new();
+        table.insert("gone".into(), state(0));
+        let mut live = state(0);
+        live.connected = true;
+        table.insert("live-but-forgotten".into(), live);
+        table.insert("stay".into(), state(0));
+
+        apply_peer_list(&mut table, &[peer("stay", true)]);
+
+        assert!(!table.contains_key("gone"), "服务端已清掉、又没连着：删除");
+        assert!(table.contains_key("live-but-forgotten"), "链路还在：保留");
+        assert!(table.contains_key("stay"));
+    }
+
+    #[test]
+    fn peer_list_tracks_online_flag_and_reports_new_arrivals() {
+        let mut table: HashMap<String, PeerState> = HashMap::new();
+        // 新出现的在线对端 → new_online
+        assert!(apply_peer_list(&mut table, &[peer("a", true)]).new_online);
+        // 没变化 → 不算
+        assert!(!apply_peer_list(&mut table, &[peer("a", true)]).new_online);
+        // 离线
+        assert!(!apply_peer_list(&mut table, &[peer("a", false)]).new_online);
+        assert!(!table["a"].online);
+        // 又上线：清掉之前的惩罚，并报告
+        table.get_mut("a").unwrap().cool_count = 3;
+        assert!(apply_peer_list(&mut table, &[peer("a", true)]).new_online);
+        assert!(table["a"].online && table["a"].cool_count == 0);
+    }
+
+    #[test]
+    fn new_offline_peer_is_known_but_not_wanted() {
+        let mut table: HashMap<String, PeerState> = HashMap::new();
+        let change = apply_peer_list(&mut table, &[peer("off", false)]);
+        assert!(!change.new_online);
+        assert!(!table["off"].online);
+    }
+
+    #[test]
+    fn old_worker_without_online_field_defaults_to_online() {
+        let json = r#"{"node_id":"abc","name":"n"}"#;
+        let p: PeerInfo = serde_json::from_str(json).unwrap();
+        assert!(p.online, "老 Worker 不返回 online：按在线处理，保持旧行为");
+    }
+
+    #[test]
+    fn failure_kind_follows_server_error_code() {
+        let mk = |code: &str| {
+            anyhow::Error::new(SignalError {
+                status: 410,
+                code: code.to_string(),
+                message: String::new(),
+            })
+        };
+        assert_eq!(fail_kind(&mk("target_offline")), FailKind::Offline);
+        assert_eq!(fail_kind(&mk("target_not_found")), FailKind::Offline);
+        assert_eq!(fail_kind(&mk("target_stale")), FailKind::Other);
+        assert_eq!(fail_kind(&anyhow::anyhow!("timeout")), FailKind::Other);
     }
 }

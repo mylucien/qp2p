@@ -16,10 +16,11 @@ use anyhow::{Context, Result};
 use quinn::Connection;
 use tokio::time::Instant;
 
-use crate::candidate::Candidate;
+use crate::candidate::{normalize, Candidate, CandidateKind};
 use crate::identity::{Identity, NodeId};
 use crate::peer::{punch, Role};
 use crate::socket;
+use crate::stun_watch;
 use crate::tls::TlsIdentity;
 use crate::upnp;
 
@@ -61,6 +62,28 @@ pub struct Engine {
     /// UPnP 映射句柄，退出/刷新时负责删除
     mapping: Option<upnp::Mapping>,
     renewer: Option<tokio::task::JoinHandle<()>>,
+    /// 周期性 STUN 保活：刷新映射、发现端口变化、持续判定 NAT 行为
+    stun_shared: Arc<stun_watch::Shared>,
+    stun_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// 把 `Bound` 里的 STUN 旁路接到保活任务上。
+fn start_stun_watch(
+    bound: &mut socket::Bound,
+    servers: &[String],
+    generation: u64,
+) -> (Arc<stun_watch::Shared>, Option<tokio::task::JoinHandle<()>>) {
+    let shared = stun_watch::Shared::new(bound.srflx, bound.nat, generation);
+    let task = bound.stun_rx.take().map(|rx| {
+        stun_watch::spawn(
+            bound.keepalive.clone(),
+            servers.to_vec(),
+            bound.stun_targets.clone(),
+            rx,
+            shared.clone(),
+        )
+    });
+    (shared, task)
 }
 
 impl Engine {
@@ -77,9 +100,10 @@ impl Engine {
     ) -> Result<Self> {
         let identity = crate::identity::Identity::load_or_create(data_dir)?;
         let tls = TlsIdentity::load_or_create(data_dir)?;
-        let bound = socket::bind(bind_addr, stun_servers, &tls).await?;
+        let mut bound = socket::bind(bind_addr, stun_servers, &tls).await?;
         let mapping = bound.mapping.clone();
         let renewer = start_upnp_renewer(mapping.clone());
+        let (stun_shared, stun_task) = start_stun_watch(&mut bound, stun_servers, 0);
 
         Ok(Self {
             endpoint: Some(bound.endpoint),
@@ -96,6 +120,8 @@ impl Engine {
             tls,
             mapping,
             renewer,
+            stun_shared,
+            stun_task,
         })
     }
 
@@ -167,8 +193,51 @@ impl Engine {
         self.local_addr
     }
 
+    /// 当前公网映射：周期 STUN 观测到的最新值，没有就退回启动时的探测结果。
     pub fn srflx(&self) -> Option<SocketAddr> {
-        self.srflx
+        self.stun_shared.snapshot().mapped.or(self.srflx)
+    }
+
+    /// 实时候选地址：启动时的内网 / UPnP 候选 + 最新的 STUN 映射。
+    ///
+    /// 周期保活发现映射变化后，[`Engine::candidates`] 里的 srflx 就过期了；
+    /// 登记到信令用这个。
+    pub fn live_candidates(&self) -> Vec<Candidate> {
+        let mut list: Vec<Candidate> = self
+            .candidates
+            .iter()
+            .filter(|c| c.kind != CandidateKind::Srflx)
+            .cloned()
+            .collect();
+        if let Some(addr) = self.srflx() {
+            list.push(Candidate::new(CandidateKind::Srflx, addr));
+        }
+        normalize(list)
+    }
+
+    /// 周期 STUN 保活开关。外壳在"没有任何直连且没休眠"时打开。
+    pub fn stun_set_active(&self, on: bool) {
+        self.stun_shared.set_active(on);
+    }
+
+    /// 公网映射每变一次加一，用来判断要不要重新登记。
+    pub fn stun_generation(&self) -> u64 {
+        self.stun_shared.snapshot().generation
+    }
+
+    /// 连续多少轮 STUN 保活没有任何服务器回应。
+    pub fn stun_misses(&self) -> u32 {
+        self.stun_shared.misses()
+    }
+
+    /// 调整保活间隔（测试用；默认 25 秒）。
+    pub fn stun_set_interval(&self, interval: Duration) {
+        self.stun_shared.set_interval(interval);
+    }
+
+    /// 本机 NAT 的映射行为。
+    pub fn nat_kind(&self) -> crate::stun::NatKind {
+        self.stun_shared.snapshot().kind
     }
 
     pub fn upnp(&self) -> Option<SocketAddr> {
@@ -185,6 +254,9 @@ impl Engine {
     /// 路由器上就留一条指向空气的映射。CLI 退出前应当显式调用这个方法。
     pub async fn shutdown(&mut self) {
         if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stun_task.take() {
             task.abort();
         }
         if let Some(mapping) = self.mapping.take() {
@@ -208,6 +280,9 @@ impl Engine {
     pub async fn renew(&mut self) -> Result<()> {
         // 旧映射先撤掉：换了端口之后它指向的是一个已经没人监听的端口
         if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stun_task.take() {
             task.abort();
         }
         if let Some(old) = self.mapping.take() {
@@ -258,9 +333,16 @@ impl Engine {
         }
     }
 
-    fn install(&mut self, bound: socket::Bound) {
+    fn install(&mut self, mut bound: socket::Bound) {
         self.mapping = bound.mapping.clone();
         self.renewer = start_upnp_renewer(self.mapping.clone());
+        // generation 沿用并加一：外壳比较它判断"映射变了没"，重置回 0 会和旧值撞车
+        let next_generation = self.stun_shared.snapshot().generation + 1;
+        let was_active = self.stun_shared.is_active_flag();
+        let (shared, task) = start_stun_watch(&mut bound, &self.stun, next_generation);
+        shared.set_active(was_active);
+        self.stun_shared = shared;
+        self.stun_task = task;
 
         // 新端点的默认客户端配置是"不钉扎"，这里把用户的钉扎重新贴回去
         let mut endpoint = bound.endpoint;
@@ -428,6 +510,9 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(task) = self.renewer.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stun_task.take() {
             task.abort();
         }
         // 兜底：正常退出应当显式调用 shutdown().await，这里只处理被遗忘的情况

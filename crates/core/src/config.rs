@@ -159,10 +159,17 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// 默认 STUN 服务器。
+///
+/// 不放 Google：`stun.l.google.com` 在部分地区不可达。Cloudflare 全球可用，
+/// 再配两台国内公共服务（小米、哔哩哔哩）。探测是并行的，不可达的只是没有回应，
+/// 不会拖慢启动；至少要有两台**不同 IP** 的回应才能判定 NAT 类型。
+/// 公共服务没有 SLA，网络受限的环境建议在配置里加上自己的服务器（`stun = [...]`）。
 fn default_stun() -> Vec<String> {
     vec![
         "stun.cloudflare.com:3478".to_string(),
-        "stun.l.google.com:19302".to_string(),
+        "stun.miwifi.com:3478".to_string(),
+        "stun.chat.bilibili.com:3478".to_string(),
     ]
 }
 
@@ -301,7 +308,11 @@ mod tests {
         assert_eq!(config.listen, format!("0.0.0.0:{}", crate::DEFAULT_PORT));
         assert!(config.upnp);
         assert!(config.network.is_none());
-        assert_eq!(config.stun.len(), 2);
+        assert_eq!(config.stun.len(), 3);
+        assert!(
+            config.stun.iter().all(|s| !s.contains("google")),
+            "默认列表不应依赖在部分地区不可达的 Google"
+        );
     }
 
     #[test]

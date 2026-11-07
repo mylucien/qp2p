@@ -21,6 +21,7 @@ pub mod session;
 pub mod signal;
 pub mod socket;
 pub mod stun;
+pub mod stun_watch;
 pub mod tls;
 pub mod upnp;
 
