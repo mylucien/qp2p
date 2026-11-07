@@ -108,6 +108,14 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  // 登录失败计数：放在 D1 里，不随 isolate 回收清零
+  `CREATE TABLE IF NOT EXISTS login_attempts (
+    key        TEXT PRIMARY KEY,
+    fails      INTEGER NOT NULL,
+    first_at   INTEGER NOT NULL,
+    last_at    INTEGER NOT NULL,
+    locked_until INTEGER NOT NULL DEFAULT 0
+  )`,
   // 老库补列必须放在建表之后：新库上 ALTER 会报 no such table
   `ALTER TABLE nodes ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE admin_actions ADD COLUMN actor TEXT NOT NULL DEFAULT ''`,
@@ -941,30 +949,97 @@ async function adminBootstrap(request, env) {
   return loginResponse(request, env, username);
 }
 
-// 登录失败计数：每个 isolate 内存里各算各的，只是防在线爆破的第一道门槛
+// 登录爆破防护：内存挡一层（isolate 内），D1 挡一层（跨 isolate、跨实例）。
+//
+// 策略按"连续失败次数"阶梯锁定，键有两个维度：
+//   - user:<用户名>   全局锁定，防换 IP 继续爆破同一个账号
+//   - ip:<ip>|<用户名>  单来源锁定，防同一台机器换账号扫
+const LOGIN_WINDOW_MS = 60 * 60_000; // 1 小时没再失败就重新计数
 const loginFails = new Map();
-const LOGIN_WINDOW_MS = 5 * 60_000;
-const LOGIN_MAX_FAILS = 8;
 
-function loginBlocked(ip, username) {
-  const slot = loginFails.get(`${ip}|${username}`);
-  if (!slot) return false;
-  if (Date.now() - slot.start > LOGIN_WINDOW_MS) {
-    loginFails.delete(`${ip}|${username}`);
-    return false;
-  }
-  return slot.count >= LOGIN_MAX_FAILS;
+function lockSecondsFor(fails) {
+  if (fails >= 20) return 3600;
+  if (fails >= 12) return 900;
+  if (fails >= 8) return 300;
+  if (fails >= 5) return 60;
+  return 0;
 }
 
-function noteLoginFail(ip, username) {
-  const key = `${ip}|${username}`;
-  const slot = loginFails.get(key);
-  if (!slot || Date.now() - slot.start > LOGIN_WINDOW_MS) {
-    if (loginFails.size > 2048) loginFails.clear();
-    loginFails.set(key, { start: Date.now(), count: 1 });
+async function getAttempt(env, key) {
+  if ((await ready(env)) === "memory") return memory.attempts.get(key) ?? null;
+  return env.DB.prepare("SELECT * FROM login_attempts WHERE key = ?").bind(key).first();
+}
+
+async function putAttempt(env, row) {
+  if ((await ready(env)) === "memory") {
+    memory.attempts.set(row.key, { ...row });
     return;
   }
-  slot.count += 1;
+  await env.DB.prepare(
+    `INSERT INTO login_attempts (key, fails, first_at, last_at, locked_until)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       fails = excluded.fails,
+       first_at = excluded.first_at,
+       last_at = excluded.last_at,
+       locked_until = excluded.locked_until`,
+  )
+    .bind(row.key, row.fails, row.first_at, row.last_at, row.locked_until)
+    .run();
+}
+
+async function clearAttempt(env, key) {
+  if ((await ready(env)) === "memory") {
+    memory.attempts.delete(key);
+    return;
+  }
+  await env.DB.prepare("DELETE FROM login_attempts WHERE key = ?").bind(key).run();
+}
+
+/** 距离解锁还有多少秒；0 表示没锁。 */
+async function lockedFor(env, username, ip) {
+  const now = Date.now();
+  for (const key of [`user:${username}`, `ip:${ip}|${username}`]) {
+    const row = await getAttempt(env, key);
+    if (!row) continue;
+    if (Number(row.locked_until) > now) {
+      return Math.ceil((Number(row.locked_until) - now) / 1000);
+    }
+  }
+  return 0;
+}
+
+async function noteFailure(env, username, ip) {
+  const now = Date.now();
+  let longest = 0;
+  for (const key of [`user:${username}`, `ip:${ip}|${username}`]) {
+    const row = await getAttempt(env, key);
+    const fresh =
+      !row || now - Number(row.last_at) > LOGIN_WINDOW_MS
+        ? { key, fails: 0, first_at: now, last_at: now, locked_until: 0 }
+        : { ...row };
+    fresh.fails = Number(fresh.fails) + 1;
+    fresh.last_at = now;
+    const lock = lockSecondsFor(fresh.fails);
+    fresh.locked_until = lock > 0 ? now + lock * 1000 : 0;
+    if (lock > longest) longest = lock;
+    await putAttempt(env, fresh);
+  }
+  // 内存里再记一份，下一轮同 isolate 的请求不用查 D1 就能挡住
+  const slot = loginFails.get(`${ip}|${username}`);
+  if (!slot || now - slot.start > LOGIN_WINDOW_MS) {
+    if (loginFails.size > 2048) loginFails.clear();
+    loginFails.set(`${ip}|${username}`, { start: now, count: 1 });
+  } else {
+    slot.count += 1;
+  }
+  return longest;
+}
+
+async function clearFailures(env, username, ip) {
+  loginFails.delete(`${ip}|${username}`);
+  await clearAttempt(env, `user:${username}`);
+  await clearAttempt(env, `ip:${ip}|${username}`);
 }
 
 async function adminLogin(request, env) {
@@ -974,8 +1049,12 @@ async function adminLogin(request, env) {
   const ip = request.headers.get("cf-connecting-ip") ?? "local";
 
   if (!username || !password) return err(400, "missing_credentials", "填用户名和密码");
-  if (loginBlocked(ip, username)) {
-    return err(429, "too_many_attempts", "密码错误次数太多，5 分钟后再试");
+
+  const wait = await lockedFor(env, username, ip);
+  if (wait > 0) {
+    const res = err(429, "too_many_attempts", `尝试过于频繁，请 ${wait} 秒后再试`);
+    res.headers.set("retry-after", String(wait));
+    return res;
   }
 
   const user = await getAdminUser(env, username);
@@ -985,12 +1064,17 @@ async function adminLogin(request, env) {
   const hash = await pbkdf2Hex(password, salt, iterations);
   const ok = Boolean(user) && timingSafeEqual(hash, user.hash);
   if (!ok) {
-    noteLoginFail(ip, username);
-    await audit(env, "login.failed", username, ip);
+    const lock = await noteFailure(env, username, ip);
+    await audit(env, "login.failed", username, ip, lock > 0 ? `已锁定 ${lock} 秒` : "");
+    if (lock > 0) {
+      const res = err(429, "too_many_attempts", `失败次数过多，锁定 ${lock} 秒`);
+      res.headers.set("retry-after", String(lock));
+      return res;
+    }
     return err(401, "bad_credentials", "用户名或密码不对");
   }
 
-  loginFails.delete(`${ip}|${username}`);
+  await clearFailures(env, username, ip);
   await audit(env, "login.ok", username, "", username);
   return loginResponse(request, env, username);
 }
@@ -1517,6 +1601,7 @@ const memory = {
   nonces: new Map(),
   reservations: new Map(),
   admins: new Map(),
+  attempts: new Map(),
   audit: [],
   seq: 0,
 };
@@ -2274,6 +2359,9 @@ async function sweep(env) {
   ).run();
   await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
     .bind(now - NONCE_TTL_MS)
+    .run();
+  await env.DB.prepare("DELETE FROM login_attempts WHERE last_at < ?")
+    .bind(now - 24 * 60 * 60_000)
     .run();
   return meta?.changes ?? 0;
 }

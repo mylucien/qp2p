@@ -329,6 +329,29 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
   https://你的-worker/v1/admin/password/reset
 ```
 
+### 防止别人爆破密码
+
+登录失败按「连续次数」阶梯锁定，两个维度同时生效：
+
+| 连续失败 | 锁定 |
+|---|---|
+| 5 次 | 60 秒 |
+| 8 次 | 5 分钟 |
+| 12 次 | 15 分钟 |
+| 20 次 | 60 分钟 |
+
+- `user:<用户名>`：**全局**锁定，换 IP 也挡得住；
+- `ip:<ip>|<用户名>`：单来源锁定，防同一台机器换账号扫；
+- 计数存在 D1（`login_attempts` 表），不随 isolate 回收清零；
+- 登录成功立刻清零；每次失败都进审计（带 IP 和锁定秒数）；
+- 锁定期间返回 `429` 并带 `Retry-After` 头；
+- 密码哈希本身是 10 万轮 PBKDF2，即使库泄漏也难以离线爆破。
+
+再往上还有两层可选的 Cloudflare 原生能力：
+
+1. **Cloudflare Access**（免费版最多 50 用户）：在 `/admin*` 前加一层身份验证，未登录连页面都打不开，是最彻底的做法；
+2. **WAF → Rate limiting rule**：对 `/v1/admin/login` 单独限速（比如 10 次/分钟/IP），在到达 Worker 之前就挡掉。
+
 页面上能做的事：
 
 | 功能 | 说明 |

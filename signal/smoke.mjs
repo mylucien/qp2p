@@ -980,6 +980,47 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     });
     check("重置后新密码可登录", resetLogin.status === 200, resetLogin.body);
 
+    // 爆破防护：3 次失败后成功登录应清零计数
+    for (let i = 0; i < 3; i += 1) {
+      await call("POST", "/v1/admin/login", {
+        body: { username: "admin", password: "definitely-wrong" },
+      });
+    }
+    const afterThree = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "resetpassword1" },
+    });
+    check("失败几次后仍可正常登录", afterThree.status === 200, afterThree.body);
+
+    const stillOpen = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "definitely-wrong" },
+    });
+    check("成功登录会清零失败计数", stillOpen.status === 401, stillOpen.body);
+
+    // 再连续失败 4 次（累计 5 次）应触发 60 秒锁定
+    for (let i = 0; i < 3; i += 1) {
+      await call("POST", "/v1/admin/login", {
+        body: { username: "admin", password: "definitely-wrong" },
+      });
+    }
+    const locked = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "definitely-wrong" },
+    });
+    check(
+      "连续失败 5 次触发锁定",
+      locked.status === 429 && locked.body.error === "too_many_attempts",
+      locked.body,
+    );
+
+    const lockedEvenCorrect = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "resetpassword1" },
+    });
+    check("锁定期间密码正确也拒绝", lockedEvenCorrect.status === 429, lockedEvenCorrect.body);
+
+    const otherUser = await call("POST", "/v1/admin/login", {
+      body: { username: "someone-else", password: "whatever-123" },
+    });
+    check("锁定只影响该账号", otherUser.status === 401, otherUser.body);
+
     const auditAfter = await call("GET", "/v1/admin/audit?limit=50", { admin: secret });
     const loginActions = (auditAfter.body.actions ?? []).map((a) => a.action);
     check("审计记录登录与账号操作", loginActions.includes("login.ok") && loginActions.includes("admin.password"), loginActions);
