@@ -1001,6 +1001,27 @@ fn cmd_gui(args: &[String]) -> Result<()> {
     }
 }
 
+/// 等 Ctrl+C 或 SIGTERM，任一到达就算该退出了。
+///
+/// procd / systemd 停服务发的是 SIGTERM，不是 SIGINT。只等 Ctrl+C 的话，
+/// 进程会在 term_timeout 后被 SIGKILL，来不及给服务端发下线通知，
+/// 对端要等约 2 分钟才把它标成离线。
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+        // 注册失败（极少见）就退化成只等 Ctrl+C
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn cmd_up(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
     if flags.flag("help") {
@@ -1180,7 +1201,7 @@ async fn cmd_up(args: &[String]) -> Result<()> {
     println!("\n已上线（Ctrl+C 退出）。直连建立时会打印对端名字和延迟。");
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\n收到中断，正在退出…"),
+        _ = shutdown_signal() => println!("\n收到中断，正在退出…"),
         _ = &mut task => println!("信令循环意外结束"),
     }
     task.abort();
@@ -1191,8 +1212,12 @@ async fn cmd_up(args: &[String]) -> Result<()> {
             println!("已断开 {count} 条直连");
         }
     }
-    if let Err(e) = client.leave(&identity).await {
-        println!("（下线通知没发出去，服务端会在 2 分钟后把它当成离线：{e}）");
+    // 下线通知限 3 秒：请求本身允许 15 秒，但 procd/systemd 通常只等 5 秒就
+    // SIGKILL，卡在通知上不如干脆放弃——服务端 2 分钟后本来也会把它判成离线。
+    match tokio::time::timeout(Duration::from_secs(3), client.leave(&identity)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => println!("（下线通知没发出去，服务端会在 2 分钟后把它当成离线：{e}）"),
+        Err(_) => println!("（下线通知超时，服务端会在 2 分钟后把它当成离线）"),
     }
     engine.write().await.shutdown().await;
     Ok(())
