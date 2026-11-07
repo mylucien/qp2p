@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-android"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "jni",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "qp2p-core",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
