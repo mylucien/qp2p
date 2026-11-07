@@ -1,31 +1,29 @@
-//! `qp2p gui`：本地配置界面。
+//! `qp2p gui` 的界面状态（仅 Windows 使用）。
 //!
-//! 不引入任何 GUI 依赖：起一个只监听 127.0.0.1 的迷你 HTTP 服务，把内置页面
-//! 交给系统浏览器打开。好处是单文件、无运行时依赖、中文渲染由浏览器负责；
-//! "连接"按钮实际是拉起本进程的 `up` 子命令，日志通过管道回传，断开就是 kill。
-//!
-//! 安全边界：只绑 127.0.0.1，并且校验 Host 头，防止 DNS rebinding 从网页里
-//! 反过来操控本机隧道。
+//! 这里只负责"配置 + 子进程 + 状态快照"这块与界面无关的逻辑：
+//! 起停 `up` 子进程、把日志/直连/告警维护成可以随时读的快照。
+//! 真正的窗口和托盘在 `win_gui`，Linux 上没有图形界面，直接用命令行。
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use qp2p_core::config::{parse_token, Config, Network};
 
-const PAGE: &str = include_str!("gui.html");
 const MAX_LOG: usize = 600;
 
 pub(crate) struct Shared {
     child: Option<Child>,
     log: VecDeque<String>,
+    /// 累计写入的日志行数（只增不减）：原生界面靠它算"还有哪几行没显示"，
+    /// 环形缓冲满了之后也不会漏
+    log_total: u64,
     /// 名称 → (虚拟地址, 延迟)
     links: BTreeMap<String, (String, String)>,
     status: String,
@@ -39,278 +37,109 @@ pub(crate) type State = Arc<Mutex<Shared>>;
 
 pub fn run(args: &[String]) -> Result<()> {
     let flags = crate::Flags::parse(args)?;
-    let data_dir = crate::data_dir(&flags).context("没有可用的数据目录")?;
-    let config_path = crate::config_path(&flags);
+    let state = build_state(&flags)?;
+    crate::win_gui::run(state)
+}
+
+fn build_state(flags: &crate::Flags) -> Result<State> {
+    let data_dir = crate::data_dir(flags).context("没有可用的数据目录")?;
+    let config_path = crate::config_path(flags);
     std::fs::create_dir_all(&data_dir).ok();
 
     let config = Config::load(&config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let state: State = Arc::new(Mutex::new(Shared {
+    Ok(Arc::new(Mutex::new(Shared {
         child: None,
         log: VecDeque::new(),
+        log_total: 0,
         links: BTreeMap::new(),
         status: "未连接".to_string(),
         warn: None,
         config,
         config_path,
         data_dir,
-    }));
-
-    let port = flags
-        .get("port")
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(0);
-    let listener = bind_local(port)?;
-    let addr = listener.local_addr()?;
-    let port = addr.port();
-    let url = format!("http://127.0.0.1:{port}/");
-
-    println!("qp2p 配置界面：{url}");
-    println!("（关掉浏览器不会断开；托盘图标右键可连接/断开/退出）");
-
-    {
-        let state = state.clone();
-        std::thread::spawn(move || serve(listener, state));
-    }
-    open_browser(&url);
-
-    #[cfg(windows)]
-    {
-        if let Err(e) = crate::tray::run(state.clone(), port) {
-            eprintln!("[gui] 托盘不可用：{e:#}（界面仍可通过 {url} 访问，Ctrl+C 退出）");
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
-    }
+    })))
 }
 
-/// 托盘悬停提示：状态 + 直连条数。
-#[cfg(windows)]
-pub(crate) fn status_text(state: &State) -> String {
+// ---------------------------------------------------------------------------
+// 原生界面（Windows）取数接口
+// ---------------------------------------------------------------------------
+
+pub(crate) struct FormValues {
+    pub worker: String,
+    pub token: String,
+    pub name: String,
+    pub ip: String,
+    pub mtu: u16,
+    pub idle: u64,
+}
+
+pub(crate) fn form_values(state: &State) -> FormValues {
     let guard = state.lock().expect("state 锁中毒");
-    let links = guard.links.len();
-    if links > 0 {
-        format!("qp2p · {} · {} 条直连", guard.status, links)
-    } else {
-        format!("qp2p · {}", guard.status)
+    let net = guard.config.network.as_ref();
+    FormValues {
+        worker: guard.config.worker.clone().unwrap_or_default(),
+        token: net.map(|n| n.token.clone()).unwrap_or_default(),
+        name: guard.config.node_name.clone(),
+        ip: net.and_then(|n| n.virtual_ip.clone()).unwrap_or_default(),
+        mtu: guard.config.mtu.unwrap_or(1400),
+        idle: guard.config.idle.unwrap_or(0),
     }
 }
 
-fn serve(listener: TcpListener, state: State) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let state = state.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = handle(stream, state) {
-                        eprintln!("[gui] 请求处理失败: {e:#}");
-                    }
-                });
-            }
-            Err(e) => eprintln!("[gui] accept 失败: {e}"),
-        }
-    }
+/// 表单 → 配置：校验、保存都复用 `save_config`，两条路径行为一致。
+pub(crate) fn apply_form(
+    state: &State,
+    worker: &str,
+    token: &str,
+    name: &str,
+    ip: &str,
+    mtu: u64,
+    idle: u64,
+) -> Result<String> {
+    let body = json!({
+        "worker": worker,
+        "token": token,
+        "name": name,
+        "ip": ip,
+        "mtu": mtu,
+        "idle": idle,
+    });
+    save_config(state, &body)
 }
 
-fn bind_local(preferred: u16) -> Result<TcpListener> {
-    if preferred != 0 {
-        return TcpListener::bind(("127.0.0.1", preferred))
-            .with_context(|| format!("端口 {preferred} 被占用"));
-    }
-    for port in 17878..17888 {
-        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
-            return Ok(l);
-        }
-    }
-    TcpListener::bind(("127.0.0.1", 0)).context("绑定本地端口失败")
-}
-
-fn open_browser(url: &str) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 极简 HTTP
-// ---------------------------------------------------------------------------
-
-fn handle(mut stream: TcpStream, state: State) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-
-    // 读到头部结束
-    loop {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
-            break;
-        }
-    }
-    if buf.is_empty() {
-        return Ok(());
-    }
-
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(buf.len());
-    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-    let mut lines = head.lines();
-    let request_line = lines.next().unwrap_or("").to_string();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-
-    // DNS rebinding 防护：只接受本机 Host
-    let mut host_ok = false;
-    let mut content_length = 0usize;
-    for line in head.lines().skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("host:")
-            && (lower.contains("127.0.0.1") || lower.contains("localhost"))
-        {
-            host_ok = true;
-        }
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
-        }
-    }
-    if !host_ok {
-        return respond(
-            &mut stream,
-            403,
-            "text/plain; charset=utf-8",
-            b"forbidden host",
-        );
-    }
-    let mut body = buf[head_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-
-    let route = path.split('?').next().unwrap_or("/").to_string();
-
-    if method == "GET" && (route == "/" || route == "/index.html") {
-        return respond(
-            &mut stream,
-            200,
-            "text/html; charset=utf-8",
-            PAGE.as_bytes(),
-        );
-    }
-    if method == "GET" && route == "/favicon.ico" {
-        return respond(&mut stream, 204, "text/plain", b"");
-    }
-    if route == "/api/state" {
-        let payload = state_json(&state);
-        return respond_json(&mut stream, 200, &payload.to_string());
-    }
-    if method == "POST" {
-        let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let result = match route.as_str() {
-            "/api/config" => save_config(&state, &value),
-            "/api/connect" => save_config(&state, &value).and_then(|_| spawn_up(&state)),
-            "/api/disconnect" => stop_child(&state),
-            "/api/open-dir" => open_dir(&state),
-            "/api/quit" => {
-                let _ = stop_child(&state);
-                respond_ok(&mut stream, &json!({ "ok": true, "bye": true }))?;
-                std::process::exit(0);
-            }
-            _ => Err(anyhow::anyhow!("未知接口 {route}")),
-        };
-        match result {
-            Ok(msg) => {
-                let payload = json!({ "ok": true, "message": msg, "state": state_json(&state) });
-                return respond_json(&mut stream, 200, &payload.to_string());
-            }
-            Err(e) => {
-                let payload =
-                    json!({ "ok": false, "error": format!("{e:#}"), "state": state_json(&state) });
-                return respond_json(&mut stream, 200, &payload.to_string());
-            }
-        }
-    }
-
-    respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found")
-}
-
-fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> Result<()> {
-    let head = format!(
-        "HTTP/1.1 {code} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn respond_json(stream: &mut TcpStream, code: u16, body: &str) -> Result<()> {
-    respond(
-        stream,
-        code,
-        "application/json; charset=utf-8",
-        body.as_bytes(),
-    )
-}
-
-fn respond_ok(stream: &mut TcpStream, value: &Value) -> Result<()> {
-    respond_json(stream, 200, &value.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// 状态与配置
-// ---------------------------------------------------------------------------
-
-fn state_json(state: &State) -> Value {
+pub(crate) fn is_running(state: &State) -> bool {
     let mut guard = state.lock().expect("state 锁中毒");
     refresh_child(&mut guard);
+    guard.child.is_some()
+}
 
-    let net = guard.config.network.as_ref();
-    json!({
-        "running": guard.child.is_some(),
-        "status": guard.status.clone(),
-        "warn": guard.warn.clone(),
-        "log": guard.log.iter().collect::<Vec<_>>(),
-        "links": guard.links.iter().map(|(name, pair)| {
-            json!({ "name": name, "ip": pair.0, "rtt": pair.1 })
-        }).collect::<Vec<_>>(),
-        "config": {
-            "worker": guard.config.worker.clone().unwrap_or_default(),
-            "token": net.map(|n| n.token.clone()).unwrap_or_default(),
-            "name": guard.config.node_name.clone(),
-            "ip": net.and_then(|n| n.virtual_ip.clone()).unwrap_or_default(),
-            "mtu": guard.config.mtu.unwrap_or(1400),
-            "idle": guard.config.idle.unwrap_or(0),
-            "data_dir": guard.data_dir.display().to_string(),
-        }
-    })
+/// 一次界面刷新的快照。
+pub(crate) struct Tick {
+    pub running: bool,
+    pub status: String,
+    pub warn: Option<String>,
+    /// (名字, 虚拟地址, 延迟)
+    pub links: Vec<(String, String, String)>,
+    /// 累计行数（单调）；和 `log` 的最后 N 行对应
+    pub log_total: u64,
+    pub log: Vec<String>,
+}
+
+pub(crate) fn tick(state: &State) -> Tick {
+    let mut guard = state.lock().expect("state 锁中毒");
+    refresh_child(&mut guard);
+    Tick {
+        running: guard.child.is_some(),
+        status: guard.status.clone(),
+        warn: guard.warn.clone(),
+        links: guard
+            .links
+            .iter()
+            .map(|(name, pair)| (name.clone(), pair.0.clone(), pair.1.clone()))
+            .collect(),
+        log_total: guard.log_total,
+        log: guard.log.iter().cloned().collect(),
+    }
 }
 
 fn save_config(state: &State, body: &Value) -> Result<String> {
@@ -462,6 +291,7 @@ fn push_log(guard: &mut Shared, line: &str) {
         guard.log.pop_front();
     }
     guard.log.push_back(line.to_string());
+    guard.log_total += 1;
 }
 
 fn parse_line(guard: &mut Shared, line: &str) {
@@ -533,18 +363,11 @@ pub(crate) fn stop_child(state: &State) -> Result<String> {
     }
 }
 
-fn open_dir(state: &State) -> Result<String> {
+pub(crate) fn open_dir(state: &State) -> Result<String> {
     let dir = {
         let guard = state.lock().expect("state 锁中毒");
         guard.data_dir.clone()
     };
-    #[cfg(windows)]
-    {
-        Command::new("explorer").arg(&dir).spawn().ok();
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new("xdg-open").arg(&dir).spawn().ok();
-    }
+    Command::new("explorer").arg(&dir).spawn().ok();
     Ok(format!("已打开 {}", dir.display()))
 }

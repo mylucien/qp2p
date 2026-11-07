@@ -23,7 +23,12 @@ serde_json.workspace = true
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
   "Win32_System_LibraryLoader",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# 只在 Windows 目标上真正用；其它平台由 build.rs 里的 target_os 判断跳过
+winresource = "0.1"

@@ -22,9 +22,10 @@ use qp2p_core::signal::client::{extract_token, normalize_worker, SignalClient};
 use qp2p_core::{link, Engine, Role};
 use tokio::sync::RwLock;
 
+#[cfg(windows)]
 mod gui;
 #[cfg(windows)]
-mod tray;
+mod win_gui;
 
 const HELP: &str = "\
 qp2p — 私有组网，没有公网 IP 也能直连
@@ -39,8 +40,8 @@ qp2p — 私有组网，没有公网 IP 也能直连
   qp2p join <令牌> --ip 10.78.0.20             # 顺便指定自己的虚拟地址
   qp2p up
 
-图形界面（Windows 推荐）：
-  qp2p gui             打开配置界面（常驻托盘，右键菜单可连接/断开/退出）
+图形界面（仅 Windows）：
+  qp2p gui             打开原生配置窗口（关掉即收进托盘，右键菜单可连接/断开/退出）
 
 日常命令：
   qp2p status          看本机地址、在线成员、谁连上了
@@ -116,7 +117,7 @@ async fn run(args: &[String]) -> Result<()> {
         Some("create") | Some("new") => cmd_create(&args[1..]).await,
         Some("join") => cmd_join(&args[1..]).await,
         Some("up") => cmd_up(&args[1..]).await,
-        Some("gui") | Some("ui") => gui::run(&args[1..]),
+        Some("gui") | Some("ui") => cmd_gui(&args[1..]),
         Some("status") | Some("peers") => cmd_status(&args[1..]).await,
         Some("token") => cmd_token(&args[1..]),
         Some("rotate") => cmd_rotate(&args[1..]).await,
@@ -944,6 +945,19 @@ async fn cmd_delete(args: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 // up：上线组网
 // ---------------------------------------------------------------------------
+
+/// 图形界面入口：只有 Windows 有原生窗口，其它平台明确告知。
+fn cmd_gui(args: &[String]) -> Result<()> {
+    #[cfg(windows)]
+    {
+        gui::run(args)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        bail!("图形界面只有 Windows 版有。这台机器请用命令行：\n  qp2p join <令牌>   加入网络\n  qp2p up            上线（需要 root）")
+    }
+}
 
 async fn cmd_up(args: &[String]) -> Result<()> {
     let flags = Flags::parse(args)?;
