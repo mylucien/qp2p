@@ -696,6 +696,11 @@ fn show_menu(hwnd: HWND) {
     }
 }
 
+/// 控制台被藏起来时用它报错：否则错误只打在看不见的 stderr 里。
+pub(crate) fn alert(text: &str) {
+    message_box(std::ptr::null_mut(), text);
+}
+
 fn message_box(hwnd: HWND, text: &str) {
     unsafe {
         MessageBoxW(

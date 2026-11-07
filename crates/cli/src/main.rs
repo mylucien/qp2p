@@ -30,6 +30,9 @@ mod win_gui;
 const HELP: &str = "\
 qp2p — 私有组网，没有公网 IP 也能直连
 
+Windows 上双击 qp2p.exe（或直接敲 qp2p 不带参数）就是打开图形界面。
+下面这些是命令行用法，看完加 --help 可以随时再翻。
+
 第一次使用（只有一台机器要建网）：
   qp2p init https://你的-worker.workers.dev    # 填信令地址，顺便检查部署
   qp2p create home                             # 建网络，自动生成并保存加入密钥
@@ -41,7 +44,8 @@ qp2p — 私有组网，没有公网 IP 也能直连
   qp2p up
 
 图形界面（仅 Windows）：
-  qp2p gui             打开原生配置窗口（关掉即收进托盘，右键菜单可连接/断开/退出）
+  qp2p                 不带参数就是打开图形界面（双击 exe 等价）
+  qp2p gui             同上，显式写法（关掉即收进托盘，右键菜单可连接/断开/退出）
 
 日常命令：
   qp2p status          看本机地址、在线成员、谁连上了
@@ -99,9 +103,51 @@ fn main() -> ExitCode {
     }
 }
 
+/// 双击启动时系统会给我们单独开一个控制台窗口；从已有终端里启动时，
+/// 控制台里还挂着那个 shell 进程。只有"里面只有自己"才藏，免得把用户的终端一起藏了。
+#[cfg(windows)]
+fn hide_own_console() -> bool {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pids = [0u32; 4];
+        let count = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
+        if count != 1 {
+            return false;
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+        );
+        true
+    }
+}
+
 async fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
-        None | Some("-h") | Some("--help") | Some("help") => {
+        // 双击 exe（无参数）直接进图形界面：双击时系统会给一个自己的控制台窗口，
+        // 顺手藏掉，别让黑框留在界面后面
+        #[cfg(windows)]
+        None => {
+            let hidden = hide_own_console();
+            let result = cmd_gui(&[]);
+            if hidden {
+                if let Err(e) = &result {
+                    win_gui::alert(&format!("{e:#}"));
+                }
+            }
+            result
+        }
+        #[cfg(not(windows))]
+        None => {
+            print!("{HELP}");
+            Ok(())
+        }
+        Some("-h") | Some("--help") | Some("help") => {
             print!("{HELP}");
             Ok(())
         }
