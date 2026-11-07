@@ -62,7 +62,6 @@ const ID_SAVE: i32 = 111;
 const ID_OPEN_DIR: i32 = 112;
 const ID_HIDE: i32 = 113;
 const ID_STATUS: i32 = 120;
-const ID_LINKS: i32 = 130;
 const ID_LOG: i32 = 131;
 
 const CMD_OPEN: i32 = 1;
@@ -70,10 +69,7 @@ const CMD_CONNECT: i32 = 2;
 const CMD_STOP: i32 = 3;
 const CMD_QUIT: i32 = 4;
 
-// listbox / edit 的消息码，windows-sys 没给这些宏
-const LB_ADDSTRING: u32 = 0x0180;
-const LB_RESETCONTENT: u32 = 0x0184;
-const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
+// edit 的消息码，windows-sys 没给这些宏
 const EM_SETSEL: u32 = 0x00B1;
 const EM_REPLACESEL: u32 = 0x00C2;
 const NIIF_INFO: u32 = 0x0000_0001;
@@ -93,10 +89,8 @@ struct Ui {
     idle: HWND,
     connect: HWND,
     status: HWND,
-    links: HWND,
     log: HWND,
     rendered_log: usize,
-    rendered_links: String,
     /// 是否已经提示过"已收到托盘"
     hinted: bool,
 }
@@ -465,26 +459,15 @@ fn build_ui(state: State, main: HWND, icon: HANDLE, scale: f32) -> Ui {
     );
 
     let status = mk!("STATIC", "未连接", 0, M, 232, 588, 24, ID_STATUS);
-    mk!("STATIC", "直连", 0, M, 264, 60, 18, 0);
-    let links = mk!(
-        "LISTBOX",
-        "",
-        WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
-        M,
-        284,
-        588,
-        96,
-        ID_LINKS,
-    );
-    mk!("STATIC", "日志", 0, M, 390, 60, 18, 0);
+    mk!("STATIC", "日志", 0, M, 264, 60, 18, 0);
     let log = mk!(
         "EDIT",
         "",
         WS_BORDER | WS_VSCROLL | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32,
         M,
-        410,
+        284,
         588,
-        220,
+        340,
         ID_LOG,
     );
 
@@ -506,10 +489,8 @@ fn build_ui(state: State, main: HWND, icon: HANDLE, scale: f32) -> Ui {
         idle,
         connect,
         status,
-        links,
         log,
         rendered_log: 0,
-        rendered_links: String::new(),
         hinted: false,
     }
 }
@@ -571,23 +552,6 @@ fn refresh() {
         set_text(ui.status, &status);
         set_text(ui.connect, if tick.running { "断开" } else { "连接" });
 
-        let joined = tick
-            .links
-            .iter()
-            .map(|(name, ip, rtt)| format!("{name}  {ip}  {rtt}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if joined != ui.rendered_links {
-            unsafe {
-                SendMessageW(ui.links, LB_RESETCONTENT, 0, 0);
-                for (name, ip, rtt) in &tick.links {
-                    let line = wide(&format!("{name}   {ip}   {rtt}"));
-                    SendMessageW(ui.links, LB_ADDSTRING, 0, line.as_ptr() as isize);
-                }
-            }
-            ui.rendered_links = joined;
-        }
-
         // 只追加新行：log 是环形缓冲，靠单调计数算差值才不会漏
         let fresh = tick.log_total.saturating_sub(ui.rendered_log as u64) as usize;
         let fresh = fresh.min(tick.log.len());
@@ -601,8 +565,12 @@ fn refresh() {
         }
         ui.rendered_log = tick.log_total as usize;
 
-        // 托盘悬停提示跟着状态走
-        let tip = format!("qp2p · {}", status);
+        // 托盘悬停提示跟着状态走：直连框删了，条数就放在提示里
+        let tip = if tick.links.is_empty() {
+            format!("qp2p · {status}")
+        } else {
+            format!("qp2p · {status} · {} 条直连", tick.links.len())
+        };
         let mut nid = ui.tray;
         let units: Vec<u16> = tip.encode_utf16().take(127).collect();
         let len = units.len();

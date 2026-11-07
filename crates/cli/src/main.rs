@@ -312,25 +312,13 @@ fn node_name(config: &Config, flags: &Flags) -> String {
         .map(str::to_string)
         .or_else(|| {
             let name = config.node_name.trim();
-            if name.is_empty() || name == "qp2p" {
+            if name.is_empty() || name == qp2p_core::config::LEGACY_PLACEHOLDER_NAME {
                 None
             } else {
                 Some(name.to_string())
             }
         })
-        .unwrap_or_else(hostname)
-}
-
-fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "qp2p".to_string())
-        .chars()
-        .take(32)
-        .collect()
+        .unwrap_or_else(qp2p_core::config::machine_name)
 }
 
 fn data_dir(flags: &Flags) -> Option<PathBuf> {

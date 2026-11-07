@@ -154,7 +154,43 @@ pub struct Forward {
     pub reverse: bool,
 }
 
+/// 老版本把节点名硬编码成 "qp2p"；读到这个占位值就当没设过。
+pub const LEGACY_PLACEHOLDER_NAME: &str = "qp2p";
+
+/// 默认节点名：本机真实主机名。
+///
+/// Windows 有 `COMPUTERNAME`，类 Unix 一般有 `HOSTNAME`，都没有再读
+/// `/etc/hostname`。带域名的只取第一段（`pc.lan` → `pc`），因为这个名字会显示在
+/// 管理页和别的成员的直连日志里，越短越好认。
 fn default_node_name() -> String {
+    machine_name()
+}
+
+/// 本机真实主机名（Windows 取 `COMPUTERNAME`，类 Unix 取 `HOSTNAME`，
+/// 再不行读 `/etc/hostname`）。取不到时退回 `"qp2p"`。
+pub fn machine_name() -> String {
+    fn short(raw: &str) -> Option<String> {
+        let name = raw.trim();
+        let head = name.split('.').next().unwrap_or(name).trim();
+        if head.is_empty() {
+            None
+        } else {
+            Some(head.to_string())
+        }
+    }
+
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(name) = short(&value) {
+                return name;
+            }
+        }
+    }
+    if let Ok(value) = std::fs::read_to_string("/etc/hostname") {
+        if let Some(name) = short(&value) {
+            return name;
+        }
+    }
     "qp2p".to_string()
 }
 
@@ -206,7 +242,12 @@ impl Default for Config {
 
 impl Config {
     pub fn from_toml(source: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(source)?;
+        let mut config: Self = toml::from_str(source)?;
+        // 老配置里节点名是硬编码的占位值 "qp2p"，读到它就换成真实主机名，
+        // 免得升级之后管理页上一排机器都叫 qp2p
+        if config.node_name.trim().is_empty() || config.node_name == LEGACY_PLACEHOLDER_NAME {
+            config.node_name = default_node_name();
+        }
         config.validate()?;
         Ok(config)
     }
