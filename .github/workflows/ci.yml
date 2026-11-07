@@ -84,6 +84,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: qp2p-linux-x86_64-static
             bin: qp2p
+          # ARM64 路由器（OpenWrt 的 aarch64_cortex-a53 一类）用的，同样是静态 musl。
+          # musl-tools 只带 x86_64，aarch64 的编译器从 musl.cc 取。
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: qp2p-linux-aarch64-static
+            bin: qp2p
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: qp2p-windows-x86_64
@@ -103,6 +109,53 @@ jobs:
       - name: 安装 musl 工具链
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+
+      # musl-tools 只有 x86_64 的 musl-gcc，aarch64 得自己准备交叉工具链。
+      # 试过 musl.cc 的预编译包，runner 上连不上（connect 超时 130s+），换成 zig cc：
+      # zig 自带 aarch64 musl 的 libc 和 crt，一条命令就能静态链接，不依赖第三方镜像。
+      - name: 安装 aarch64 musl 工具链（zig cc）
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          ZIG_VER=0.13.0
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz" \
+            -o /tmp/zig.tar.xz
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt
+          sudo ln -sf "/opt/zig-linux-x86_64-${ZIG_VER}/zig" /usr/local/bin/zig
+
+          # cargo 的 linker 只能是一个可执行文件、不能带参数，所以包一层。
+          # cc-rs 还会往编译器里塞 rust 三元组 --target=aarch64-unknown-linux-musl，
+          # zig 不认这个写法（它要 aarch64-linux-musl），在这里换掉。
+          sudo tee /usr/local/bin/zigcc >/dev/null <<'WRAP'
+          #!/bin/sh
+          n=$#
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            a=$1; shift
+            i=$((i + 1))
+            case "$a" in
+              --target=aarch64-unknown-linux-musl) continue ;;
+              aarch64-unknown-linux-musl)         continue ;;
+              # rustc 给 aarch64-linux 加的这个 relax 选项 zig 的驱动不认，去掉
+              -Wl,--fix-cortex-a53-843419)        continue ;;
+            esac
+            set -- "$@" "$a"
+          done
+          exec zig cc -target aarch64-linux-musl "$@"
+          WRAP
+          sudo chmod +x /usr/local/bin/zigcc
+
+          {
+            echo "CC_aarch64_unknown_linux_musl=zigcc"
+            echo "AR_aarch64_unknown_linux_musl=ar"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=zigcc"
+            # 不用 rust 自带的 musl crt/libc，交给 zig 提供的那份，否则两套 crt 会撞
+            echo "RUSTFLAGS=-C link-self-contained=no"
+          } >> "$GITHUB_ENV"
+
+          zig version
+          zigcc --version | head -n1
+          file "$(command -v zigcc)"
 
       - name: Build release
         env:
@@ -195,17 +248,48 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
-  # 只有打 v* 标签才发布。包全部来自本次运行刚编出来的产物，
-  # 不从别处下载、不在本地上传，保证 Release 里的文件和 tag 指向的代码是同一份。
+  # 每次 push 都发布：打 v* 标签发正式版，推到 main 发预发布（v<版本>+<构建号>）。
+  # 包全部来自本次运行刚编出来的产物，不从别处下载、不在本地上传。
   release:
-    name: release (${{ github.ref_name }})
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: release
+    if: github.event_name == 'push'
     needs: [test, signal, build, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # --generate-notes 要读提交历史来生成 release notes
+          fetch-depth: 0
+
+      # 版本号只认 Cargo.toml，tag 里的构建号不参与资产命名，
+      # 否则 qp2p-0.1.2+57-linux-aarch64-static 这种名字在 OpenWrt 包里很难对上。
+      - name: 决定版本与标签
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::读不到 Cargo.toml 里的 version"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              echo "tag=$GITHUB_REF_NAME"                 >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"                     >> "$GITHUB_OUTPUT"
+              echo "title=qp2p ${GITHUB_REF_NAME#v}"      >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # run_number 单调递增，天然唯一，不用自己算 sha 前缀
+              echo "tag=v${VERSION}+${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"                      >> "$GITHUB_OUTPUT"
+              echo "title=qp2p ${VERSION} build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       - name: 下载本次构建的全部产物
         uses: actions/download-artifact@v4
@@ -215,49 +299,63 @@ jobs:
 
       - name: 整理成发布文件
         shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
-          if [ ! -f "$NOTES" ]; then
-            echo "::error::缺少 $NOTES，发版前请先写好发布说明"
-            exit 1
-          fi
 
           mkdir -p dist
           cp "artifacts/qp2p-windows-x86_64/qp2p.exe"  "dist/qp2p-${VERSION}-windows-x86_64.exe"
           cp "artifacts/qp2p-linux-x86_64/qp2p"        "dist/qp2p-${VERSION}-linux-x86_64"
           cp "artifacts/qp2p-linux-x86_64-static/qp2p" "dist/qp2p-${VERSION}-linux-x86_64-static"
+          cp "artifacts/qp2p-linux-aarch64-static/qp2p" "dist/qp2p-${VERSION}-linux-aarch64-static"
           APK=$(find artifacts/qp2p-android-apk -name '*.apk' -print -quit)
           if [ -z "$APK" ]; then
             echo "::error::Android 产物里没找到 apk"
             exit 1
           fi
           cp "$APK" "dist/qp2p-${VERSION}-android.apk"
-          chmod +x "dist/qp2p-${VERSION}-linux-x86_64" "dist/qp2p-${VERSION}-linux-x86_64-static"
+          chmod +x "dist/qp2p-${VERSION}-linux-x86_64" "dist/qp2p-${VERSION}-linux-x86_64-static" \
+                   "dist/qp2p-${VERSION}-linux-aarch64-static"
 
           (cd dist && sha256sum qp2p-* > SHA256SUMS.txt)
           ls -lh dist
           cat dist/SHA256SUMS.txt
 
-      # 重跑时 Release 可能已经存在，这时只覆盖附件，不重复创建。
+      # 重跑时 Release 可能已经存在（tag 构建号相同），这时只覆盖附件。
       - name: 创建 Release 并上传
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.title }}
+          PRE: ${{ steps.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
-          TAG="$GITHUB_REF_NAME"
-          NOTES=".github/release-notes/${TAG}.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release 已存在，覆盖附件"
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" \
-              --title "qp2p ${TAG#v}" \
-              --notes-file "$NOTES" \
-              --verify-tag \
-              dist/*
+            NOTES=".github/release-notes/${TAG}.md"
+            if [ "$PRE" = "true" ]; then
+              # 自动构建没有手写说明，用提交记录生成
+              gh release create "$TAG" \
+                --title "$TITLE" \
+                --target "$GITHUB_SHA" \
+                --prerelease \
+                --generate-notes \
+                dist/*
+            else
+              if [ ! -f "$NOTES" ]; then
+                echo "::error::缺少 $NOTES，发版前请先写好发布说明"
+                exit 1
+              fi
+              gh release create "$TAG" \
+                --title "$TITLE" \
+                --notes-file "$NOTES" \
+                --verify-tag \
+                dist/*
+            fi
           fi
           gh release view "$TAG" --json url,tagName,assets --jq \
             '"发布页: " + .url, "资产: " + ([.assets[].name] | join(", "))'
