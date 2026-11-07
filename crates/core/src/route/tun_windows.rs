@@ -26,7 +26,10 @@ type SessionHandle = isize;
 
 type CreateAdapterFn =
     unsafe extern "system" fn(*const u16, *const u16, *const u8) -> AdapterHandle;
-type DeleteAdapterFn = unsafe extern "system" fn(AdapterHandle, i32) -> i32;
+/// wintun 没有 `WintunDeleteAdapter`：0.14 的 API 里关闭适配器就是
+/// `WintunCloseAdapter(adapter)`（void），删除驱动才是 `WintunDeleteDriver()`。
+/// 之前误用了不存在的符号，`GetProcAddress` 返回空，报 os error 127。
+type CloseAdapterFn = unsafe extern "system" fn(AdapterHandle);
 type StartSessionFn = unsafe extern "system" fn(AdapterHandle, u32) -> SessionHandle;
 type EndSessionFn = unsafe extern "system" fn(SessionHandle);
 type GetReadWaitEventFn = unsafe extern "system" fn(SessionHandle) -> HANDLE;
@@ -38,7 +41,7 @@ type SendPacketFn = unsafe extern "system" fn(SessionHandle, *const u8);
 struct WintunApi {
     _lib: Library,
     create_adapter: CreateAdapterFn,
-    delete_adapter: DeleteAdapterFn,
+    close_adapter: CloseAdapterFn,
     start_session: StartSessionFn,
     end_session: EndSessionFn,
     read_wait_event: GetReadWaitEventFn,
@@ -70,7 +73,7 @@ impl WintunApi {
         unsafe {
             Ok(Self {
                 create_adapter: sym(&lib, b"WintunCreateAdapter\0")?,
-                delete_adapter: sym(&lib, b"WintunDeleteAdapter\0")?,
+                close_adapter: sym(&lib, b"WintunCloseAdapter\0")?,
                 start_session: sym(&lib, b"WintunStartSession\0")?,
                 end_session: sym(&lib, b"WintunEndSession\0")?,
                 read_wait_event: sym(&lib, b"WintunGetReadWaitEvent\0")?,
@@ -166,7 +169,7 @@ impl WindowsTun {
         let session = unsafe { (api.start_session)(adapter, RING_CAPACITY) };
         if session == 0 {
             let err = std::io::Error::last_os_error();
-            unsafe { (api.delete_adapter)(adapter, 1) };
+            unsafe { (api.close_adapter)(adapter) };
             return Err(err).context("启动 WinTun 会话失败");
         }
 
@@ -328,7 +331,7 @@ impl Drop for WindowsTun {
         // SAFETY: 句柄来自本结构，且只在这里关闭一次
         unsafe {
             (self.api.end_session)(self.session);
-            (self.api.delete_adapter)(self.adapter, 0);
+            (self.api.close_adapter)(self.adapter);
             if !self.wait_event.is_null() {
                 CloseHandle(self.wait_event);
             }
