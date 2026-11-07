@@ -52,11 +52,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 期望输出：
 
 ```
-✓ Worker 可用
-  版本    : 2.3.0
+✓ Worker 可达
+  版本    : 2.5.0
   存储    : D1（多地域一致）
   管理密钥: 已配置
 ```
+
+这些详情只对带管理密钥的请求返回；不加 `--admin` 只会看到「✓ Worker 可达」和一行提示。
+根路径 `/` 返回 404，不提供任何接口清单。
 
 | 不符合 | 处理 |
 |---|---|
@@ -77,7 +80,6 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 | Windows 10/11 x64 | `qp2p-0.1.2-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
 | Linux x86_64（主流发行版） | `qp2p-0.1.2-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
 | Linux x86_64（老系统/容器） | `qp2p-0.1.2-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.2-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
 | Android 8+ | `qp2p-0.1.2-android.apk` | VpnService，debug 签名 |
 
 下载后先校验：

@@ -324,11 +324,11 @@ impl SignalClient {
 
     // ---- 管理面（只有建网的人需要 ADMIN_SECRET） -------------------------
 
-    /// 检查 Worker 是否可用、是否绑了 D1、有没有配置 ADMIN_SECRET。
+    /// 检查 Worker 是否可用。匿名探测，只拿得到 `ok`。
     ///
     /// 不需要令牌——`qp2p init` 就是要在还没有网络的时候先探一下。
     pub async fn health(&self) -> Result<Health> {
-        health_of(&self.base).await
+        health_of(&self.base, None).await
     }
 
     /// 建一个网络。密钥留空则让服务端生成随机的（更安全）。
@@ -667,12 +667,18 @@ fn is_local_target(base: &str) -> bool {
     }
 }
 
-/// 探测一个 Worker 地址（不需要令牌）。
-pub async fn health_of(worker: &str) -> Result<Health> {
+/// 探测一个 Worker 地址。
+///
+/// 不需要令牌。但服务端只对**带对管理密钥**的请求返回版本、存储、节点数这些
+/// 部署详情，匿名请求只会拿到 `{"ok":true}`——它不该变成公开的资产清单。
+pub async fn health_of(worker: &str, admin: Option<&str>) -> Result<Health> {
     let base = normalize_worker(worker)?;
     let url = format!("{base}/v1/health");
-    let res = build_http_for(&base)?
-        .get(&url)
+    let mut request = build_http_for(&base)?.get(&url);
+    if let Some(secret) = admin {
+        request = request.header("x-admin-secret", secret);
+    }
+    let res = request
         .send()
         .await
         .with_context(|| format!("连不上 {url}（检查地址、本机网络，或换一个能访问的域名）"))?;

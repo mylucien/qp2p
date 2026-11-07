@@ -347,8 +347,12 @@ async fn cmd_init(args: &[String]) -> Result<()> {
         .context("用法：qp2p init https://你的-worker.workers.dev")?;
     let worker = normalize_worker(raw)?;
 
+    // 先读配置：health 的详情要求管理密钥，密钥可能早就存在本机配置里。
+    let (mut config, path) = load_config(&flags)?;
+    let admin_key = admin_of(&config, &flags);
+
     println!("检查 {worker} …");
-    let health = qp2p_core::signal::client::health_of(&worker)
+    let health = qp2p_core::signal::client::health_of(&worker, admin_key.as_deref())
         .await
         .context("这个地址不是可用的 qp2p 信令服务")?;
 
@@ -364,28 +368,32 @@ async fn cmd_init(args: &[String]) -> Result<()> {
         );
     }
 
-    println!("✓ Worker 可用");
-    println!("  版本    : {}", health.version);
-    println!(
-        "  存储    : {}",
-        if health.storage == "d1" {
-            "D1（多地域一致）"
-        } else {
-            "内存（只存在单个实例里，重启就丢）"
-        }
-    );
-    if !health.warning.is_empty() {
-        println!("  注意    : {}", health.warning);
-    }
-    if health.has_admin_secret {
-        println!("  管理密钥: 已配置");
+    println!("✓ Worker 可达");
+    if health.version.is_empty() {
+        // 服务端不公开版本和存储：要么这次没带管理密钥，要么服务端还没配 ADMIN_SECRET。
+        println!("  详情    : 需要管理密钥（加 --admin <密钥>），或登录 /admin 查看");
     } else {
-        println!("  管理密钥: 未配置");
-        println!("            → Cloudflare → Worker → Settings → Variables 添加 ADMIN_SECRET 后重新部署，");
-        println!("              否则建不了网络（成员加入不需要它）");
+        println!("  版本    : {}", health.version);
+        println!(
+            "  存储    : {}",
+            if health.storage == "d1" {
+                "D1（多地域一致）"
+            } else {
+                "内存（只存在单个实例里，重启就丢）"
+            }
+        );
+        if !health.warning.is_empty() {
+            println!("  注意    : {}", health.warning);
+        }
+        if health.has_admin_secret {
+            println!("  管理密钥: 已配置");
+        } else {
+            println!("  管理密钥: 未配置");
+            println!("            → Cloudflare → Worker → Settings → Variables 添加 ADMIN_SECRET 后重新部署，");
+            println!("              否则建不了网络（成员加入不需要它）");
+        }
     }
 
-    let (mut config, path) = load_config(&flags)?;
     config.worker = Some(worker.clone());
     if let Some(admin) = flags.get("admin") {
         config.admin_secret = Some(admin.to_string());

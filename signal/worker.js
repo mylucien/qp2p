@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.4.0";
+const VERSION = "2.5.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -163,7 +163,7 @@ async function route(request, url, env, ctx) {
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = request.method;
 
-  if (path === "/") return landing();
+  // 根路径不提供任何入口说明：外部扫描应该看不出这里跑的是什么服务。
   if (path === "/admin") return adminPage();
   if (path === "/v1/health") return health(request, env);
   if (path === "/v1/admin/status" && method === "GET") return adminStatus(request, env);
@@ -208,40 +208,14 @@ async function route(request, url, env, ctx) {
 // 基础接口
 // ---------------------------------------------------------------------------
 
-async function landing() {
-  const body = [
-    "qp2p signal worker",
-    `version ${VERSION}`,
-    "",
-    "GET  /v1/health",
-    "GET  /admin                       管理页面（账号密码登录）",
-    "GET  /v1/admin/status             是否需要初始化管理员账号",
-    "POST /v1/admin/bootstrap          首次创建管理员（需 ADMIN_SECRET）",
-    "POST /v1/admin/login              用户名 + 密码换 2 小时会话",
-    "POST /v1/admin/password           改自己的密码（需登录）",
-    "POST /v1/admin/password/reset     重置密码（需 X-Admin-Secret）",
-    "POST /v1/admin/networks   需要 X-Admin-Secret，可带 join_key / cidr",
-    "PATCH /v1/admin/networks/<id>     改名字 / 网段",
-    "POST /v1/admin/networks/<id>/rotate   需要 X-Admin-Secret，换加入密钥",
-    "GET  /v1/admin/networks/<id>/nodes    节点列表（在线状态）",
-    "POST /v1/admin/networks/<id>/nodes/<node>/kick   踢下线",
-    "POST /v1/admin/networks/<id>/nodes/kick          批量踢下线",
-    "GET/POST /v1/admin/networks/<id>/reservations     查/加 IP 预留",
-    "DELETE /v1/admin/networks/<id>/reservations/<ip> 释放预留",
-    "GET  /v1/admin/audit              管理操作审计",
-    "POST /v1/join",
-    "POST /v1/register",
-    "POST /v1/connect",
-    "GET  /v1/events?node_id=&since=",
-    "POST /v1/leave",
-  ].join("\n");
-  return new Response(body + "\n", {
-    status: 200,
-    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-  });
-}
-
+/// 健康检查。端点本身公开（监控探活要用），但**匿名只回一个 ok**：
+/// 版本、存储后端、节点数、限额都属于部署细节，只给带对管理密钥的请求。
 async function health(request, env) {
+  const isAdmin =
+    Boolean(env.ADMIN_SECRET) &&
+    timingSafeEqual(request.headers.get("x-admin-secret") ?? "", env.ADMIN_SECRET);
+  if (!isAdmin) return json({ ok: true });
+
   const storage = await ready(env);
   const out = {
     ok: true,
@@ -254,7 +228,7 @@ async function health(request, env) {
   };
 
   if (storage === "d1") {
-    // 计数走 60 秒缓存：health 免鉴权，不能让它变成免费的 D1 读放大器
+    // 计数走 60 秒缓存：COUNT(*) 每次都是一次 D1 读，没必要连查就重算
     const now = Date.now();
     if (!healthCache.at || now - healthCache.at > 60_000) {
       try {

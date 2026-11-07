@@ -160,9 +160,19 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   console.log(`\n=== ${label} ===`);
 
   console.log("\n1. 健康检查");
-  const health = await call("GET", "/v1/health");
-  check("health ok", health.status === 200 && health.body.ok === true, health.body);
+  const anon = await call("GET", "/v1/health");
+  check("匿名可达", anon.status === 200 && anon.body.ok === true, anon.body);
+  check(
+    "匿名看不到版本/存储",
+    anon.body.version === undefined && anon.body.storage === undefined,
+    anon.body,
+  );
+  const health = await call("GET", "/v1/health", { admin: secret });
+  check("带管理密钥看到详情", health.status === 200 && health.body.ok === true, health.body);
   check(`storage=${expectedStorage}`, health.body.storage === expectedStorage, health.body.storage);
+
+  const root = await call("GET", "/");
+  check("根路径不暴露接口清单", root.status === 404, root.body);
 
   console.log("\n2. 建网与加入密钥");
   const noSecret = await call("POST", "/v1/admin/networks", { body: { name: "home" } });

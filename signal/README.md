@@ -12,7 +12,10 @@
    回到 Worker → **Settings → Bindings → Add → D1 database**，变量名必须是 **`DB`**
 4. **Settings → Variables → Add**：名字 **`ADMIN_SECRET`**，值用一串长随机
    （这是管理密钥，只用来建网络、换加入密钥，节点不接触）
-5. 打开 `https://<你的域名>/v1/health`，看到 `"ok": true` 即可
+5. 打开 `https://<你的域名>/v1/health`，看到 `{"ok": true}` 即可
+
+匿名访问 `/v1/health` 只会拿到 `{"ok":true}`；根路径 `/` 故意返回 404，
+不提供任何接口说明，外部扫描看不出这里跑的是什么服务。
 
 表结构在第一次请求时自动建立，不需要手动执行 SQL。
 
@@ -72,7 +75,7 @@ curl -X POST https://<你的域名>/v1/admin/networks/home/rotate \
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/v1/health` | 无 | 状态、存储后端、节点数 |
+| GET | `/v1/health` | 无 / 管理密钥 | 匿名只回 `{"ok":true}`；带 `X-Admin-Secret` 才返回版本、存储后端、节点数、限额 |
 | GET | `/admin` | 页面登录 | 内置管理页面（网络 / 节点 / 预留 / 审计） |
 | POST | `/v1/admin/login` | secret 换 cookie | 签发 2 小时 HttpOnly 会话 |
 | POST | `/v1/admin/logout` | cookie | 清掉会话 |
