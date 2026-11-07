@@ -1,8 +1,10 @@
 //! Windows 的 TUN 设备：WinTun（wintun.dll）+ `netsh` / `route`。
 //!
-//! 需要管理员权限（创建网络适配器）。dll 不随二进制静态链接，运行时按
-//! 「exe 同目录 → PATH」顺序查找；找不到就把下载地址说清楚，而不是抛一个
-//! 看不懂的 LoadLibrary 错误。
+//! 需要管理员权限（创建网络适配器）。**优先用编译时内嵌的 wintun 0.14.1**：
+//! 装过 WireGuard / Tailscale 的机器常在 `C:\Windows\System32` 留一份 0.13X，
+//! 用裸名字加载会命中它——LoadLibrary 成功，但它没有 `WintunCloseAdapter`，
+//! 于是「外部找不到就用内嵌」的回退根本不会触发，最后报 os error 127 并降级成只打洞。
+//! 内嵌那份用独立文件名 + 完整路径加载，彻底绕开系统的 DLL 搜索顺序。
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -17,8 +19,10 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use super::{Cidr, TunConfig, TunDevice};
 
 const WINTUN_DLL: &str = "wintun.dll";
-/// 内嵌的官方 wintun 0.14.1（amd64）。找不到外部 dll 时解到本地目录再用，
-/// 这样只发一个 exe 也能建虚拟网卡。
+/// 内嵌 dll 落盘用的名字。刻意不叫 `wintun.dll`：Windows 加载模块时可能按
+/// 基名复用进程里已加载的同名 dll，换个名字才能确保用的是我们这份。
+const EMBEDDED_DLL_NAME: &str = "wintun-0.14.1.dll";
+/// 内嵌的官方 wintun 0.14.1（amd64）。只发一个 exe 也能建虚拟网卡。
 const EMBEDDED_WINTUN: &[u8] = include_bytes!("../../../../assets/wintun.dll");
 
 /// 内置 dll 的落盘位置：优先 %LOCALAPPDATA%\qp2p（用户可写、不进 Program Files）。
@@ -28,7 +32,8 @@ fn embedded_dll_path() -> Option<PathBuf> {
         .unwrap_or_else(std::env::temp_dir);
     let dir = base.join("qp2p");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(WINTUN_DLL);
+    let path = dir.join(EMBEDDED_DLL_NAME);
+    // 内嵌版本换了就覆盖，避免旧文件一直留在用户目录里。
     let stale = std::fs::read(&path)
         .map(|existing| existing != EMBEDDED_WINTUN)
         .unwrap_or(true);
@@ -73,27 +78,10 @@ struct WintunApi {
 
 impl WintunApi {
     fn load() -> Result<Self> {
-        // 注意：加载失败的报错必须只挂在 Library::new 上。符号缺失是另一种病
-        // （老版本 wintun 0.10 的导出名带 X 后缀），混在一起会把「版本不对」
-        // 误报成「文件没找到」，排查时会绕远路。
-        let lib = unsafe { Library::new(WINTUN_DLL) }
-            .or_else(|e| {
-                // 退一步到 exe 同目录找
-                let beside = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join(WINTUN_DLL)));
-                match beside {
-                    Some(path) if path.exists() => unsafe { Library::new(path) },
-                    _ => Err(e),
-                }
-            })
-            .or_else(|e| {
-                // 再退一步：用编译时内嵌的那份（单文件分发）
-                match embedded_dll_path() {
-                    Some(path) => unsafe { Library::new(path) },
-                    None => Err(e),
-                }
-            })
+        // 注意：加载失败的报错只挂在 load_library 上。符号缺失是另一种病
+        // （系统里装了 0.13X 的旧 dll），混在一起会把「版本不对」误报成
+        // 「文件没找到」，排查时会绕远路。
+        let lib = load_library()
             .with_context(|| format!("加载 {WINTUN_DLL} 失败。{}", download_hint()))?;
 
         // SAFETY: 名字与 wintun.h 一致；dll 生命周期由 self._lib 持有
@@ -114,6 +102,28 @@ impl WintunApi {
     }
 }
 
+/// 优先加载编译期内嵌的 0.14.1，解不出来才按老顺序找外部 dll。
+///
+/// 顺序不能反：`Library::new("wintun.dll")` 走 Windows 的 DLL 搜索路径，
+/// System32 里那份 0.13X 会**加载成功**（只是没有 0.14 的符号），
+/// 于是「外部找不到就用内嵌」的回退永远不触发，用户只看到降级为只打洞。
+fn load_library() -> std::result::Result<Library, libloading::Error> {
+    if let Some(lib) = embedded_dll_path().and_then(|path| unsafe { Library::new(&path) }.ok()) {
+        tracing::debug!("[tun] 使用内嵌 wintun 0.14.1");
+        return Ok(lib);
+    }
+    // 内嵌那份解不出来，才按老顺序找外部 dll
+    unsafe { Library::new(WINTUN_DLL) }.or_else(|e| {
+        let beside = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(WINTUN_DLL)));
+        match beside {
+            Some(path) if path.exists() => unsafe { Library::new(path) },
+            _ => Err(e),
+        }
+    })
+}
+
 /// 按名字取导出函数；缺失时给出「版本太老」的提示而不是裸的GetProcAddress 错误。
 ///
 /// `lib.get` 返回 `Symbol<T>`（Deref 到 T），函数指针都是 Copy，
@@ -123,14 +133,15 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
         .map(|s| *s)
         .with_context(|| {
             format!(
-                "wintun.dll 里没有 {}。多半是版本太老（wintun 0.10 的导出名带 X 后缀），请换 wintun.net 的 0.14+ amd64 版",
+                "加载的 wintun.dll 里没有 {}。多半是系统里装了 0.13X 或更老的版本（例如 C:\\Windows\\System32\\wintun.dll），需要 wintun.net 的 0.14+ amd64 版",
                 String::from_utf8_lossy(&name[..name.len() - 1])
             )
         })
 }
 
 fn download_hint() -> &'static str {
-    "把 wintun.dll（https://www.wintun.net/ ，选 amd64）放到 qp2p.exe 同目录或 PATH"
+    "程序自带 wintun 0.14.1，正常无需另装 dll；若 %LOCALAPPDATA%\\qp2p 不可写， \
+     可把 wintun.net 的 0.14+ amd64 版 wintun.dll 放到 qp2p.exe 同目录"
 }
 
 /// 当前进程是否以管理员身份运行。
@@ -174,9 +185,8 @@ impl WindowsTun {
             );
         }
 
-        tracing::debug!("[tun] 加载 {WINTUN_DLL}");
-        let api = WintunApi::load()
-            .with_context(|| format!("加载 {WINTUN_DLL} 失败。{}", download_hint()))?;
+        tracing::debug!("[tun] 加载 WinTun");
+        let api = WintunApi::load()?;
 
         let name = wide(&config.name);
         let tunnel_type = wide("qp2p");
@@ -401,7 +411,7 @@ fn if_index_of(name: &str) -> Option<u32> {
     None
 }
 
-/// wintun.dll 应该被放在哪里，出问题时打到日志里。
+/// 出问题时给用户看的 dll 位置提示（当前实现优先用内嵌那份，这里只是兜底路径）。
 #[allow(dead_code)]
 pub fn expected_dll_path() -> String {
     std::env::current_exe()

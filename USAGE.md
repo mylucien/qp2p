@@ -123,10 +123,10 @@ qp2p gui     # 同一个东西，显式写出来而已
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.1-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.1-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.1-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Android 8+ | `qp2p-0.1.1-android.apk` | VpnService，debug 签名 |
+| Windows 10/11 x64 | `qp2p-0.1.2-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.2-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.2-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Android 8+ | `qp2p-0.1.2-android.apk` | VpnService，debug 签名 |
 
 下载完先校验，避免下到损坏的包：
 
@@ -137,8 +137,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.1-linux-x86_64-static
-sudo mv qp2p-0.1.1-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.2-linux-x86_64-static
+sudo mv qp2p-0.1.2-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 

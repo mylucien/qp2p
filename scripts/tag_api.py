@@ -5,8 +5,8 @@
 CONNECT tunnel failed 502，只有 api.github.com 稳定可达（和 push_api.py 同理）。
 
 用法：
-    python scripts/tag_api.py v0.1.1                  # 打在远端 main 当前 HEAD 上
-    python scripts/tag_api.py v0.1.1 <commit-sha>     # 打在指定提交上
+    python scripts/tag_api.py v0.1.2                  # 打在远端 main 当前 HEAD 上
+    python scripts/tag_api.py v0.1.2 <commit-sha>     # 打在指定提交上
 
 前置条件：代码已经用 push_api.py 推到 main，且
 .github/release-notes/<tag>.md 已提交，否则 release job 会明确报错。
