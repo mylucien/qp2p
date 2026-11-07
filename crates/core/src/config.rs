@@ -62,6 +62,9 @@ pub struct Config {
     /// 虚拟网卡 MTU。命令行没给时用这里的值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
+    /// 直连空闲多少秒自动断开（0/None = 不断）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<u64>,
     /// 虚拟网卡名。Windows 上就是适配器名。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<String>,
@@ -191,6 +194,7 @@ impl Default for Config {
             stun: default_stun(),
             listen: default_listen(),
             mtu: None,
+            idle: None,
             dev: None,
             routes: Vec::new(),
             upnp: true,

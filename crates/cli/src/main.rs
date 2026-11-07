@@ -22,6 +22,10 @@ use qp2p_core::signal::client::{extract_token, normalize_worker, SignalClient};
 use qp2p_core::{link, Engine, Role};
 use tokio::sync::RwLock;
 
+mod gui;
+#[cfg(windows)]
+mod tray;
+
 const HELP: &str = "\
 qp2p — 私有组网，没有公网 IP 也能直连
 
@@ -34,6 +38,9 @@ qp2p — 私有组网，没有公网 IP 也能直连
   qp2p join qp2p1_home_xxxxxxxx                # 用建网时打印的令牌
   qp2p join <令牌> --ip 10.78.0.20             # 顺便指定自己的虚拟地址
   qp2p up
+
+图形界面（Windows 推荐）：
+  qp2p gui             打开配置界面（常驻托盘，右键菜单可连接/断开/退出）
 
 日常命令：
   qp2p status          看本机地址、在线成员、谁连上了
@@ -109,6 +116,7 @@ async fn run(args: &[String]) -> Result<()> {
         Some("create") | Some("new") => cmd_create(&args[1..]).await,
         Some("join") => cmd_join(&args[1..]).await,
         Some("up") => cmd_up(&args[1..]).await,
+        Some("gui") | Some("ui") => gui::run(&args[1..]),
         Some("status") | Some("peers") => cmd_status(&args[1..]).await,
         Some("token") => cmd_token(&args[1..]),
         Some("rotate") => cmd_rotate(&args[1..]).await,
@@ -766,6 +774,12 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             config.mtu = Some(mtu);
         }
         "dev" => config.dev = Some(value.to_string()),
+        "idle" => {
+            let secs: u64 = value
+                .parse()
+                .with_context(|| format!("idle 不是数字：{value}"))?;
+            config.idle = if secs == 0 { None } else { Some(secs) };
+        }
         "stun" => {
             let list = split_list(value);
             if list.is_empty() {
@@ -814,13 +828,9 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         "node_name" | "name" => config.node_name = String::new(),
         "listen" => config.listen = format!("0.0.0.0:{}", qp2p_core::DEFAULT_PORT),
         "mtu" => config.mtu = None,
+        "idle" => config.idle = None,
         "dev" => config.dev = None,
-        "stun" => {
-            config.stun = vec![
-                "stun.cloudflare.com:3478".to_string(),
-                "stun.l.google.com:19302".to_string(),
-            ]
-        }
+        "stun" => config.stun = Config::default().stun,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {
             if let Some(network) = config.network.as_mut() {
@@ -1096,10 +1106,11 @@ async fn cmd_up(args: &[String]) -> Result<()> {
             name: name.clone(),
             net: net_cidr,
             wanted_ip,
-            // --idle <秒>：直连空闲这么久就断开（省电/省流量）。默认不断。
+            // --idle <秒>：直连空闲这么久就断开（省电/省流量）。命令行优先，其次配置。
             idle_timeout: flags
                 .get("idle")
                 .and_then(|v| v.parse::<u64>().ok())
+                .or(config.idle)
                 .filter(|secs| *secs > 0)
                 .map(Duration::from_secs),
             peers: reply.peers.clone(),
