@@ -136,6 +136,8 @@ jobs:
             case "$a" in
               --target=aarch64-unknown-linux-musl) continue ;;
               aarch64-unknown-linux-musl)         continue ;;
+              # rustc 给 aarch64-linux 加的这个 relax 选项 zig 的驱动不认，去掉
+              -Wl,--fix-cortex-a53-843419)        continue ;;
             esac
             set -- "$@" "$a"
           done
