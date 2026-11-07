@@ -800,6 +800,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const eveRow = (nodeList.body.nodes ?? []).find((n) => n.node_id === eve.nodeId);
   check("节点列表带在线状态", eveRow?.online === true, eveRow);
   check("节点列表带预留标记", eveRow?.reserved === true, eveRow);
+  check("节点列表带首次上线时间", Number(eveRow?.first_seen) > 0, eveRow?.first_seen);
 
   const nickBack = await call("POST", "/v1/join", {
     token: rToken,
@@ -856,40 +857,135 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     afterKick.body.nodes,
   );
 
+  const batchKick = await call("POST", `/v1/admin/networks/${rNet}/nodes/kick`, {
+    admin: secret,
+    body: { node_ids: [nick.nodeId] },
+  });
+  check("批量踢下线成功", batchKick.status === 200 && batchKick.body.removed === 1, batchKick.body);
+
+  const batchBad = await call("POST", `/v1/admin/networks/${rNet}/nodes/kick`, {
+    admin: secret,
+    body: { node_ids: ["not-a-node-id"] },
+  });
+  check("批量踢下线校验 node_id", batchBad.status === 400, batchBad.body);
+
   const auditRows = await call("GET", "/v1/admin/audit?limit=50", { admin: secret });
   const actions = (auditRows.body.actions ?? []).map((a) => a.action);
   check("审计记录改网段", actions.includes("network.update"), actions);
   check("审计记录踢下线", actions.includes("node.kick"), actions);
   check("审计记录预留", actions.includes("reservation.put"), actions);
 
-  const badLogin = await call("POST", "/v1/admin/login", { body: { secret: "wrong-secret" } });
-  check("错误密钥登录被拒", badLogin.status === 401, badLogin.body);
-  const goodLogin = await call("POST", "/v1/admin/login", { body: { secret } });
-  check("正确密钥登录成功", goodLogin.status === 200 && goodLogin.body.ok === true, goodLogin.body);
+  const status1 = await call("GET", "/v1/admin/status");
+  check("管理状态可查", status1.status === 200, status1.body);
 
-  const rawLogin = new Request(`${base}/v1/admin/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ secret }),
-  });
-  const loginRes = remote ? await fetch(rawLogin) : await worker.fetch(rawLogin, env, ctx);
-  const setCookie = loginRes.headers.get("set-cookie") ?? "";
-  check(
-    "登录下发 HttpOnly cookie",
-    /qp2p_admin=/.test(setCookie) && /HttpOnly/.test(setCookie),
-    setCookie,
-  );
+  if (!remote) {
+    // 账号流程只在本地跑：远端可能已经初始化过，重复 bootstrap 会 409
+    check("初始状态需要创建账号", status1.body.needs_bootstrap === true, status1.body);
 
-  const cookieHeader = setCookie.split(";")[0];
-  const cookieReq = new Request(`${base}/v1/admin/networks`, { headers: { cookie: cookieHeader } });
-  const cookieRes = remote ? await fetch(cookieReq) : await worker.fetch(cookieReq, env, ctx);
-  check("cookie 可以访问管理接口", cookieRes.status === 200, cookieRes.status);
+    const bootWrong = await call("POST", "/v1/admin/bootstrap", {
+      body: { secret: "wrong", username: "admin", password: "password123" },
+    });
+    check("初始化密钥错误被拒", bootWrong.status === 401, bootWrong.body);
 
-  const forgedReq = new Request(`${base}/v1/admin/networks`, {
-    headers: { cookie: "qp2p_admin=9999999999999.deadbeef" },
-  });
-  const forgedRes = remote ? await fetch(forgedReq) : await worker.fetch(forgedReq, env, ctx);
-  check("伪造 cookie 被拒", forgedRes.status === 401, forgedRes.status);
+    const bootShort = await call("POST", "/v1/admin/bootstrap", {
+      body: { secret, username: "admin", password: "short" },
+    });
+    check("过短密码被拒", bootShort.status === 400 && bootShort.body.error === "weak_password", bootShort.body);
+
+    const bootBadName = await call("POST", "/v1/admin/bootstrap", {
+      body: { secret, username: "A", password: "password123" },
+    });
+    check("用户名不合规被拒", bootBadName.status === 400, bootBadName.body);
+
+    const bootReq = new Request(`${base}/v1/admin/bootstrap`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ secret, username: "admin", password: "password123" }),
+    });
+    const bootRes = await worker.fetch(bootReq, env, ctx);
+    const bootBody = await bootRes.json();
+    check("初始化账号成功", bootRes.status === 200 && bootBody.ok === true, bootBody);
+    const setCookie = bootRes.headers.get("set-cookie") ?? "";
+    check(
+      "初始化后下发 HttpOnly 会话",
+      /qp2p_admin=/.test(setCookie) && /HttpOnly/.test(setCookie),
+      setCookie,
+    );
+
+    const status2 = await call("GET", "/v1/admin/status");
+    check("初始化后不再需要创建", status2.body.needs_bootstrap === false, status2.body);
+
+    const bootAgain = await call("POST", "/v1/admin/bootstrap", {
+      body: { secret, username: "admin2", password: "password123" },
+    });
+    check("重复初始化被拒", bootAgain.status === 409, bootAgain.body);
+
+    const badLogin = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "wrong-password" },
+    });
+    check("密码错误被拒", badLogin.status === 401 && badLogin.body.error === "bad_credentials", badLogin.body);
+
+    const noUser = await call("POST", "/v1/admin/login", {
+      body: { username: "nobody", password: "password123" },
+    });
+    check("不存在的账号同样报凭据错误", noUser.status === 401, noUser.body);
+
+    const loginReq = new Request(`${base}/v1/admin/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "password123" }),
+    });
+    const loginRes = await worker.fetch(loginReq, env, ctx);
+    check("账号密码登录成功", loginRes.status === 200, loginRes.status);
+    const loginCookie = loginRes.headers.get("set-cookie") ?? "";
+    check("登录下发会话", /qp2p_admin=/.test(loginCookie), loginCookie);
+
+    const cookieHeader = loginCookie.split(";")[0];
+    const cookieReq = new Request(`${base}/v1/admin/networks`, { headers: { cookie: cookieHeader } });
+    const cookieRes = await worker.fetch(cookieReq, env, ctx);
+    check("cookie 可以访问管理接口", cookieRes.status === 200, cookieRes.status);
+
+    const forgedReq = new Request(`${base}/v1/admin/networks`, {
+      headers: { cookie: "qp2p_admin=9999999999999.admin.deadbeefdeadbeefdeadbeefdeadbeef" },
+    });
+    const forgedRes = await worker.fetch(forgedReq, env, ctx);
+    check("伪造 cookie 被拒", forgedRes.status === 401, forgedRes.status);
+
+    const pwdWrong = await call("POST", "/v1/admin/password", {
+      body: { old_password: "nope", new_password: "newpassword1" },
+    });
+    check("未登录不能改密码", pwdWrong.status === 401, pwdWrong.body);
+
+    const pwdReq = new Request(`${base}/v1/admin/password`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: cookieHeader },
+      body: JSON.stringify({ old_password: "password123", new_password: "newpassword1" }),
+    });
+    const pwdRes = await worker.fetch(pwdReq, env, ctx);
+    check("登录后可以改密码", pwdRes.status === 200, pwdRes.status);
+
+    const oldPwdLogin = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "password123" },
+    });
+    check("改完密码旧密码失效", oldPwdLogin.status === 401, oldPwdLogin.body);
+
+    const reset = await call("POST", "/v1/admin/password/reset", {
+      admin: secret,
+      body: { username: "admin", new_password: "resetpassword1" },
+    });
+    check("命令行密钥可重置密码", reset.status === 200, reset.body);
+
+    const resetLogin = await call("POST", "/v1/admin/login", {
+      body: { username: "admin", password: "resetpassword1" },
+    });
+    check("重置后新密码可登录", resetLogin.status === 200, resetLogin.body);
+
+    const auditAfter = await call("GET", "/v1/admin/audit?limit=50", { admin: secret });
+    const loginActions = (auditAfter.body.actions ?? []).map((a) => a.action);
+    check("审计记录登录与账号操作", loginActions.includes("login.ok") && loginActions.includes("admin.password"), loginActions);
+    const withActor = (auditAfter.body.actions ?? []).some((a) => a.actor === "admin");
+    check("审计记录操作人", withActor, auditAfter.body.actions?.[0]);
+  }
 
   const page = remote
     ? await fetch(`${base}/admin`)

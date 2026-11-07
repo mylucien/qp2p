@@ -96,8 +96,21 @@ const DDL_STATEMENTS = [
     at         INTEGER NOT NULL,
     action     TEXT NOT NULL,
     target     TEXT NOT NULL,
-    detail     TEXT NOT NULL DEFAULT ''
+    detail     TEXT NOT NULL DEFAULT '',
+    actor      TEXT NOT NULL DEFAULT ''
   )`,
+  // 管理员账号：口令用 PBKDF2-HMAC-SHA256 存，服务端拿不到明文
+  `CREATE TABLE IF NOT EXISTS admin_users (
+    username   TEXT PRIMARY KEY,
+    salt       TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    iterations INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  // 老库补列必须放在建表之后：新库上 ALTER 会报 no such table
+  `ALTER TABLE nodes ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE admin_actions ADD COLUMN actor TEXT NOT NULL DEFAULT ''`,
 ];
 
 // ---------------------------------------------------------------------------
@@ -145,8 +158,13 @@ async function route(request, url, env, ctx) {
   if (path === "/") return landing();
   if (path === "/admin") return adminPage();
   if (path === "/v1/health") return health(request, env);
+  if (path === "/v1/admin/status" && method === "GET") return adminStatus(request, env);
+  if (path === "/v1/admin/bootstrap" && method === "POST") return adminBootstrap(request, env);
   if (path === "/v1/admin/login" && method === "POST") return adminLogin(request, env);
   if (path === "/v1/admin/logout" && method === "POST") return adminLogout(request);
+  if (path === "/v1/admin/me" && method === "GET") return adminMe(request, env);
+  if (path === "/v1/admin/password" && method === "POST") return adminPassword(request, env);
+  if (path === "/v1/admin/password/reset" && method === "POST") return adminResetPassword(request, env);
   if (path === "/v1/admin/audit" && method === "GET") return auditLog(request, env, url);
   if (path === "/v1/admin/networks" && method === "GET") return listNetworks(request, env);
   if (path === "/v1/admin/networks" && method === "POST") return createNetwork(request, env);
@@ -157,6 +175,8 @@ async function route(request, url, env, ctx) {
   if (netPath && method === "PATCH") return updateNetwork(request, env, netPath[1]);
   const nodesPath = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/nodes$/.exec(path);
   if (nodesPath && method === "GET") return listNetworkNodes(request, env, nodesPath[1]);
+  const kickBatch = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/nodes\/kick$/.exec(path);
+  if (kickBatch && method === "POST") return kickNodes(request, env, kickBatch[1]);
   const kick = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/nodes\/([0-9a-f]{32})\/kick$/.exec(path);
   if (kick && method === "POST") return kickNode(request, env, kick[1], kick[2]);
   const resv = /^\/v1\/admin\/networks\/([a-z0-9][a-z0-9-]{0,39})\/reservations$/.exec(path);
@@ -186,13 +206,18 @@ async function landing() {
     `version ${VERSION}`,
     "",
     "GET  /v1/health",
-    "GET  /admin                       管理页面（登录后操作）",
-    "POST /v1/admin/login              用 ADMIN_SECRET 换 2 小时 cookie",
+    "GET  /admin                       管理页面（账号密码登录）",
+    "GET  /v1/admin/status             是否需要初始化管理员账号",
+    "POST /v1/admin/bootstrap          首次创建管理员（需 ADMIN_SECRET）",
+    "POST /v1/admin/login              用户名 + 密码换 2 小时会话",
+    "POST /v1/admin/password           改自己的密码（需登录）",
+    "POST /v1/admin/password/reset     重置密码（需 X-Admin-Secret）",
     "POST /v1/admin/networks   需要 X-Admin-Secret，可带 join_key / cidr",
     "PATCH /v1/admin/networks/<id>     改名字 / 网段",
     "POST /v1/admin/networks/<id>/rotate   需要 X-Admin-Secret，换加入密钥",
     "GET  /v1/admin/networks/<id>/nodes    节点列表（在线状态）",
     "POST /v1/admin/networks/<id>/nodes/<node>/kick   踢下线",
+    "POST /v1/admin/networks/<id>/nodes/kick          批量踢下线",
     "GET/POST /v1/admin/networks/<id>/reservations     查/加 IP 预留",
     "DELETE /v1/admin/networks/<id>/reservations/<ip> 释放预留",
     "GET  /v1/admin/audit              管理操作审计",
@@ -387,7 +412,7 @@ async function deleteNetwork(request, env, networkId) {
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const removed = await purgeNetwork(env, networkId);
-  await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`);
+  await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`, await adminActor(request, env));
   console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
 
   return json({ ok: true, network: { id: networkId, name: net.name }, removed_nodes: removed });
@@ -457,7 +482,13 @@ async function updateNetwork(request, env, networkId) {
     }
   }
 
-  await audit(env, "network.update", networkId, `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`);
+  await audit(
+    env,
+    "network.update",
+    networkId,
+    `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`,
+    await adminActor(request, env),
+  );
   return json({
     ok: true,
     changed: true,
@@ -504,10 +535,38 @@ async function kickNode(request, env, networkId, nodeId) {
 
   await deleteNode(env, networkId, nodeId);
   await dropNodeEvents(env, networkId, nodeId);
-  await audit(env, "node.kick", `${networkId}/${nodeId}`, node.name);
+  await audit(env, "node.kick", `${networkId}/${nodeId}`, node.name, await adminActor(request, env));
   console.warn(`[signal] 管理员踢下线 ${node.name} (${nodeId})`);
 
   return json({ ok: true, node: { node_id: nodeId, name: node.name } });
+}
+
+/** 批量踢下线：一次请求清掉多个节点，排查时比一个个点省事。 */
+async function kickNodes(request, env, networkId) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+
+  const body = (await readJson(request)) ?? {};
+  const ids = Array.isArray(body.node_ids) ? body.node_ids.map((x) => String(x).toLowerCase()) : [];
+  if (ids.length === 0 || ids.length > MAX_NODES) {
+    return err(400, "invalid_node_ids", `node_ids 必须是 1~${MAX_NODES} 个 node_id 的数组`);
+  }
+  if (ids.some((id) => !/^[0-9a-f]{32}$/.test(id))) {
+    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+  }
+
+  let removed = 0;
+  for (const id of ids) {
+    const node = await getNode(env, networkId, id);
+    if (!node) continue;
+    await deleteNode(env, networkId, id);
+    await dropNodeEvents(env, networkId, id);
+    removed += 1;
+  }
+  const actor = await adminActor(request, env);
+  await audit(env, "node.kick_batch", networkId, `清理 ${removed} 个节点`, actor);
+  console.warn(`[signal] 管理员批量踢下线 ${removed} 个节点（${networkId}）`);
+  return json({ ok: true, removed });
 }
 
 /** 管理员手动预留一个 IP（可以给还没上线的节点预占）。 */
@@ -556,7 +615,13 @@ async function reserveIp(request, env, networkId) {
     note: String(body.note ?? "").slice(0, 100),
     created_at: Date.now(),
   });
-  await audit(env, "reservation.put", `${networkId}/${ip}`, nodeId || "(未绑定节点)");
+  await audit(
+    env,
+    "reservation.put",
+    `${networkId}/${ip}`,
+    nodeId || "(未绑定节点)",
+    await adminActor(request, env),
+  );
   return json({ ok: true, reservation: { ip, node_id: nodeId } });
 }
 
@@ -565,7 +630,7 @@ async function releaseIp(request, env, networkId, ip) {
   if (admin) return admin;
 
   await deleteReservation(env, networkId, ip);
-  await audit(env, "reservation.delete", `${networkId}/${ip}`, "");
+  await audit(env, "reservation.delete", `${networkId}/${ip}`, "", await adminActor(request, env));
   return json({ ok: true, released: ip });
 }
 
@@ -680,29 +745,94 @@ async function checkAdmin(request, env) {
   const provided = request.headers.get("x-admin-secret") ?? "";
   if (timingSafeEqual(provided, env.ADMIN_SECRET)) return null;
 
-  // 管理页面用 cookie：secret 只 POST 一次换成短期签名，之后不再出现在
-  // URL 或 localStorage 里，被 XSS 抄走的机会小得多。
-  if (await adminCookieValid(request, env)) return null;
-  return err(401, "invalid_admin_secret", "需要 X-Admin-Secret，或先在 /admin 登录");
+  // 管理页面用账号会话：口令只在登录时提交一次，之后靠 HttpOnly cookie。
+  if (await adminSession(request, env)) return null;
+  return err(401, "unauthorized", "需要 X-Admin-Secret（命令行），或先在 /admin 登录");
 }
 
 const ADMIN_COOKIE = "qp2p_admin";
 const ADMIN_SESSION_MS = 2 * 60 * 60 * 1000; // 2 小时
+const PBKDF2_ITERATIONS = 120_000;
+const USERNAME_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/;
+const PASSWORD_MIN = 8;
 
-async function adminCookieFor(env, expiresAt) {
-  const mac = await hmacHex(env.ADMIN_SECRET, `admin:${expiresAt}`);
-  return `${expiresAt}.${mac.slice(0, 32)}`;
+/** PBKDF2-HMAC-SHA256。口令永远不以明文或可逆形式落库。 */
+async function pbkdf2Hex(password, saltHex, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: hexToBytes(saltHex), iterations, hash: "SHA-256" },
+    key,
+    256,
+  );
+  return hex(new Uint8Array(bits));
 }
 
-async function adminCookieValid(request, env) {
-  if (!env.ADMIN_SECRET) return false;
+async function getAdminUser(env, username) {
+  if ((await ready(env)) === "memory") return memory.admins.get(username) ?? null;
+  return env.DB.prepare("SELECT * FROM admin_users WHERE username = ?").bind(username).first();
+}
+
+async function listAdminUsers(env) {
+  if ((await ready(env)) === "memory") return [...memory.admins.values()];
+  const { results } = await env.DB.prepare("SELECT username FROM admin_users").all();
+  return results ?? [];
+}
+
+async function putAdminUser(env, user) {
+  if ((await ready(env)) === "memory") {
+    memory.admins.set(user.username, { ...user });
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO admin_users (username, salt, hash, iterations, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(username) DO UPDATE SET
+       salt = excluded.salt,
+       hash = excluded.hash,
+       iterations = excluded.iterations,
+       updated_at = excluded.updated_at`,
+  )
+    .bind(user.username, user.salt, user.hash, user.iterations, user.created_at, user.updated_at)
+    .run();
+}
+
+function validateAccount(username, password) {
+  if (!USERNAME_RE.test(username)) {
+    return err(400, "invalid_username", "用户名 3~32 位，只能用小写字母、数字、下划线、连字符");
+  }
+  if (String(password).length < PASSWORD_MIN) {
+    return err(400, "weak_password", `密码至少 ${PASSWORD_MIN} 位`);
+  }
+  return null;
+}
+
+async function adminCookieFor(env, username, expiresAt) {
+  const mac = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${expiresAt}`);
+  return `${expiresAt}.${username}.${mac.slice(0, 32)}`;
+}
+
+/** 解析 cookie 里的会话：签名对、没过期、账号还在，三者都满足才算数。 */
+async function adminSession(request, env) {
+  if (!env.ADMIN_SECRET) return null;
   const raw = cookieValue(request, ADMIN_COOKIE);
-  if (!raw) return false;
-  const [expText, mac] = raw.split(".");
+  if (!raw) return null;
+  const parts = raw.split(".");
+  if (parts.length !== 3) return null;
+  const [expText, username, mac] = parts;
   const expiresAt = Number(expText);
-  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
-  const expect = await hmacHex(env.ADMIN_SECRET, `admin:${expiresAt}`);
-  return timingSafeEqual(mac ?? "", expect.slice(0, 32));
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return null;
+  if (!USERNAME_RE.test(username)) return null;
+  const expect = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${expiresAt}`);
+  if (!timingSafeEqual(mac, expect.slice(0, 32))) return null;
+  // 账号被删/改过，旧 cookie 立刻失效
+  const user = await getAdminUser(env, username);
+  return user ? { username } : null;
 }
 
 function cookieValue(request, name) {
@@ -714,37 +844,199 @@ function cookieValue(request, name) {
   return "";
 }
 
-/** 用 secret 换一张短期 cookie；管理页面靠它免重复输入。 */
-async function adminLogin(request, env) {
-  if (!env.ADMIN_SECRET) return err(503, "admin_secret_unset", "请先部署 ADMIN_SECRET");
-  const body = (await readJson(request)) ?? {};
-  const secret = String(body.secret ?? "");
-  if (!timingSafeEqual(secret, env.ADMIN_SECRET)) {
-    await audit(env, "login.failed", "admin", request.headers.get("cf-connecting-ip") ?? "");
-    return err(401, "invalid_admin_secret");
-  }
-  const expiresAt = Date.now() + ADMIN_SESSION_MS;
-  const value = await adminCookieFor(env, expiresAt);
-  await audit(env, "login.ok", "admin", "");
-  // 线上是 https 才加 Secure；本地 dev-server 跑 http，加了会导致 cookie 存不下来
+function sessionCookie(request, value, maxAgeSeconds) {
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return new Response(JSON.stringify({ ok: true, expires_at: expiresAt }), {
-    status: 200,
-    headers: {
-      ...JSON_HEADERS,
-      "set-cookie": `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ADMIN_SESSION_MS / 1000}${secure}`,
-    },
+  return `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`;
+}
+
+function loginResponse(request, env, username) {
+  return adminCookieFor(env, username, Date.now() + ADMIN_SESSION_MS).then(
+    (value) =>
+      new Response(JSON.stringify({ ok: true, username }), {
+        status: 200,
+        headers: {
+          ...JSON_HEADERS,
+          "set-cookie": sessionCookie(request, value, ADMIN_SESSION_MS / 1000),
+        },
+      }),
+  );
+}
+
+/** 谁在操作：命令行带 X-Admin-Secret 记为 cli，页面里记用户名。 */
+async function adminActor(request, env) {
+  if (timingSafeEqual(request.headers.get("x-admin-secret") ?? "", env.ADMIN_SECRET ?? "")) {
+    return "cli";
+  }
+  const session = await adminSession(request, env);
+  return session ? session.username : "unknown";
+}
+
+/** 首次初始化状态：页面据此决定显示"创建管理员"还是"登录"。 */
+async function adminStatus(request, env) {
+  const users = await listAdminUsers(env);
+  return json({
+    ok: true,
+    needs_bootstrap: users.length === 0,
+    has_admin_secret: Boolean(env.ADMIN_SECRET),
   });
 }
 
+/** 第一次设账号：唯一需要 ADMIN_SECRET 的一步，之后只用账号密码。 */
+async function adminBootstrap(request, env) {
+  if (!env.ADMIN_SECRET) {
+    return err(503, "admin_secret_unset", "先在 Cloudflare 里设置 ADMIN_SECRET，再来初始化账号");
+  }
+  if ((await listAdminUsers(env)).length > 0) {
+    return err(409, "already_initialized", "管理员账号已存在，直接登录即可");
+  }
+  const body = (await readJson(request)) ?? {};
+  if (!timingSafeEqual(String(body.secret ?? ""), env.ADMIN_SECRET)) {
+    return err(401, "invalid_admin_secret", "初始化密钥不对");
+  }
+  const username = String(body.username ?? "").trim().toLowerCase();
+  const password = String(body.password ?? "");
+  const bad = validateAccount(username, password);
+  if (bad) return bad;
+
+  const salt = randomSecret();
+  const now = Date.now();
+  await putAdminUser(env, {
+    username,
+    salt,
+    hash: await pbkdf2Hex(password, salt, PBKDF2_ITERATIONS),
+    iterations: PBKDF2_ITERATIONS,
+    created_at: now,
+    updated_at: now,
+  });
+  await audit(env, "admin.bootstrap", username, "首次初始化", username);
+  return loginResponse(request, env, username);
+}
+
+// 登录失败计数：每个 isolate 内存里各算各的，只是防在线爆破的第一道门槛
+const loginFails = new Map();
+const LOGIN_WINDOW_MS = 5 * 60_000;
+const LOGIN_MAX_FAILS = 8;
+
+function loginBlocked(ip, username) {
+  const slot = loginFails.get(`${ip}|${username}`);
+  if (!slot) return false;
+  if (Date.now() - slot.start > LOGIN_WINDOW_MS) {
+    loginFails.delete(`${ip}|${username}`);
+    return false;
+  }
+  return slot.count >= LOGIN_MAX_FAILS;
+}
+
+function noteLoginFail(ip, username) {
+  const key = `${ip}|${username}`;
+  const slot = loginFails.get(key);
+  if (!slot || Date.now() - slot.start > LOGIN_WINDOW_MS) {
+    if (loginFails.size > 2048) loginFails.clear();
+    loginFails.set(key, { start: Date.now(), count: 1 });
+    return;
+  }
+  slot.count += 1;
+}
+
+async function adminLogin(request, env) {
+  const body = (await readJson(request)) ?? {};
+  const username = String(body.username ?? "").trim().toLowerCase();
+  const password = String(body.password ?? "");
+  const ip = request.headers.get("cf-connecting-ip") ?? "local";
+
+  if (!username || !password) return err(400, "missing_credentials", "填用户名和密码");
+  if (loginBlocked(ip, username)) {
+    return err(429, "too_many_attempts", "密码错误次数太多，5 分钟后再试");
+  }
+
+  const user = await getAdminUser(env, username);
+  // 账号不存在时也算一次哈希，避免从响应时间上看出账号是否存在
+  const salt = user?.salt ?? "00".repeat(24);
+  const iterations = Number(user?.iterations ?? PBKDF2_ITERATIONS);
+  const hash = await pbkdf2Hex(password, salt, iterations);
+  const ok = Boolean(user) && timingSafeEqual(hash, user.hash);
+  if (!ok) {
+    noteLoginFail(ip, username);
+    await audit(env, "login.failed", username, ip);
+    return err(401, "bad_credentials", "用户名或密码不对");
+  }
+
+  loginFails.delete(`${ip}|${username}`);
+  await audit(env, "login.ok", username, "", username);
+  return loginResponse(request, env, username);
+}
+
+/** 改自己的密码：必须验证旧密码。 */
+async function adminPassword(request, env) {
+  const session = await adminSession(request, env);
+  if (!session) return err(401, "not_logged_in", "先登录");
+  const body = (await readJson(request)) ?? {};
+  const user = await getAdminUser(env, session.username);
+  if (!user) return err(401, "not_logged_in", "账号不存在");
+
+  const oldHash = await pbkdf2Hex(
+    String(body.old_password ?? ""),
+    user.salt,
+    Number(user.iterations),
+  );
+  if (!timingSafeEqual(oldHash, user.hash)) {
+    await audit(env, "admin.password_failed", session.username, "");
+    return err(403, "wrong_password", "旧密码不对");
+  }
+  const next = String(body.new_password ?? "");
+  if (next.length < PASSWORD_MIN) return err(400, "weak_password", `密码至少 ${PASSWORD_MIN} 位`);
+
+  const salt = randomSecret();
+  await putAdminUser(env, {
+    username: session.username,
+    salt,
+    hash: await pbkdf2Hex(next, salt, PBKDF2_ITERATIONS),
+    iterations: PBKDF2_ITERATIONS,
+    created_at: Number(user.created_at),
+    updated_at: Date.now(),
+  });
+  await audit(env, "admin.password", session.username, "", session.username);
+  // 旧 cookie 立即失效，用新会话回到页面
+  return loginResponse(request, env, session.username);
+}
+
+/** 忘记密码时的兜底：需要 ADMIN_SECRET（等同于服务器控制权）。 */
+async function adminResetPassword(request, env) {
+  const admin = await checkAdmin(request, env);
+  if (admin) return admin;
+  if (!timingSafeEqual(request.headers.get("x-admin-secret") ?? "", env.ADMIN_SECRET ?? "")) {
+    return err(403, "secret_required", "重置密码必须在请求头里带 X-Admin-Secret");
+  }
+  const body = (await readJson(request)) ?? {};
+  const username = String(body.username ?? "").trim().toLowerCase();
+  const user = await getAdminUser(env, username);
+  if (!user) return err(404, "user_not_found", `没有账号 ${username}`);
+  const next = String(body.new_password ?? "");
+  if (next.length < PASSWORD_MIN) return err(400, "weak_password", `密码至少 ${PASSWORD_MIN} 位`);
+
+  const salt = randomSecret();
+  await putAdminUser(env, {
+    username,
+    salt,
+    hash: await pbkdf2Hex(next, salt, PBKDF2_ITERATIONS),
+    iterations: PBKDF2_ITERATIONS,
+    created_at: Number(user.created_at),
+    updated_at: Date.now(),
+  });
+  await audit(env, "admin.password_reset", username, "管理员重置", "cli");
+  return json({ ok: true, username });
+}
+
+async function adminMe(request, env) {
+  const session = await adminSession(request, env);
+  if (!session) return err(401, "not_logged_in");
+  return json({ ok: true, username: session.username });
+}
+
 async function adminLogout(request) {
-  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
-    headers: {
-      ...JSON_HEADERS,
-      "set-cookie": `${ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`,
-    },
+    headers: { ...JSON_HEADERS, "set-cookie": sessionCookie(request, "", 0) },
   });
 }
 
@@ -899,6 +1191,8 @@ async function joinOrRegister(request, env, url, needCandidates) {
     ),
     candidates: JSON.stringify(candidates.length > 0 ? candidates : JSON.parse(existing?.candidates ?? "[]")),
     last_seen: now,
+    // 首次上线时间只写一次：上线时长、是否频繁重启都靠它
+    first_seen: Number(existing?.first_seen ?? 0) || now,
   };
 
   await putNode(env, record);
@@ -1191,6 +1485,7 @@ const memory = {
   events: [],
   nonces: new Map(),
   reservations: new Map(),
+  admins: new Map(),
   audit: [],
   seq: 0,
 };
@@ -1242,8 +1537,8 @@ async function putNode(env, node) {
     return;
   }
   await env.DB.prepare(
-    `INSERT INTO nodes (network_id, node_id, name, pubkey, tls_fp, virtual_ip, nat_type, advertise, candidates, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO nodes (network_id, node_id, name, pubkey, tls_fp, virtual_ip, nat_type, advertise, candidates, last_seen, first_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(network_id, node_id) DO UPDATE SET
        name = excluded.name,
        pubkey = excluded.pubkey,
@@ -1265,6 +1560,7 @@ async function putNode(env, node) {
       node.advertise,
       node.candidates,
       node.last_seen,
+      node.first_seen ?? node.last_seen,
     )
     .run();
 }
@@ -1360,17 +1656,23 @@ async function dropAutoReservations(env, networkId, nodeId) {
 
 // --- 管理审计 --------------------------------------------------------------
 
-async function audit(env, action, target, detail = "") {
-  const row = { at: Date.now(), action, target, detail: String(detail).slice(0, 400) };
+async function audit(env, action, target, detail = "", actor = "") {
+  const row = {
+    at: Date.now(),
+    action,
+    target,
+    detail: String(detail).slice(0, 400),
+    actor: String(actor).slice(0, 40),
+  };
   if ((await ready(env)) === "memory") {
     memory.audit.push(row);
     if (memory.audit.length > 500) memory.audit.shift();
     return;
   }
   await env.DB.prepare(
-    "INSERT INTO admin_actions (at, action, target, detail) VALUES (?, ?, ?, ?)",
+    "INSERT INTO admin_actions (at, action, target, detail, actor) VALUES (?, ?, ?, ?, ?)",
   )
-    .bind(row.at, row.action, row.target, row.detail)
+    .bind(row.at, row.action, row.target, row.detail, row.actor)
     .run();
 }
 
@@ -1379,7 +1681,7 @@ async function listAudit(env, limit = 100) {
     return memory.audit.slice(-limit).reverse();
   }
   const { results } = await env.DB.prepare(
-    "SELECT at, action, target, detail FROM admin_actions ORDER BY id DESC LIMIT ?",
+    "SELECT at, action, target, detail, actor FROM admin_actions ORDER BY id DESC LIMIT ?",
   )
     .bind(Math.min(500, Math.max(1, limit)))
     .all();
@@ -1563,9 +1865,11 @@ function publicNode(node, now) {
   return {
     node_id: node.node_id,
     name: node.name,
+    pubkey: node.pubkey,
     virtual_ip: node.virtual_ip,
     nat_type: node.nat_type,
     tls_fp: node.tls_fp,
+    first_seen: Number(node.first_seen ?? 0) || node.last_seen,
     candidates: safeParseArray(node.candidates),
     last_seen: node.last_seen,
     online: now - node.last_seen <= OFFLINE_MS,
@@ -1967,48 +2271,85 @@ const ADMIN_PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>qp2p 管理台</title>
 <style>
-:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1a1c1f;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--danger:#dc2626;--ok:#16a34a}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8eb;--muted:#9aa3ad;--line:#262b33;--accent:#5b8cff;--danger:#f87171;--ok:#4ade80}}
+:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1a1c1f;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--danger:#dc2626;--ok:#16a34a;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8eb;--muted:#9aa3ad;--line:#262b33;--accent:#5b8cff;--danger:#f87171;--ok:#4ade80;--warn:#fbbf24}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
 h1{font-size:16px;margin:0;font-weight:600}
-main{max-width:1080px;margin:0 auto;padding:20px}
+main{max-width:1100px;margin:0 auto;padding:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
 input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
 select{width:auto;min-width:180px}
 button{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.danger{color:var(--danger);border-color:var(--danger)}
 button.sm{padding:3px 8px;font-size:12px}
+button:disabled{opacity:.5;cursor:not-allowed}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
-th{color:var(--muted);font-weight:500;font-size:12px}
+th{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
 tr:last-child td{border-bottom:0}
 .muted{color:var(--muted)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
 .on{background:var(--ok)}.off{background:var(--muted)}
+.tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--muted)}
+.tag.warn{color:var(--warn);border-color:var(--warn)}
+.tag.good{color:var(--ok);border-color:var(--ok)}
 pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;border-radius:8px;font-size:12px}
 .hide{display:none}
+.scroll{overflow-x:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px}
+.stat b{display:block;font-size:22px;line-height:1.2}
+.stat span{font-size:12px;color:var(--muted)}
+.banner{border-left:3px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--card));padding:10px 12px;border-radius:8px;margin-bottom:12px;font-size:13px}
+.detail td{background:var(--bg);font-size:12px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:4px 12px}
+.kv div:nth-child(odd){color:var(--muted)}
 </style>
 </head>
 <body>
-<header><h1>qp2p 管理台</h1><span class="muted" id="who"></span><span style="flex:1"></span><button id="refresh" class="hide">刷新</button><button id="logout" class="hide">退出</button></header>
+<header>
+  <h1>qp2p 管理台</h1>
+  <span class="muted" id="who"></span>
+  <span style="flex:1"></span>
+  <button id="changePwd" class="hide">改密码</button>
+  <button id="refresh" class="hide">刷新</button>
+  <button id="logout" class="hide">退出</button>
+</header>
 <main>
   <section id="login" class="card hide" style="max-width:420px;margin:40px auto">
-    <h2 style="margin-top:0;font-size:15px">用管理员密钥登录</h2>
-    <label>ADMIN_SECRET</label>
-    <input id="secret" type="password" autocomplete="current-password" placeholder="部署时设置的变量">
-    <div class="row" style="margin-top:12px"><button class="primary" id="doLogin">登录</button><span class="muted" id="loginMsg"></span></div>
-    <p class="muted" style="font-size:12px;margin-bottom:0">登录后服务端签发 2 小时 HttpOnly cookie，密钥不会存进浏览器。</p>
+    <h2 style="margin-top:0;font-size:15px" id="authTitle">登录</h2>
+    <label>用户名</label>
+    <input id="username" autocomplete="username" placeholder="admin">
+    <label>密码</label>
+    <input id="password" type="password" autocomplete="current-password" placeholder="至少 8 位">
+    <label id="secretLabel" class="hide">初始化密钥（ADMIN_SECRET，只在第一次用）</label>
+    <input id="secret" type="password" autocomplete="off" class="hide" placeholder="部署时设置的 ADMIN_SECRET">
+    <div class="row" style="margin-top:14px"><button class="primary" id="doAuth">登录</button><span class="muted" id="authMsg"></span></div>
+    <p class="muted" style="font-size:12px;margin-bottom:0" id="authHint">登录后服务端签发 2 小时 HttpOnly cookie，密码不会存进浏览器。</p>
   </section>
 
   <div id="dash" class="hide">
+    <div id="healthBanner" class="banner hide"></div>
+
+    <section class="card">
+      <h2 style="margin:0 0 12px;font-size:15px">概览</h2>
+      <div class="grid">
+        <div class="stat"><b id="statNets">0</b><span>网络</span></div>
+        <div class="stat"><b id="statNodes">0</b><span>设备总数</span></div>
+        <div class="stat"><b id="statOnline">0</b><span>在线设备</span></div>
+        <div class="stat"><b id="statResv">0</b><span>IP 预留</span></div>
+        <div class="stat"><b id="statOffline">0</b><span>离线超 10 分钟</span></div>
+      </div>
+    </section>
+
     <section class="card">
       <h2 style="margin:0 0 10px;font-size:15px">网络</h2>
-      <table><thead><tr><th>名称</th><th>网段</th><th>节点</th><th>在线</th><th>预留</th><th>操作</th></tr></thead><tbody id="nets"></tbody></table>
+      <div class="scroll"><table><thead><tr><th>名称</th><th>网段</th><th>节点</th><th>在线</th><th>预留</th><th>操作</th></tr></thead><tbody id="nets"></tbody></table></div>
       <div class="row" style="margin-top:12px">
         <input id="newName" placeholder="新网络名称" style="max-width:180px">
         <input id="newCidr" placeholder="网段（可空，如 10.90.0.0/16）" style="max-width:220px">
@@ -2026,9 +2367,15 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;
           <button id="refreshNodes" class="sm">刷新</button>
         </div>
       </div>
-      <table><thead><tr><th>状态</th><th>名称</th><th>虚拟 IP</th><th>NAT</th><th>最后心跳</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table>
+      <div class="row" style="margin-bottom:10px">
+        <label class="row" style="margin:0;font-size:12px;color:var(--muted)"><input type="checkbox" id="checkAll" style="width:auto;margin-right:6px">全选</label>
+        <button id="kickSelected" class="sm danger" disabled>踢下线所选</button>
+        <button id="exportNodes" class="sm">导出成员 CSV</button>
+        <button id="exportResv" class="sm">导出预留 CSV</button>
+      </div>
+      <div class="scroll"><table><thead><tr><th style="width:28px"></th><th>状态</th><th>名称</th><th>虚拟 IP</th><th>NAT</th><th>在线时长</th><th>最后心跳</th><th>操作</th></tr></thead><tbody id="nodes"></tbody></table></div>
       <h2 style="margin:18px 0 10px;font-size:15px">IP 预留</h2>
-      <table><thead><tr><th>IP</th><th>节点</th><th>类型</th><th>备注</th><th>操作</th></tr></thead><tbody id="resv"></tbody></table>
+      <div class="scroll"><table><thead><tr><th>IP</th><th>节点</th><th>类型</th><th>备注</th><th>操作</th></tr></thead><tbody id="resv"></tbody></table></div>
       <div class="row" style="margin-top:12px">
         <input id="resvIp" placeholder="要预留的 IP" style="max-width:160px">
         <input id="resvNode" placeholder="node_id（可空）" style="max-width:280px">
@@ -2038,72 +2385,153 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;
     </section>
 
     <section class="card">
-      <h2 style="margin:0 0 10px;font-size:15px">操作审计</h2>
-      <table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody id="audit"></tbody></table>
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <h2 style="margin:0;font-size:15px">操作审计</h2>
+        <div class="row">
+          <select id="auditKind">
+            <option value="">全部动作</option>
+            <option value="network.">网络</option>
+            <option value="node.">节点</option>
+            <option value="reservation.">预留</option>
+            <option value="login.">登录</option>
+            <option value="admin.">账号</option>
+          </select>
+          <input id="auditSearch" placeholder="搜索对象/详情/操作人" style="max-width:200px">
+        </div>
+      </div>
+      <div class="scroll"><table><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody id="audit"></tbody></table></div>
     </section>
   </div>
 </main>
 <script>
-var current = null;
-var nets = [];
+var current = null, nets = [], nodes = [], reservations = [], needBootstrap = false;
+
 function $(id){return document.getElementById(id)}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function api(path, method, body){
   var opt = {method: method||'GET', credentials:'same-origin', headers:{}};
   if (body !== undefined) { opt.headers['content-type']='application/json'; opt.body=JSON.stringify(body); }
   return fetch(path, opt).then(function(r){
     return r.json().catch(function(){return {ok:false,error:'bad_json'}}).then(function(j){
-      if (!r.ok || j.ok === false) throw new Error((j.error||String(r.status))+' '+(j.detail||''));
+      if (!r.ok || j.ok === false) { var e = new Error((j.error||String(r.status)) + ' ' + (j.detail||'')); e.status = r.status; throw e; }
       return j;
     });
   });
 }
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function ago(ms){ if(!ms) return '—'; var d=Math.min(9999,Math.round((Date.now()-ms)/1000)); if(d<60)return d+' 秒前'; if(d<3600)return Math.round(d/60)+' 分钟前'; return Math.round(d/3600)+' 小时前'; }
-function showDash(){
+function ago(ms){ if(!ms) return '—'; var d=Math.max(0,Math.round((Date.now()-ms)/1000));
+  if(d<60)return d+' 秒前'; if(d<3600)return Math.round(d/60)+' 分钟前'; if(d<86400)return Math.round(d/3600)+' 小时前'; return Math.round(d/86400)+' 天前'; }
+function span(ms){ if(!ms) return '—'; var d=Math.max(0,Math.round((Date.now()-ms)/1000));
+  var day=Math.floor(d/86400), h=Math.floor(d%86400/3600), m=Math.floor(d%3600/60);
+  if(day) return day+' 天 '+h+' 小时'; if(h) return h+' 小时 '+m+' 分'; return m+' 分'; }
+function natLabel(n){
+  var map={upnp:'UPnP 映射',srflx:'STUN 反射',host:'内网地址',cone:'锥形 NAT',symmetric:'对称 NAT',unknown:'未知'};
+  return map[n] || n || '未知';
+}
+function natRisk(n){ return n==='symmetric'; }
+function copyText(text){
+  if (navigator.clipboard) { navigator.clipboard.writeText(text).then(function(){},function(){prompt('手动复制：', text)}); }
+  else prompt('手动复制：', text);
+}
+function download(name, rows){
+  var csv = rows.map(function(r){return r.map(function(c){return '"'+String(c==null?'':c).replace(/"/g,'""')+'"'}).join(',')}).join('\\n');
+  var blob = new Blob(['\\ufeff'+csv], {type:'text/csv;charset=utf-8'});
+  var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
+}
+
+function showLogin(){
+  $('dash').classList.add('hide');
+  $('login').classList.remove('hide');
+  $('who').textContent='';
+  $('changePwd').classList.add('hide'); $('refresh').classList.add('hide'); $('logout').classList.add('hide');
+}
+function showBoot(){
+  needBootstrap = true;
+  $('authTitle').textContent='第一次使用：创建管理员';
+  $('secretLabel').classList.remove('hide'); $('secret').classList.remove('hide');
+  $('doAuth').textContent='创建并登录';
+  $('authHint').textContent='这一步需要部署时设置的 ADMIN_SECRET，账号建好后就不再需要它了。';
+  showLogin();
+}
+function showDash(username){
   $('login').classList.add('hide'); $('dash').classList.remove('hide');
-  $('refresh').classList.remove('hide'); $('logout').classList.remove('hide');
+  $('who').textContent = username ? '· ' + username : '';
+  $('changePwd').classList.remove('hide'); $('refresh').classList.remove('hide'); $('logout').classList.remove('hide');
   load();
 }
-function showLogin(){ $('dash').classList.add('hide'); $('login').classList.remove('hide'); $('refresh').classList.add('hide'); $('logout').classList.add('hide'); }
-function load(){
-  api('/v1/admin/networks').then(function(j){ renderNets(j.networks) }).catch(function(e){ if(/401/.test(e.message)) showLogin(); });
-  api('/v1/admin/audit?limit=50').then(function(j){ renderAudit(j.actions) }).catch(function(){});
+
+function auth(){
+  var body = {username:$('username').value.trim(), password:$('password').value};
+  var path = '/v1/admin/login';
+  if (needBootstrap) { body.secret = $('secret').value; path = '/v1/admin/bootstrap'; }
+  $('authMsg').textContent='处理中…';
+  api(path,'POST',body).then(function(j){
+    $('password').value=''; $('secret').value=''; $('authMsg').textContent='';
+    showDash(j.username || body.username);
+  }).catch(function(e){
+    $('authMsg').textContent = needBootstrap ? ('创建失败：'+e.message) : ('登录失败：'+e.message);
+  });
 }
+
+function load(){
+  api('/v1/admin/networks').then(function(j){ renderNets(j.networks||[]) }).catch(function(e){
+    if (e.status === 401) { showLogin(); }
+  });
+  loadAudit();
+}
+function loadAudit(){
+  var kind = $('auditKind').value, q = $('auditSearch').value.trim().toLowerCase();
+  api('/v1/admin/audit?limit=200').then(function(j){
+    var rows = (j.actions||[]).filter(function(a){
+      if (kind && String(a.action).indexOf(kind) !== 0) return false;
+      if (q) {
+        var hay = (a.action+' '+a.target+' '+a.detail+' '+(a.actor||'')).toLowerCase();
+        if (hay.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+    renderAudit(rows);
+  }).catch(function(){});
+}
+
 function renderNets(list){
-  nets = list || [];
+  nets = list;
+  var total = 0, online = 0, resv = 0, offlineLong = 0;
+  list.forEach(function(n){ total += n.nodes; online += n.online; resv += n.reservations; });
+  $('statNets').textContent = list.length;
+  $('statNodes').textContent = total;
+  $('statOnline').textContent = online;
+  $('statResv').textContent = resv;
+
   var pick = $('netPick');
-  var keep = current || (pick.value || null);
-  pick.innerHTML='';
-  nets.forEach(function(n){
-    var opt=document.createElement('option');
-    opt.value=n.id; opt.textContent=n.name+' · '+n.cidr+'（在线 '+n.online+'/'+n.nodes+'）';
+  var keep = current || pick.value || null;
+  pick.innerHTML = '';
+  list.forEach(function(n){
+    var opt = document.createElement('option');
+    opt.value = n.id;
+    opt.textContent = n.name + ' · ' + n.cidr + '（在线 ' + n.online + '/' + n.nodes + '）';
     pick.appendChild(opt);
   });
-  if (keep && nets.some(function(n){return n.id===keep;})) {
-    pick.value = keep;
-  } else if (nets.length) {
-    pick.value = nets[0].id;
-    current = nets[0].id;
-  }
-  // 有网络就自动展开选中的那个，省一次点击
-  if (current) loadNodes(current);
+  if (keep && list.some(function(n){return n.id===keep;})) pick.value = keep;
+  else if (list.length) { pick.value = list[0].id; current = list[0].id; }
 
   var t = $('nets'); t.innerHTML='';
   if (!list.length) t.innerHTML = '<tr><td colspan="6" class="muted">还没有网络，先新建一个</td></tr>';
   list.forEach(function(n){
-    var tr=document.createElement('tr');
+    var tr = document.createElement('tr');
     tr.innerHTML = '<td><b>'+esc(n.name)+'</b><div class="muted" style="font-size:12px">'+esc(n.id)+'</div></td>'+
       '<td>'+esc(n.cidr)+'</td><td>'+n.nodes+'</td><td>'+n.online+'</td><td>'+n.reservations+'</td>';
-    var td=document.createElement('td'); td.className='row';
-    td.appendChild(btn('查看','sm',function(){ current=n.id; $('netPick').value=n.id; loadNodes(n.id); }));
+    var td = document.createElement('td'); td.className='row';
+    td.appendChild(btn('查看','sm',function(){ current=n.id; pick.value=n.id; loadNodes(n.id); }));
     td.appendChild(btn('改网段','sm',function(){
       var v=prompt('新网段（10.x.0.0/16）。落在网段外的节点会被重新分配地址', n.cidr);
-      if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(function(){ load(); }).catch(function(e){alert(e.message)});
+      if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(load).catch(function(e){alert(e.message)});
     }));
     td.appendChild(btn('换密钥','sm',function(){
       if(!confirm('换掉「'+n.name+'」的加入密钥？旧令牌立刻失效')) return;
       api('/v1/admin/networks/'+n.id+'/rotate','POST',{}).then(function(j){
-        $('tokenOut').classList.remove('hide'); $('tokenOut').textContent='新令牌（只显示这一次）：\\n'+j.token;
+        $('tokenOut').classList.remove('hide');
+        $('tokenOut').textContent = '新令牌（只显示这一次）：\\n' + j.token;
       }).catch(function(e){alert(e.message)});
     }));
     td.appendChild(btn('删除','sm danger',function(){
@@ -2114,88 +2542,193 @@ function renderNets(list){
     }));
     tr.appendChild(td); t.appendChild(tr);
   });
+
+  if (current) loadNodes(current);
 }
+
 function btn(text, cls, fn){ var b=document.createElement('button'); b.textContent=text; b.className=cls; b.onclick=fn; return b; }
+
 function loadNodes(id){
   current = id;
   $('nodesCard').classList.remove('hide');
-  $('nodesFor').textContent='· '+id;
+  $('nodesFor').textContent = '· ' + id;
   api('/v1/admin/networks/'+id+'/nodes').then(function(j){
-    var online = j.nodes.filter(function(n){return n.online}).length;
-    $('nodesFor').textContent='· '+j.network.name+' '+j.network.cidr+
-      '　在线 '+online+' / 共 '+j.nodes.length;
-    var t=$('nodes'); t.innerHTML='';
-    if(!j.nodes.length) t.innerHTML='<tr><td colspan="6" class="muted">还没有节点</td></tr>';
-    j.nodes.slice().sort(function(a,b){
-      if (a.online !== b.online) return a.online ? -1 : 1;
-      return 0;
-    }).forEach(function(n){
-      var tr=document.createElement('tr');
-      tr.innerHTML='<td><span class="dot '+(n.online?'on':'off')+'"></span>'+(n.online?'在线':'离线')+'</td>'+
-        '<td>'+esc(n.name)+(n.reserved?' <span class="muted" style="font-size:12px">已固定</span>':'')+'</td>'+
-        '<td>'+esc(n.virtual_ip)+'</td><td>'+esc(n.nat_type)+'</td><td class="muted">'+ago(n.last_seen)+'</td>';
-      var td=document.createElement('td'); td.className='row';
-      td.appendChild(btn('踢下线','sm danger',function(){
-        if(!confirm('把「'+n.name+'」踢下线？')) return;
-        api('/v1/admin/networks/'+id+'/nodes/'+n.node_id+'/kick','POST',{}).then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
-      }));
-      td.appendChild(btn('固定此 IP','sm',function(){
-        api('/v1/admin/networks/'+id+'/reservations','POST',{ip:n.virtual_ip,node_id:n.node_id,note:'页面固定'})
-          .then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
-      }));
-      tr.appendChild(td); t.appendChild(tr);
-    });
-    var r=$('resv'); r.innerHTML='';
-    if(!j.reservations.length) r.innerHTML='<tr><td colspan="5" class="muted">没有预留</td></tr>';
-    j.reservations.forEach(function(x){
-      var tr=document.createElement('tr');
-      tr.innerHTML='<td>'+esc(x.ip)+'</td><td class="muted">'+esc(x.node_id||'—')+'</td><td>'+(x.kind==='user'?'手动':'自动')+'</td><td class="muted">'+esc(x.note||'')+'</td>';
-      var td=document.createElement('td');
-      td.appendChild(btn('释放','sm danger',function(){
-        api('/v1/admin/networks/'+id+'/reservations/'+x.ip,'DELETE').then(function(){loadNodes(id)}).catch(function(e){alert(e.message)});
-      }));
-      tr.appendChild(td); r.appendChild(tr);
-    });
-  }).catch(function(e){ if(/401/.test(e.message)) showLogin(); });
+    nodes = j.nodes || []; reservations = j.reservations || [];
+    var online = nodes.filter(function(n){return n.online}).length;
+    var longOff = nodes.filter(function(n){return !n.online && Date.now()-n.last_seen > 600000}).length;
+    $('nodesFor').textContent = '· ' + j.network.name + ' ' + j.network.cidr + '　在线 ' + online + ' / 共 ' + nodes.length;
+    renderHealth(longOff);
+    renderNodes();
+    renderResv();
+  }).catch(function(e){ if (e.status === 401) showLogin(); });
 }
+
+function renderHealth(longOff){
+  var sym = nodes.filter(function(n){return n.online && natRisk(n.nat_type)}).length;
+  var msgs = [];
+  if (longOff) msgs.push(longOff + ' 台设备离线超过 10 分钟');
+  if (sym) msgs.push(sym + ' 台在线设备是对称 NAT，打洞可能失败');
+  var banner = $('healthBanner');
+  if (!msgs.length) { banner.classList.add('hide'); return; }
+  banner.classList.remove('hide');
+  banner.textContent = '⚠ ' + msgs.join('；');
+}
+
+function renderNodes(){
+  var t = $('nodes'); t.innerHTML='';
+  if (!nodes.length) t.innerHTML = '<tr><td colspan="8" class="muted">还没有节点</td></tr>';
+  nodes.slice().sort(function(a,b){ if(a.online!==b.online) return a.online?-1:1; return 0; }).forEach(function(n){
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td><input type="checkbox" class="pick" data-id="'+esc(n.node_id)+'" style="width:auto"></td>'+
+      '<td><span class="dot '+(n.online?'on':'off')+'"></span>'+(n.online?'在线':'离线')+'</td>'+
+      '<td>'+esc(n.name)+(n.reserved?' <span class="tag good">已固定</span>':'')+'</td>'+
+      '<td>'+esc(n.virtual_ip)+'</td>'+
+      '<td>'+esc(natLabel(n.nat_type))+(natRisk(n.nat_type)?' <span class="tag warn">风险</span>':'')+'</td>'+
+      '<td class="muted">'+span(n.first_seen)+'</td>'+
+      '<td class="muted">'+ago(n.last_seen)+'</td>';
+    var td = document.createElement('td'); td.className='row';
+    td.appendChild(btn('详情','sm',function(){ toggleDetail(tr, n); }));
+    td.appendChild(btn('踢下线','sm danger',function(){
+      if(!confirm('把「'+n.name+'」踢下线？')) return;
+      api('/v1/admin/networks/'+current+'/nodes/'+n.node_id+'/kick','POST',{}).then(function(){loadNodes(current)}).catch(function(e){alert(e.message)});
+    }));
+    td.appendChild(btn('固定此 IP','sm',function(){
+      api('/v1/admin/networks/'+current+'/reservations','POST',{ip:n.virtual_ip,node_id:n.node_id,note:'页面固定'})
+        .then(function(){loadNodes(current)}).catch(function(e){alert(e.message)});
+    }));
+    tr.appendChild(td);
+    t.appendChild(tr);
+  });
+  $('checkAll').checked = false;
+  $('kickSelected').disabled = true;
+  bindPicks();
+}
+
+function toggleDetail(tr, n){
+  var next = tr.nextSibling;
+  if (next && next.classList && next.classList.contains('detail')) { next.remove(); return; }
+  var cands = (n.candidates || []).map(function(c){ return typeof c === 'string' ? c : (c.addr || JSON.stringify(c)); });
+  var adv = (n.advertised || []).join(', ') || '—';
+  var d = document.createElement('tr');
+  d.className = 'detail';
+  d.innerHTML = '<td colspan="8"><div class="kv">'+
+    '<div>node_id</div><div>'+esc(n.node_id)+'</div>'+
+    '<div>公钥</div><div>'+esc(n.pubkey ? n.pubkey.slice(0,32)+'…' : '—')+'</div>'+
+    '<div>TLS 指纹</div><div>'+esc(n.tls_fp ? n.tls_fp.slice(0,32)+'…' : '—')+'</div>'+
+    '<div>候选地址</div><div>'+esc(cands.join('  ') || '—')+'</div>'+
+    '<div>广告路由</div><div>'+esc(adv)+'</div>'+
+    '<div>首次上线</div><div>'+esc(new Date(n.first_seen||n.last_seen).toLocaleString())+'</div>'+
+    '<div>快捷命令</div><div class="row">'+
+      '<button class="sm" data-copy="ping '+esc(n.virtual_ip)+'">复制 ping</button>'+
+      '<button class="sm" data-copy="ssh '+esc(n.virtual_ip)+'">复制 ssh</button>'+
+    '</div></div></td>';
+  tr.parentNode.insertBefore(d, tr.nextSibling);
+  d.querySelectorAll('[data-copy]').forEach(function(b){
+    b.onclick = function(){ copyText(b.getAttribute('data-copy')); };
+  });
+}
+
+function bindPicks(){
+  var boxes = document.querySelectorAll('.pick');
+  Array.prototype.forEach.call(boxes, function(b){ b.onchange = updateKickBtn; });
+  updateKickBtn();
+}
+function picked(){
+  return Array.prototype.filter.call(document.querySelectorAll('.pick'), function(b){return b.checked})
+    .map(function(b){return b.getAttribute('data-id')});
+}
+function updateKickBtn(){ $('kickSelected').disabled = picked().length === 0; }
+
+function renderResv(){
+  var r = $('resv'); r.innerHTML='';
+  if (!reservations.length) r.innerHTML = '<tr><td colspan="5" class="muted">没有预留</td></tr>';
+  reservations.forEach(function(x){
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(x.ip)+'</td><td class="muted">'+esc(x.node_id||'—')+'</td>'+
+      '<td>'+(x.kind==='user'?'手动':'自动')+'</td><td class="muted">'+esc(x.note||'')+'</td>';
+    var td = document.createElement('td');
+    td.appendChild(btn('释放','sm danger',function(){
+      api('/v1/admin/networks/'+current+'/reservations/'+x.ip,'DELETE').then(function(){loadNodes(current)}).catch(function(e){alert(e.message)});
+    }));
+    tr.appendChild(td); r.appendChild(tr);
+  });
+}
+
 function renderAudit(list){
-  var t=$('audit'); t.innerHTML='';
-  if(!list || !list.length){ t.innerHTML='<tr><td colspan="4" class="muted">还没有操作记录</td></tr>'; return; }
+  var t = $('audit'); t.innerHTML='';
+  if (!list || !list.length) { t.innerHTML = '<tr><td colspan="5" class="muted">没有匹配的记录</td></tr>'; return; }
   list.forEach(function(a){
-    var tr=document.createElement('tr');
-    tr.innerHTML='<td class="muted">'+new Date(a.at).toLocaleString()+'</td><td>'+esc(a.action)+'</td><td>'+esc(a.target)+'</td><td class="muted">'+esc(a.detail)+'</td>';
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td class="muted">'+new Date(a.at).toLocaleString()+'</td>'+
+      '<td>'+esc(a.actor || '—')+'</td><td>'+esc(a.action)+'</td>'+
+      '<td>'+esc(a.target)+'</td><td class="muted">'+esc(a.detail)+'</td>';
     t.appendChild(tr);
   });
 }
-$('doLogin').onclick=function(){
-  $('loginMsg').textContent='登录中…';
-  api('/v1/admin/login','POST',{secret:$('secret').value}).then(function(){
-    $('secret').value=''; $('loginMsg').textContent=''; showDash();
-  }).catch(function(e){ $('loginMsg').textContent='登录失败：'+e.message; });
+
+$('doAuth').onclick = auth;
+$('password').addEventListener('keydown', function(e){ if(e.key==='Enter') auth(); });
+$('secret').addEventListener('keydown', function(e){ if(e.key==='Enter') auth(); });
+$('netPick').onchange = function(){ if(this.value) loadNodes(this.value); };
+$('refreshNodes').onclick = function(){ if(current) loadNodes(current); };
+$('refresh').onclick = load;
+$('logout').onclick = function(){ api('/v1/admin/logout','POST',{}).then(showLogin).catch(showLogin); };
+$('changePwd').onclick = function(){
+  var oldPwd = prompt('当前密码'); if(!oldPwd) return;
+  var newPwd = prompt('新密码（至少 8 位）'); if(!newPwd) return;
+  api('/v1/admin/password','POST',{old_password:oldPwd,new_password:newPwd})
+    .then(function(){ alert('密码已更新'); }).catch(function(e){ alert(e.message); });
 };
-$('secret').addEventListener('keydown',function(e){ if(e.key==='Enter') $('doLogin').click(); });
-$('netPick').onchange=function(){ if(this.value) loadNodes(this.value); };
-$('refreshNodes').onclick=function(){ if(current) loadNodes(current); };
-$('refresh').onclick=load;
-$('logout').onclick=function(){ api('/v1/admin/logout','POST',{}).then(showLogin).catch(showLogin); };
-$('createNet').onclick=function(){
-  var body={name:$('newName').value.trim()};
-  if($('newCidr').value.trim()) body.cidr=$('newCidr').value.trim();
-  if($('newKey').value.trim()) body.join_key=$('newKey').value.trim();
+$('createNet').onclick = function(){
+  var body = {name:$('newName').value.trim()};
+  if($('newCidr').value.trim()) body.cidr = $('newCidr').value.trim();
+  if($('newKey').value.trim()) body.join_key = $('newKey').value.trim();
   api('/v1/admin/networks','POST',body).then(function(j){
     $('tokenOut').classList.remove('hide');
-    $('tokenOut').textContent='加入令牌（只显示这一次，请立刻保存）：\\n'+j.token+'\\n\\n客户端命令：\\nqp2p join '+j.token+' --name 设备名';
+    $('tokenOut').textContent = '加入令牌（只显示这一次，请立刻保存）：\\n' + j.token + '\\n\\n客户端命令：\\nqp2p join ' + j.token + ' --name 设备名';
     $('newName').value=''; $('newCidr').value=''; $('newKey').value='';
     load();
   }).catch(function(e){ alert(e.message); });
 };
-$('addResv').onclick=function(){
+$('addResv').onclick = function(){
   if(!current) return;
   api('/v1/admin/networks/'+current+'/reservations','POST',{ip:$('resvIp').value.trim(),node_id:$('resvNode').value.trim(),note:$('resvNote').value.trim()})
-    .then(function(){ $('resvIp').value='';$('resvNode').value='';$('resvNote').value=''; loadNodes(current); })
-    .catch(function(e){alert(e.message)});
+    .then(function(){ $('resvIp').value=''; $('resvNode').value=''; $('resvNote').value=''; loadNodes(current); })
+    .catch(function(e){ alert(e.message); });
 };
-api('/v1/admin/networks').then(function(){ showDash() }).catch(function(){ showLogin() });
+$('checkAll').onchange = function(){
+  var on = this.checked;
+  Array.prototype.forEach.call(document.querySelectorAll('.pick'), function(b){ b.checked = on; });
+  updateKickBtn();
+};
+$('kickSelected').onclick = function(){
+  var ids = picked(); if(!ids.length) return;
+  if(!confirm('把选中的 ' + ids.length + ' 台设备踢下线？')) return;
+  api('/v1/admin/networks/'+current+'/nodes/kick','POST',{node_ids:ids})
+    .then(function(){ loadNodes(current); }).catch(function(e){ alert(e.message); });
+};
+$('exportNodes').onclick = function(){
+  var rows = [['名称','虚拟IP','node_id','状态','NAT','在线时长','最后心跳','固定IP']];
+  nodes.forEach(function(n){
+    rows.push([n.name,n.virtual_ip,n.node_id,n.online?'在线':'离线',natLabel(n.nat_type),span(n.first_seen),new Date(n.last_seen).toLocaleString(),n.reserved?'是':'否']);
+  });
+  download('qp2p-members.csv', rows);
+};
+$('exportResv').onclick = function(){
+  var rows = [['IP','node_id','类型','备注','创建时间']];
+  reservations.forEach(function(r){
+    rows.push([r.ip,r.node_id,r.kind==='user'?'手动':'自动',r.note||'',new Date(r.created_at).toLocaleString()]);
+  });
+  download('qp2p-reservations.csv', rows);
+};
+$('auditKind').onchange = loadAudit;
+$('auditSearch').oninput = loadAudit;
+
+// 打开页面：先问服务端是否已初始化账号
+api('/v1/admin/status').then(function(j){
+  if (j.needs_bootstrap) { showBoot(); return; }
+  api('/v1/admin/me').then(function(me){ showDash(me.username); }).catch(function(){ showLogin(); });
+}).catch(function(){ showLogin(); });
 </script>
 </body>
 </html>`;
