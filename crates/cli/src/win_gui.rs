@@ -217,7 +217,7 @@ pub fn run(state: State) -> Result<()> {
             left: 0,
             top: 0,
             right: (620.0 * scale) as i32,
-            bottom: (664.0 * scale) as i32,
+            bottom: (494.0 * scale) as i32,
         };
         AdjustWindowRect(&mut rect, style, 0);
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -467,7 +467,7 @@ fn build_ui(state: State, main: HWND, icon: HANDLE, scale: f32) -> Ui {
         M,
         284,
         588,
-        340,
+        170,
         ID_LOG,
     );
 
