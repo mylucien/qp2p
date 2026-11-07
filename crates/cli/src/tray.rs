@@ -8,7 +8,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -110,10 +110,11 @@ thread_local! {
 
 fn write_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
     let units: Vec<u16> = text.encode_utf16().take(127).collect();
-    for (slot, unit) in nid.szTip.iter_mut().zip(units) {
+    let len = units.len();
+    for (slot, unit) in nid.szTip.iter_mut().zip(units.into_iter()) {
         *slot = unit;
     }
-    if let Some(last) = nid.szTip.get_mut(units.len()) {
+    if let Some(last) = nid.szTip.get_mut(len) {
         *last = 0;
     }
 }
