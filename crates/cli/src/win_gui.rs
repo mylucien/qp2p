@@ -318,7 +318,7 @@ fn build_ui(state: State, main: HWND, icon: HANDLE, scale: f32) -> Ui {
 
     // 用宏而不是闭包：闭包要 `mut` 才能推 push，而且 8 个参数会触发 clippy
     macro_rules! mk {
-        ($class:expr, $text:expr, $style:expr, $x:expr, $y:expr, $w:expr, $hh:expr, $id:expr) => {{
+        ($class:expr, $text:expr, $style:expr, $x:expr, $y:expr, $w:expr, $hh:expr, $id:expr $(,)?) => {{
             let handle = child(main, $class, $text, $style, $x, $y, $w, $hh, $id, scale);
             ids.push(handle);
             handle
