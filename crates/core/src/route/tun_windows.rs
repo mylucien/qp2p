@@ -17,6 +17,26 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use super::{Cidr, TunConfig, TunDevice};
 
 const WINTUN_DLL: &str = "wintun.dll";
+/// 内嵌的官方 wintun 0.14.1（amd64）。找不到外部 dll 时解到本地目录再用，
+/// 这样只发一个 exe 也能建虚拟网卡。
+const EMBEDDED_WINTUN: &[u8] = include_bytes!("../../../../assets/wintun.dll");
+
+/// 内置 dll 的落盘位置：优先 %LOCALAPPDATA%\qp2p（用户可写、不进 Program Files）。
+fn embedded_dll_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("qp2p");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(WINTUN_DLL);
+    let stale = std::fs::read(&path)
+        .map(|existing| existing != EMBEDDED_WINTUN)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&path, EMBEDDED_WINTUN).ok()?;
+    }
+    Some(path)
+}
 /// 会话环形缓冲区大小，也是单包上限（WinTun 要求 128KiB 起步）。
 const RING_CAPACITY: u32 = 0x40_0000;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
@@ -65,6 +85,13 @@ impl WintunApi {
                 match beside {
                     Some(path) if path.exists() => unsafe { Library::new(path) },
                     _ => Err(e),
+                }
+            })
+            .or_else(|e| {
+                // 再退一步：用编译时内嵌的那份（单文件分发）
+                match embedded_dll_path() {
+                    Some(path) => unsafe { Library::new(path) },
+                    None => Err(e),
                 }
             })
             .with_context(|| format!("加载 {WINTUN_DLL} 失败。{}", download_hint()))?;
