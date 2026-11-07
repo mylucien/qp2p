@@ -752,12 +752,40 @@ async function checkAdmin(request, env) {
 
 const ADMIN_COOKIE = "qp2p_admin";
 const ADMIN_SESSION_MS = 2 * 60 * 60 * 1000; // 2 小时
-const PBKDF2_ITERATIONS = 120_000;
+// Cloudflare 的 WebCrypto 对 PBKDF2 有硬上限：iterations ≤ 100000，
+// 超了会直接抛 "iteration counts above 100000 are not supported"。
+// 迭代轮数按用户存库，将来调整只影响新账号。
+const PBKDF2_ITERATIONS = 100_000;
+
+/**
+ * 允许用环境变量调低轮数。
+ *
+ * 免费档 CPU 上限只有 10ms/请求，如果登录时报 1102（超出 CPU），
+ * 在 Settings → Variables 里加 PBKDF2_ITERATIONS=2000 即可；付费档可以不管。
+ */
+function pbkdf2Iterations(env) {
+  const raw = Number(env?.PBKDF2_ITERATIONS ?? PBKDF2_ITERATIONS);
+  if (!Number.isFinite(raw) || raw <= 0) return PBKDF2_ITERATIONS;
+  return Math.max(1_000, Math.min(100_000, Math.floor(raw)));
+}
 const USERNAME_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/;
 const PASSWORD_MIN = 8;
 
 /** PBKDF2-HMAC-SHA256。口令永远不以明文或可逆形式落库。 */
 async function pbkdf2Hex(password, saltHex, iterations) {
+  try {
+    return await pbkdf2HexInner(password, saltHex, iterations);
+  } catch (e) {
+    const text = String(e?.message ?? e);
+    throw new Error(
+      /iteration/i.test(text)
+        ? `口令哈希失败：迭代次数 ${iterations} 超出运行时限制（Workers 上限 100000）`
+        : `口令哈希失败：${text}`,
+    );
+  }
+}
+
+async function pbkdf2HexInner(password, saltHex, iterations) {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(password),
@@ -900,11 +928,12 @@ async function adminBootstrap(request, env) {
 
   const salt = randomSecret();
   const now = Date.now();
+  const iterations = pbkdf2Iterations(env);
   await putAdminUser(env, {
     username,
     salt,
-    hash: await pbkdf2Hex(password, salt, PBKDF2_ITERATIONS),
-    iterations: PBKDF2_ITERATIONS,
+    hash: await pbkdf2Hex(password, salt, iterations),
+    iterations,
     created_at: now,
     updated_at: now,
   });
@@ -987,11 +1016,12 @@ async function adminPassword(request, env) {
   if (next.length < PASSWORD_MIN) return err(400, "weak_password", `密码至少 ${PASSWORD_MIN} 位`);
 
   const salt = randomSecret();
+  const iterations = pbkdf2Iterations(env);
   await putAdminUser(env, {
     username: session.username,
     salt,
-    hash: await pbkdf2Hex(next, salt, PBKDF2_ITERATIONS),
-    iterations: PBKDF2_ITERATIONS,
+    hash: await pbkdf2Hex(next, salt, iterations),
+    iterations,
     created_at: Number(user.created_at),
     updated_at: Date.now(),
   });
@@ -1015,11 +1045,12 @@ async function adminResetPassword(request, env) {
   if (next.length < PASSWORD_MIN) return err(400, "weak_password", `密码至少 ${PASSWORD_MIN} 位`);
 
   const salt = randomSecret();
+  const iterations = pbkdf2Iterations(env);
   await putAdminUser(env, {
     username,
     salt,
-    hash: await pbkdf2Hex(next, salt, PBKDF2_ITERATIONS),
-    iterations: PBKDF2_ITERATIONS,
+    hash: await pbkdf2Hex(next, salt, iterations),
+    iterations,
     created_at: Number(user.created_at),
     updated_at: Date.now(),
   });

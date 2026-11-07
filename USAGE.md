@@ -318,7 +318,7 @@ qp2p up --mtu 1280 --route 192.168.1.0/24 --save
 这一步需要填 `ADMIN_SECRET` 作为初始化密钥；**之后只用账号密码登录**，
 `ADMIN_SECRET` 不再参与日常使用（它能做的只剩命令行和重置密码）。
 
-- 密码用 PBKDF2-HMAC-SHA256（12 万轮）加盐存储，数据库里没有明文；
+- 密码用 PBKDF2-HMAC-SHA256（10 万轮，Cloudflare WebCrypto 的上限）加盐存储，数据库里没有明文；
 - 登录成功签发 2 小时 HttpOnly + SameSite=Strict 的会话 cookie；
 - 右上角「改密码」需要验证旧密码；
 - 忘记密码：
