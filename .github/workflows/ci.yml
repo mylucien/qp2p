@@ -194,3 +194,70 @@ jobs:
           name: qp2p-android-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+  # 只有打 v* 标签才发布。包全部来自本次运行刚编出来的产物，
+  # 不从别处下载、不在本地上传，保证 Release 里的文件和 tag 指向的代码是同一份。
+  release:
+    name: release (${{ github.ref_name }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, signal, build, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载本次构建的全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: qp2p-*
+
+      - name: 整理成发布文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::缺少 $NOTES，发版前请先写好发布说明"
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "artifacts/qp2p-windows-x86_64/qp2p.exe"  "dist/qp2p-${VERSION}-windows-x86_64.exe"
+          cp "artifacts/qp2p-linux-x86_64/qp2p"        "dist/qp2p-${VERSION}-linux-x86_64"
+          cp "artifacts/qp2p-linux-x86_64-static/qp2p" "dist/qp2p-${VERSION}-linux-x86_64-static"
+          APK=$(find artifacts/qp2p-android-apk -name '*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::error::Android 产物里没找到 apk"
+            exit 1
+          fi
+          cp "$APK" "dist/qp2p-${VERSION}-android.apk"
+          chmod +x "dist/qp2p-${VERSION}-linux-x86_64" "dist/qp2p-${VERSION}-linux-x86_64-static"
+
+          (cd dist && sha256sum qp2p-* > SHA256SUMS.txt)
+          ls -lh dist
+          cat dist/SHA256SUMS.txt
+
+      # 重跑时 Release 可能已经存在，这时只覆盖附件，不重复创建。
+      - name: 创建 Release 并上传
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          NOTES=".github/release-notes/${TAG}.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release 已存在，覆盖附件"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "qp2p ${TAG#v}" \
+              --notes-file "$NOTES" \
+              --verify-tag \
+              dist/*
+          fi
+          gh release view "$TAG" --json url,tagName,assets --jq \
+            '"发布页: " + .url, "资产: " + ([.assets[].name] | join(", "))'

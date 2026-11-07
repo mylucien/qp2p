@@ -119,22 +119,30 @@ qp2p gui     # 同一个东西，显式写出来而已
 
 ## 2. 安装客户端
 
-从仓库 **Actions → 最新一次 ci → Artifacts** 下载：
+从仓库 **Releases → 最新版** 下载（每个版本都附 `SHA256SUMS.txt`）：
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Linux x86_64（主流发行版） | `qp2p-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Windows x86_64 | `qp2p-windows-x86_64` | 解压出 `qp2p.exe` |
+| Windows 10/11 x64 | `qp2p-0.1.1-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.1-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.1-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Android 8+ | `qp2p-0.1.1-android.apk` | VpnService，debug 签名 |
+
+下载完先校验，避免下到损坏的包：
 
 ```bash
-chmod +x qp2p-linux-x86_64-static
-sudo mv qp2p-linux-x86_64-static /usr/local/bin/qp2p
+sha256sum -c SHA256SUMS.txt
+```
+
+Linux 安装：
+
+```bash
+chmod +x qp2p-0.1.1-linux-x86_64-static
+sudo mv qp2p-0.1.1-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
-**Windows 的虚拟网卡**还需要 `wintun.dll`：从 <https://www.wintun.net/> 下载 amd64 包，
-把 `bin/amd64/wintun.dll` 放到 `qp2p.exe` 同目录。没有它也能打洞，只是不能 ping 通对端。
+Windows 直接双击 exe：图标和 `wintun.dll` 已经内嵌，**不用另外下载 dll**。
 
 ---
 
@@ -559,3 +567,86 @@ TOKEN=$(./target/debug/qp2p token --data-dir /tmp/qa)
 cargo test --all          # Rust：单测 + e2e 打洞
 node signal/smoke.mjs     # 信令：内存 + D1 两条存储路径
 ```
+
+---
+
+## 12. 开发者：发一个新版本
+
+发布完全由 GitHub Actions 完成：打 `v*` 标签 → CI 跑测试和四个平台构建 →
+自动创建 Release、上传安装包和 `SHA256SUMS.txt`。**不用本地编译，也不用本地上传文件**，
+Release 里的包一定和 tag 指向的代码是同一份。
+
+### 第 1 步：改版本号
+
+改 `Cargo.toml` 的 `version`，以及 `android/app/build.gradle.kts` 里的
+`versionName` / `versionCode`。
+
+```bash
+grep '^version' Cargo.toml
+```
+
+**验收**：输出的版本号和要发的版本一致。
+
+### 第 2 步：写发布说明
+
+新建 `.github/release-notes/vX.Y.Z.md`，**文件名必须和标签完全一致**。
+内容写下载表、这版改了什么、快速开始、已知限制。校验值不用写死，
+CI 会算好 `SHA256SUMS.txt` 一起传上去。
+
+```bash
+test -f .github/release-notes/v0.1.2.md && echo OK
+```
+
+**验收**：打印 `OK`。少了这个文件，release job 会直接报「缺少发布说明」并停下。
+
+### 第 3 步：推到 main
+
+```bash
+git add -A                                # 新增文件必须先 add，否则会漏推
+python scripts/push_api.py "release: 0.1.2"
+```
+
+本机 `git push` 走代理会返回 502，一律用这个脚本（它走 GitHub API）。
+
+**验收**：打开 <https://github.com/mylucien/qp2p/commits/main>，
+最新提交是刚才那句说明，且 `.github/release-notes/` 下能看到新文件。
+
+### 第 4 步：打标签触发发布
+
+```bash
+python scripts/tag_api.py v0.1.2
+```
+
+脚本会把标签打在远端 main 当前 HEAD 上；同名标签已存在时直接拒绝，不覆盖不删除。
+
+**验收**：命令打印 `已打标签 v0.1.2 → <7 位 sha>`。
+
+### 第 5 步：看 CI
+
+打开 <https://github.com/mylucien/qp2p/actions>，找 tag 那次 `ci` 运行。
+
+**验收**：`test (ubuntu-latest)`、`test (windows-latest)`、`signal (node)`、
+三个 `build (...)`、`android (apk)` 全绿，最后 `release (v0.1.2)` 也绿。
+前面任何一个红了都不会发布（release job 依赖它们全部成功）。
+
+### 第 6 步：验收发布页
+
+打开 <https://github.com/mylucien/qp2p/releases/tag/v0.1.2>
+
+| 判据 | 期望 |
+|---|---|
+| 附件数量 | 5 个：4 个安装包 + `SHA256SUMS.txt` |
+| 说明文字 | 与 `.github/release-notes/v0.1.2.md` 一致 |
+| 文件校验 | 下载后 `sha256sum -c SHA256SUMS.txt` 全部 `OK` |
+| 版本号 | Linux 上 `qp2p -V` 输出 `qp2p 0.1.2` |
+| Windows | 双击 exe 弹 UAC，确认后直接进图形界面，不需要另外放 `wintun.dll` |
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+### 重跑
+
+在 Actions 页面点 **Re-run all jobs** 即可：Release 已存在时流程只覆盖附件
+（`gh release upload --clobber`），不会重复创建，也不会改说明文字。
+如果改了 md 里的说明，需要到 Release 页面手动编辑正文才生效。
