@@ -123,9 +123,22 @@ jobs:
           sudo tar -xJf /tmp/zig.tar.xz -C /opt
           sudo ln -sf "/opt/zig-linux-x86_64-${ZIG_VER}/zig" /usr/local/bin/zig
 
-          # cargo 的 linker 只能是一个可执行文件、不能带参数，所以包一层
+          # cargo 的 linker 只能是一个可执行文件、不能带参数，所以包一层。
+          # cc-rs 还会往编译器里塞 rust 三元组 --target=aarch64-unknown-linux-musl，
+          # zig 不认这个写法（它要 aarch64-linux-musl），在这里换掉。
           sudo tee /usr/local/bin/zigcc >/dev/null <<'WRAP'
           #!/bin/sh
+          n=$#
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            a=$1; shift
+            i=$((i + 1))
+            case "$a" in
+              --target=aarch64-unknown-linux-musl) continue ;;
+              aarch64-unknown-linux-musl)         continue ;;
+            esac
+            set -- "$@" "$a"
+          done
           exec zig cc -target aarch64-linux-musl "$@"
           WRAP
           sudo chmod +x /usr/local/bin/zigcc
