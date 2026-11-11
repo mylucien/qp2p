@@ -114,17 +114,47 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # runner 偶尔会解析不了 archive.ubuntu.com（Temporary failure resolving），
-      # 加几次重试＋超时，比一次失败就把整个 job 判死强
-      - name: 安装 musl 工具链
+      # 曾经用 apt 装 musl-tools，但 runner 会间歇性解析不了 archive.ubuntu.com
+      # （Temporary failure resolving），一个 job 能卡十几分钟再失败。
+      # x86_64 也改用 zig：和下面 aarch64 同一套办法，不依赖任何第三方 apt 源。
+      - name: 安装 x86_64 musl 工具链（zig cc）
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          APT="sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30"
-          for i in 1 2 3; do
-            $APT update -qq && $APT install -y musl-tools && exit 0
-            echo "第 $i 次失败，20 秒后重试"; sleep 20
+          set -euo pipefail
+          ZIG_VER=0.13.0
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz" \
+            -o /tmp/zig.tar.xz
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt
+          sudo ln -sf "/opt/zig-linux-x86_64-${ZIG_VER}/zig" /usr/local/bin/zig
+
+          # cargo 的 linker 只能是一个可执行文件、不能带参数，所以包一层。
+          # cc-rs 会塞 rust 三元组 --target=x86_64-unknown-linux-musl，
+          # zig 不认这个写法（它要 x86_64-linux-musl），在这里换掉。
+          sudo tee /usr/local/bin/zigcc >/dev/null <<'WRAP'
+          #!/bin/sh
+          n=$#
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            a=$1; shift
+            i=$((i + 1))
+            case "$a" in
+              --target=x86_64-unknown-linux-musl) continue ;;
+              x86_64-unknown-linux-musl)          continue ;;
+            esac
+            set -- "$@" "$a"
           done
-          exit 1
+          exec zig cc -target x86_64-linux-musl "$@"
+          WRAP
+          sudo chmod +x /usr/local/bin/zigcc
+
+          {
+            echo "CC_x86_64_unknown_linux_musl=zigcc"
+            echo "AR_x86_64_unknown_linux_musl=ar"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=zigcc"
+            echo "RUSTFLAGS=-C link-self-contained=no"
+          } >> "$GITHUB_ENV"
+
+          zig version
 
       # musl-tools 只有 x86_64 的 musl-gcc，aarch64 得自己准备交叉工具链。
       # 试过 musl.cc 的预编译包，runner 上连不上（connect 超时 130s+），换成 zig cc：
@@ -175,8 +205,9 @@ jobs:
 
       - name: Build release
         env:
-          # 只有 musl 目标需要；其它目标忽略
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          # 只有 musl 目标需要；其它目标忽略。两个 musl 目标都由 zig 提供工具链，
+          # 环境变量在各自的安装步骤里已经写进 GITHUB_ENV。
+          CC_x86_64_unknown_linux_musl: zigcc
         run: cargo build --release --target ${{ matrix.target }} -p qp2p-cli
 
       # WinTun 是运行期加载的 dll，不打包进去用户就得自己找，
