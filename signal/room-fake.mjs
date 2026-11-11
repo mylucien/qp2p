@@ -80,4 +80,25 @@ export class RoomFakeState {
   setWebSocketAutoResponse(pair) {
     this.autoResponse = pair;
   }
+
+  /** 真机的 Hibernation API：登记 socket（可选 tags）。 */
+  acceptWebSocket(ws, tags = []) {
+    ws._state = this;
+    ws._tags = tags;
+    ws.accept?.();
+    if (!this.sockets.includes(ws)) this.sockets.push(ws);
+  }
+
+  /**
+   * 自动应答时间戳。真机上由运行时在收到 ping 时刷新；本地没有运行时，
+   * 直接读 `socket._autoAt`，由测试自己改它来模拟"时间戳在推进"。
+   */
+  getWebSocketAutoResponseTimestamp(ws) {
+    return ws?._autoAt ? new Date(ws._autoAt) : null;
+  }
+
+  /** 连接关闭后要从列表里摘掉，否则 liveness 会一直看到已经断掉的 socket。 */
+  dropSocket(ws) {
+    this.sockets = this.sockets.filter((s) => s !== ws);
+  }
 }

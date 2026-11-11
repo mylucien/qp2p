@@ -154,11 +154,20 @@ export default {
     }
 
     if (!(res instanceof Response)) {
+      // 本地冒烟的 101 是替身对象（node 的 Response 不接受 101），只有它会走到这里
+      if (res && res.status === 101 && res.webSocket) return res;
       // 走到这里说明某个分支忘了 return Response，直接 500 会只剩一张空白错误页
       return err(500, "bad_internal_response", `route 返回了 ${typeof res} ${String(res).slice(0, 120)}`);
     }
-    res.headers.set("x-qp2p-colo", colo);
-    res.headers.set("x-qp2p-ms", String(Date.now() - started));
+    // WebSocket 升级响应（101）的头是只读的，set 会抛异常，整条连接就变成空白 500
+    if (res.status !== 101) {
+      try {
+        res.headers.set("x-qp2p-colo", colo);
+        res.headers.set("x-qp2p-ms", String(Date.now() - started));
+      } catch {
+        // 只读头来自 DO 转发，附加信息不是必需的
+      }
+    }
     return res;
   },
 };
@@ -169,7 +178,8 @@ async function route(request, url, env, ctx) {
 
   // 诊断端点：只有显式设置 LAB_DEBUG=1 的部署才会启用，用来把 DO 的异常原样带出来
   if (path === "/__diag" && env.LAB_DEBUG === "1") {
-    const net = { network_id: "home", name: "home", cidr: "10.78.0.0/16" };
+    const netId = url.searchParams.get("net") ?? "home";
+    const net = { network_id: netId, name: netId, cidr: "10.78.0.0/16" };
     const stub = roomStub(env, net);
     if (!stub) return json({ ok: false, error: "no_room" });
     try {
@@ -220,6 +230,7 @@ async function route(request, url, env, ctx) {
   if (resvOne && method === "DELETE") return releaseIp(request, env, resvOne[1], resvOne[2]);
 
   const isRead = method === "GET";
+  if (path === "/v1/ws" && isRead) return wsEntry(request, env, url);
   if (path === "/v1/join" && method === "POST") return joinOrRegister(request, env, url, false);
   if (path === "/v1/register" && method === "POST") return joinOrRegister(request, env, url, true);
   if (path === "/v1/connect" && method === "POST") return connect(request, env, url);
@@ -317,6 +328,82 @@ async function forwardToRoom(request, env, url, path) {
   });
 }
 
+/**
+ * 构造 101 升级响应。
+ *
+ * 线上必须返回带 `webSocket` 的 101 Response。本地冒烟用的是 node 的 Response，
+ * 它的构造器只接受 200–599，101 会抛 RangeError，于是退化成同形状的普通对象。
+ * 这个分支只在本地测试里走到，真机永远走第一条。
+ */
+/**
+ * 组装一条 WS 事件消息。
+ *
+ * 消息类型字段占用 `t`，而 punch_request 载荷里的 `t` 是打洞时间戳——两个语义
+ * 撞名。WS 侧把**载荷**的 `t` 改名 `punch_at`，消息类型仍是 `t`；HTTP 接口里
+ * 这个字段继续叫 `t`，两边只有这一处差异（设计文档 §5.3）。
+ */
+function wsEvent(seq, type, payload) {
+  const { t: punchAt, ...rest } = payload ?? {};
+  const msg = { t: "event", seq, type, ...rest };
+  if (punchAt !== undefined) msg.punch_at = punchAt;
+  return msg;
+}
+
+function upgradeResponse(client) {
+  try {
+    return new Response(null, { status: 101, webSocket: client });
+  } catch {
+    return { status: 101, webSocket: client, headers: new Headers() };
+  }
+}
+
+/**
+ * `GET /v1/ws`：WebSocket 升级入口。
+ *
+ * Worker 只做三件事——限流、令牌鉴权（定位到哪个网络的 DO）、把升级请求原样转给 DO。
+ * 验签、去重、hello、事件补发全在 DO 里，因为只有 DO 知道节点表。
+ *
+ * 101 响应必须**原样返回**：它是带 `webSocket` 属性的特殊 Response，
+ * 复制 headers 会把这个属性丢掉，连接就建不起来。
+ */
+async function wsEntry(request, env, url) {
+  const upgrade = (request.headers.get("upgrade") ?? "").toLowerCase();
+  if (upgrade !== "websocket") {
+    return err(426, "upgrade_required", "这个端点只接受 WebSocket 升级请求");
+  }
+  if (!roomEnabled(env)) {
+    // 501 是给客户端的降级信号：退回轮询，不要反复重试握手
+    return err(501, "ws_unsupported", "这个部署没有绑定 Durable Object，请使用 /v1/events 轮询");
+  }
+  if (limited(request, WS_HANDSHAKE_MAX, "ws|")) {
+    return err(429, "rate_limited", `握手每 IP 每分钟最多 ${WS_HANDSHAKE_MAX} 次`);
+  }
+
+  const auth = await authenticate(request, env, url);
+  if (!auth.ok) return auth.response;
+
+  const stub = roomStub(env, auth.network);
+  if (!stub) return err(501, "ws_unsupported", "没有绑定 Durable Object");
+
+  const target = new URL(request.url);
+  target.pathname = "/i/ws";
+
+  const headers = new Headers(request.headers);
+  // 客户端自带的 x-qp2p-* 一律不可信；网络上下文由我们按令牌填写
+  for (const key of [...headers.keys()]) {
+    if (key.toLowerCase().startsWith("x-qp2p-")) headers.delete(key);
+  }
+  headers.set("x-qp2p-net", netContext(auth.network));
+
+  let res;
+  try {
+    res = await stub.fetch(new Request(target.toString(), { method: "GET", headers }));
+  } catch (e) {
+    return err(503, "room_unavailable", `${e?.name}: ${e?.message}`.slice(0, 300));
+  }
+  return res;
+}
+
 /** 把管理面请求转给 DO 的数据面。调用方已经做过 checkAdmin。 */
 async function roomAdminApi(env, net, path, { method = "GET", body } = {}) {
   const stub = roomStub(env, net);
@@ -379,11 +466,11 @@ async function health(request, env) {
     has_admin_secret: Boolean(env.ADMIN_SECRET),
     engine: roomEnabled(env) ? "room" : "legacy",
     room_bound: roomEnabled(env),
-    // WebSocket 在 P3 上线；在那之前不能报 ws，否则客户端会尝试握手再失败降级
-    features: [],
+    // 只有绑了 DO 的部署才有 WebSocket；legacy 报空，客户端据此直接走轮询
+    features: roomEnabled(env) ? ["ws"] : [],
     colo: request.cf?.colo ?? "local",
     server_ms: Date.now(),
-    limits: { offline_ms: OFFLINE_MS, heartbeat_ms: HEARTBEAT_MS, max_nodes: MAX_NODES },
+    limits: LIMITS,
   };
 
   if (storage === "d1") {
@@ -2547,9 +2634,9 @@ function timingSafeEqual(a, b) {
 
 const rate = new Map(); // "ip|上限" -> { start, count }
 
-function limited(request, max = RATE_MAX) {
+function limited(request, max = RATE_MAX, scope = "") {
   const ip = request.headers.get("cf-connecting-ip") ?? "local";
-  const bucket = `${ip}|${max}`;
+  const bucket = `${scope}${ip}|${max}`;
   const now = Date.now();
   const slot = rate.get(bucket);
   if (!slot || now - slot.start > RATE_WINDOW_MS) {
@@ -3132,6 +3219,34 @@ api('/v1/admin/status').then(function(j){
 
 const ROOM_SCHEMA_VERSION = 1;
 
+// ---- WebSocket（P3） ------------------------------------------------------
+
+const ROOM_PROTO_V = 1;
+const WS_GRACE_MS = 75_000; // socket 存活判定：约 3 个 ping 周期
+const PING_EVERY_MS = 25_000; // 下发给客户端的保活间隔
+const WS_HANDSHAKE_MAX = 30; // 握手限流：每 IP 每分钟
+const WS_MSG_MAX_BYTES = 4096; // 单条消息上限
+const WS_MSG_LIMIT = 20; // 每 socket 每窗口消息数
+const WS_MSG_WINDOW_MS = 10_000;
+
+const WS_CLOSE_NORMAL = 1000;
+const WS_CLOSE_SUPERSEDED = 4000; // 被同 node 的新连接替换
+const WS_CLOSE_UNAUTHORIZED = 4401; // 令牌失效、被踢、密钥轮换
+const WS_CLOSE_ROOM_GONE = 4410; // 网络已删除
+const WS_CLOSE_RATE = 4429; // 消息限流
+const WS_CLOSE_INTERNAL = 4500;
+
+/** 下发给客户端的阈值，避免两端各写一份不一致（附录 A）。 */
+const LIMITS = {
+  ping_every_ms: PING_EVERY_MS,
+  pong_timeout_ms: 10_000,
+  ws_grace_ms: WS_GRACE_MS,
+  offline_ms: OFFLINE_MS,
+  heartbeat_ms: HEARTBEAT_MS,
+  max_nodes: MAX_NODES,
+  max_events: MAX_EVENTS,
+};
+
 const ROOM_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS nodes (
     node_id      TEXT PRIMARY KEY,
@@ -3240,7 +3355,7 @@ export class NetworkRoom {
         return this.handleAdminRelease((await readJson(request))?.ip);
       }
 
-      if (path === "/i/ws") return err(501, "not_implemented", "WebSocket 在 P3 实现");
+      if (path === "/i/ws") return await this.acceptWs(request);
       return err(404, "not_found", `${method} ${path}`);
     } catch (e) {
       return err(500, "internal_error", e instanceof Error ? e.message : String(e));
@@ -3293,7 +3408,10 @@ export class NetworkRoom {
   async handleInit(request) {
     const body = await request.json().catch(() => null);
     if (!body || !body.net || !body.net.id) return err(400, "invalid_json");
+    const prev = this.net();
     this.setMeta("net", JSON.stringify(body.net));
+    // 同一个 DO 换了网络 id：旧连接的上下文已经不对，直接关掉让客户端重新握手
+    if (prev && prev.id !== body.net.id) this.closeAll(WS_CLOSE_ROOM_GONE, "network reinit");
     this.sweepNow();
     return json({ ok: true, schema_version: ROOM_SCHEMA_VERSION });
   }
@@ -3335,23 +3453,40 @@ export class NetworkRoom {
 
   async handlePurge() {
     const removed = this.listNodes().length;
+    // 先遣散连接：网络被删了还挂着的 socket 只会不停重连
+    this.closeAll(WS_CLOSE_ROOM_GONE, "network purged");
     for (const table of ["nodes", "reservations", "events", "nonces"]) {
       this.sql.exec(`DELETE FROM ${table}`);
     }
-    this.sql.exec("DELETE FROM meta WHERE k = 'net'");
+    // epoch 一起清掉：重建后会换新的，客户端据此判断本地 cursor 已失效
+    this.sql.exec("DELETE FROM meta WHERE k IN ('net', 'epoch')");
     return json({ ok: true, removed });
   }
 
   /** 统计：节点、在线、socket、预留、事件。 */
   stats() {
     const now = Date.now();
+    const idx = this.socketIndex();
     const nodes = this.listNodes();
     const count = (table) => this.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]?.n ?? 0;
+    let onlineWs = 0;
+    let onlinePoll = 0;
+    for (const n of nodes) {
+      const ws = idx.get(n.node_id);
+      if (ws) {
+        const stamp = this.autoResponseAt(ws) ?? this.attachment(ws).joinedAt ?? now;
+        if (now - stamp <= WS_GRACE_MS) onlineWs += 1;
+      } else if (now - n.last_seen <= OFFLINE_MS) {
+        onlinePoll += 1;
+      }
+    }
     return {
       ok: true,
       nodes: nodes.length,
-      online: nodes.filter((n) => this.liveness(n, now).online).length,
-      sockets: this.state.getWebSockets?.().length ?? 0,
+      online: onlineWs + onlinePoll,
+      online_ws: onlineWs,
+      online_poll: onlinePoll,
+      sockets: idx.size,
       reservations: count("reservations"),
       events: count("events"),
       schema_version: ROOM_SCHEMA_VERSION,
@@ -3359,14 +3494,23 @@ export class NetworkRoom {
   }
 
   debug() {
+    const now = Date.now();
     return {
       ok: true,
       bootAt: this.bootAt,
       schema_version: ROOM_SCHEMA_VERSION,
       net: this.net(),
+      epoch: this.epoch(),
       sockets: (this.state.getWebSockets?.() ?? []).map((ws) => {
-        const a = ws.deserializeAttachment?.() ?? {};
-        return { node: a.node ?? null, joinedAt: a.joinedAt ?? null };
+        const a = this.attachment(ws);
+        const pingAt = this.autoResponseAt(ws);
+        return {
+          node: a.node ?? null,
+          joinedAt: a.joinedAt ?? null,
+          caps: a.caps ?? [],
+          lastPingAt: pingAt,
+          alive: pingAt === null ? null : now - pingAt <= WS_GRACE_MS,
+        };
       }),
       lastSweep: this.lastSweep,
     };
@@ -3457,13 +3601,28 @@ export class NetworkRoom {
     this.sql.exec("DELETE FROM reservations WHERE node_id = ? AND kind = 'auto'", nodeId);
   }
 
-  /** 写一条事件并返回 seq。v3.0 一律落库，B1（有 socket 就不落库）留到 P3 之后。 */
+  /**
+   * 写一条事件并返回 seq；同时直投给目标在线 socket。
+   *
+   * v3.0 一律落库（B1「有 socket 就不落库」留作后续优化）：落库才能让断线重连
+   * 用 since 补齐。直投只是省掉一轮 wakeup 延迟，不是替代。
+   */
   emit(to, type, payload) {
+    const data = payload ?? {};
     this.sql.exec(
       "INSERT INTO events (to_node, type, payload, created_at) VALUES (?, ?, ?, ?)",
-      to, type, JSON.stringify(payload ?? {}), Date.now(),
+      to, type, JSON.stringify(data), Date.now(),
     );
-    return this.sql.exec("SELECT last_insert_rowid() AS id").toArray()[0].id;
+    const seq = this.sql.exec("SELECT last_insert_rowid() AS id").toArray()[0].id;
+
+    const msg = wsEvent(seq, type, data);
+    if (to === BROADCAST) {
+      for (const ws of this.state.getWebSockets?.() ?? []) this.deliver(ws, msg);
+    } else {
+      const ws = this.socketIndex().get(to);
+      if (ws) this.deliver(ws, msg);
+    }
+    return seq;
   }
 
   /** 踢人时清掉这个节点待投递的事件。 */
@@ -3487,10 +3646,82 @@ export class NetworkRoom {
     return true;
   }
 
-  /** 在线判定。P2 只有 HTTP 轮询，按 last_seen；P3 接入 socket 后补 WebSocket 分支。 */
+  /**
+   * 在线判定。
+   *
+   * 有 socket：看自动应答时间戳（没收到过 ping 就用 joinedAt），距现在不超过
+   * WS_GRACE_MS 即存活。这条**完全依赖 V9** —— 时间戳不刷新的话所有 WS 节点
+   * 会被同时判成离线，所以真机验证必做（见 ctl 的 room-probe）。
+   * 无 socket：沿用 last_seen 与 OFFLINE_MS，与 legacy 一致。
+   */
   liveness(node, now) {
+    const ws = this.socketIndex().get(node.node_id);
+    if (ws) {
+      const stamp = this.autoResponseAt(ws) ?? this.attachment(ws).joinedAt ?? now;
+      const idleMs = Math.max(0, now - stamp);
+      return { online: idleMs <= WS_GRACE_MS, via: "ws", idleMs };
+    }
     const idleMs = now - node.last_seen;
     return { online: idleMs <= OFFLINE_MS, via: "poll", idleMs };
+  }
+
+  /**
+   * 撮合：校验对端可连并投递 punch_request。HTTP 与 WebSocket 两条路径共用，
+   * 差别只在「身份怎么来」——HTTP 逐条验签，WS 取 socket attachment。
+   */
+  matchmake(from, target, { commit = true } = {}) {
+    if (!/^[0-9a-f]{32}$/.test(from) || !/^[0-9a-f]{32}$/.test(target)) {
+      return { ok: false, status: 400, error: "invalid_node_id", detail: "node_id 必须是 32 位十六进制" };
+    }
+    if (from === target) return { ok: false, status: 400, error: "self_connect", detail: "不能连自己" };
+
+    const now = Date.now();
+    const self = this.getNode(from);
+    if (!self) return { ok: false, status: 404, error: "unknown_node", detail: "发起方尚未注册" };
+
+    const peer = this.getNode(target);
+    if (!peer) return { ok: false, status: 404, error: "target_not_found", detail: "对端不在这个网络里" };
+    if (!this.liveness(peer, now).online) {
+      return { ok: false, status: 410, error: "target_offline", detail: "对端心跳已超时" };
+    }
+
+    const targetAge = now - peer.last_seen;
+    if (targetAge > Number(this.env.STALE_MS ?? STALE_MS)) {
+      return {
+        ok: false,
+        status: 409,
+        error: "target_stale",
+        detail: `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
+      };
+    }
+
+    const peerCandidates = safeParseArray(peer.candidates);
+    if (peerCandidates.length === 0) {
+      return { ok: false, status: 409, error: "target_no_candidates", detail: "对端还没有上报候选地址" };
+    }
+
+    const t = now + 500;
+    // commit=false 只做预检：HTTP 路径要先把 nonce 占掉才允许产生副作用
+    if (commit) this.emit(target, "punch_request", {
+      from,
+      from_name: self.name,
+      virtual_ip: self.virtual_ip,
+      candidates: safeParseArray(self.candidates),
+      t,
+      server_ms: now,
+    });
+
+    return {
+      ok: true,
+      reply: {
+        t,
+        target_last_seen: peer.last_seen,
+        target_candidates: peerCandidates,
+        target_virtual_ip: peer.virtual_ip,
+        target_tls_fp: peer.tls_fp,
+        server_ms: now,
+      },
+    };
   }
 
   // ---- 验签（与 legacy 的 verifySignedRequest 同规则，nonce 落 SQLite） ------
@@ -3687,52 +3918,18 @@ export class NetworkRoom {
     });
     if (bad) return err(403, "bad_signature", bad);
 
-    const peer = this.getNode(target);
-    if (!peer) return err(404, "target_not_found", "对端不在这个网络里");
-    if (!this.liveness(peer, now).online) {
-      return err(410, "target_offline", "对端心跳已超时");
-    }
+    // 先做无副作用的可连性预检，通过了才占 nonce（与 legacy 一致）
+    const pre = this.matchmake(from, target, { commit: false });
+    if (!pre.ok) return err(pre.status, pre.error, pre.detail);
 
-    const targetAge = now - peer.last_seen;
-    const staleMs = Number(this.env.STALE_MS ?? STALE_MS);
-    if (targetAge > staleMs) {
-      return err(
-        409,
-        "target_stale",
-        `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
-      );
-    }
-
-    const peerCandidates = JSON.parse(peer.candidates || "[]");
-    if (peerCandidates.length === 0) {
-      return err(409, "target_no_candidates", "对端还没有上报候选地址");
-    }
-
-    // 到这里才有副作用，此时才占 nonce（与 legacy 一致）
     const nonce = String(body.nonce ?? "").toLowerCase();
     if (!this.consumeNonce(`${network.id}:${nonce}`, now)) {
       return err(403, "bad_signature", "nonce 已用过（疑似重放）");
     }
 
-    const t = now + 500;
-    this.emit(target, "punch_request", {
-      from,
-      from_name: self.name,
-      virtual_ip: self.virtual_ip,
-      candidates: JSON.parse(self.candidates || "[]"),
-      t,
-      server_ms: now,
-    });
-
-    return json({
-      ok: true,
-      t,
-      target_last_seen: peer.last_seen,
-      target_candidates: peerCandidates,
-      target_virtual_ip: peer.virtual_ip,
-      target_tls_fp: peer.tls_fp,
-      server_ms: now,
-    });
+    const done = this.matchmake(from, target);
+    if (!done.ok) return err(done.status, done.error, done.detail);
+    return json({ ok: true, ...done.reply });
   }
 
   async handleEvents(request) {
@@ -3821,6 +4018,287 @@ export class NetworkRoom {
     return json({ ok: true });
   }
 
+  // ---- WebSocket（P3） -----------------------------------------------------
+
+  /**
+   * `GET /i/ws` 握手。
+   *
+   * 签名摘要固定为 `canonicalJson({node_id, since, ts, nonce, caps})`，
+   * 其中 **caps 是排序后逗号拼接的字符串**：两边只需要对一个字符串，
+   * 比数组的序列化形状好对齐（Rust 与 JS 的数组序列化差异是踩过的坑）。
+   */
+  async acceptWs(request) {
+    this.sweep();
+    const network = this.net();
+    if (!network) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const url = new URL(request.url);
+    const nodeId = (url.searchParams.get("node_id") ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(nodeId)) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+    const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
+    const caps = (url.searchParams.get("caps") ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+      .sort()
+      .slice(0, 16);
+
+    const now = Date.now();
+    const node = this.getNode(nodeId);
+    // 节点必须先由 HTTP join/register 登记：公钥在那条记录里
+    if (!node) return err(404, "unknown_node", "先 register 再连 WebSocket");
+
+    const bad = await this.verifyReq({
+      op: "ws",
+      body: {
+        node_id: nodeId,
+        since,
+        ts: Number(url.searchParams.get("ts")),
+        nonce: url.searchParams.get("nonce"),
+        caps: caps.join(","),
+        sig: url.searchParams.get("sig"),
+      },
+      pubkey: node.pubkey,
+      now,
+      trackReplay: false,
+    });
+    if (bad) return err(403, "bad_signature", bad);
+
+    if (!this.consumeNonce(`${network.id}:${url.searchParams.get("nonce")}`, now)) {
+      return err(403, "bad_signature", "nonce 已用过（疑似重放）");
+    }
+
+    const wasOffline = !this.socketIndex().has(nodeId) && now - node.last_seen > OFFLINE_MS;
+
+    // 同一 node 只留一条 socket：旧连接以 4000 关掉。
+    // 客户端必须按「连接代次」处理这条码，否则自己的重连会被这条 4000 误停（§5.2）。
+    const existing = this.socketIndex().get(nodeId);
+    if (existing) {
+      try {
+        existing.close(WS_CLOSE_SUPERSEDED, "superseded");
+      } catch {
+        // 半开的 socket 关不掉是常态，不影响新连接
+      }
+    }
+
+    if (typeof WebSocketPair !== "function") {
+      return err(503, "room_unavailable", "运行时没有 WebSocketPair");
+    }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    const attachment = { node: nodeId, joinedAt: now, caps, v: ROOM_PROTO_V };
+    server.serializeAttachment(attachment);
+    if (typeof this.state.acceptWebSocket === "function") {
+      this.state.acceptWebSocket(server, [nodeId]);
+    } else {
+      server.accept();
+    }
+
+    // 发数据要用服务端那一端（pair[1]）：pair[0] 是交给调用方的客户端对象
+    this.send(server, {
+      t: "hello",
+      v: ROOM_PROTO_V,
+      server_ms: now,
+      cursor: this.maxSeq(),
+      epoch: this.epoch(),
+      limits: LIMITS,
+    });
+
+    // 断线重连：把离线期间攒的事件补齐，客户端不必再发一次 resume
+    if (since > 0) this.replay(server, nodeId, since);
+
+    if (wasOffline && safeParseArray(node.candidates).length > 0) {
+      this.emit(BROADCAST, "peer_online", publicNode({ ...node, last_seen: now }, now));
+    }
+
+    return upgradeResponse(client);
+  }
+
+  /** 补发 seq 大于 since 的事件（最多 MAX_EVENTS 条、只在事件 TTL 内）。 */
+  replay(ws, nodeId, since) {
+    const rows = this.pullEvents(nodeId, since, MAX_EVENTS, Date.now() - EVENT_TTL_MS);
+    for (const r of rows) {
+      this.send(ws, wsEvent(r.id, r.type, safeParse(r.payload)));
+    }
+    return rows.length > 0 ? rows[rows.length - 1].id : since;
+  }
+
+  async webSocketMessage(ws, raw) {
+    // sweep 也挂在这里：B4 取消定时 register 后，纯 WS 网络没有别的 HTTP 入口，
+    // 漏掉这一处 events 与僵尸节点就永不回收。WS 消息本来就要唤醒 DO，不额外增加唤醒。
+    this.sweep();
+
+    if (typeof raw !== "string") return; // 二进制帧一律忽略
+    if (raw.length > WS_MSG_MAX_BYTES) {
+      try {
+        ws.close(WS_CLOSE_RATE, "message too large");
+      } catch {}
+      return;
+    }
+    if (!this.allow(ws)) {
+      try {
+        ws.close(WS_CLOSE_RATE, "rate limited");
+      } catch {}
+      return;
+    }
+
+    let m;
+    try {
+      m = JSON.parse(raw);
+    } catch {
+      return; // 非法 JSON 静默忽略：不值得为一次坏帧断连
+    }
+    if (!m || typeof m.t !== "string") return;
+
+    const a = this.attachment(ws);
+    const nodeId = a.node;
+    if (!nodeId) return;
+
+    if (m.t === "connect") return this.onConnectMsg(ws, nodeId, m);
+    if (m.t === "resume") return this.onResumeMsg(ws, nodeId, m);
+    if (m.t === "leave") {
+      // 主动下线：不留 last_seen 宽限，直接当离线
+      this.deleteNode(nodeId);
+      try {
+        ws.close(WS_CLOSE_NORMAL, "bye");
+      } catch {}
+      return;
+    }
+  }
+
+  /** socket 身份直接撮合，不再逐条验签（身份已在握手时确认）。 */
+  onConnectMsg(ws, nodeId, m) {
+    const req = m.req ?? null;
+    const target = String(m.target ?? "").toLowerCase();
+    const r = this.matchmake(nodeId, target);
+    if (!r.ok) return this.send(ws, { t: "error", req, error: r.error, detail: r.detail });
+    // 与 throw 一致：载荷里的 t（打洞时间）在 WS 侧叫 punch_at，不覆盖消息类型
+    const { t: punchAt, ...rest } = r.reply;
+    this.send(ws, { t: "connect_ok", req, ...rest, punch_at: punchAt });
+  }
+
+  onResumeMsg(ws, nodeId, m) {
+    const since = Math.max(0, Number(m.since ?? 0) || 0);
+    const cursor = this.replay(ws, nodeId, since);
+    this.send(ws, { t: "resume_ok", cursor });
+  }
+
+  async webSocketClose(ws, code, reason) {
+    this.sockets.delete(ws);
+    const a = this.attachment(ws);
+    const nodeId = a.node;
+
+    // 1005/1006 是保留码，直接用它们回关会抛异常（原型已踩过）
+    const safe = code === 1005 || code === 1006 ? WS_CLOSE_NORMAL : code;
+    try {
+      ws.close(safe, reason ?? "");
+    } catch {}
+
+    if (!nodeId) return;
+    const now = Date.now();
+    // 非 leave 关闭：写一次 last_seen，给轮询侧留一个离线宽限
+    const node = this.getNode(nodeId);
+    if (!node) return;
+    if (now - node.last_seen > 0) this.touchNode(nodeId, now);
+
+    // peer_offline 不落库：只推给声明了 offline_evt 能力的 socket（旧客户端永远看不到）
+    const msg = { t: "event", seq: 0, type: "peer_offline", node_id: nodeId, name: node.name ?? "" };
+    for (const other of this.state.getWebSockets?.() ?? []) {
+      const ao = this.attachment(other);
+      if (ao.node === nodeId) continue;
+      if (!(ao.caps ?? []).includes("offline_evt")) continue;
+      this.deliver(other, msg);
+    }
+  }
+
+  webSocketError(ws, err) {
+    this.sockets.delete(ws);
+    console.warn(`[room] socket 异常: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  /** 关闭全部 socket：换密钥、删网络、迁移使用。 */
+  closeAll(code, reason) {
+    for (const ws of this.state.getWebSockets?.() ?? []) {
+      try {
+        ws.close(code, reason);
+      } catch {}
+    }
+    this.sockets.clear();
+  }
+
+  // ---- socket 辅助 ---------------------------------------------------------
+
+  attachment(ws) {
+    try {
+      return ws.deserializeAttachment?.() ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** node_id → socket。n ≤ 256，遍历足够，没必要再维护一份可能过期的索引。 */
+  socketIndex() {
+    const idx = new Map();
+    for (const ws of this.state.getWebSockets?.() ?? []) {
+      const a = this.attachment(ws);
+      if (a?.node) idx.set(a.node, ws);
+    }
+    return idx;
+  }
+
+  /** 运行时记录的自动应答时间（毫秒）；没收到过 ping 时为 null。 */
+  autoResponseAt(ws) {
+    try {
+      const t = this.state.getWebSocketAutoResponseTimestamp?.(ws);
+      return t ? new Date(t).getTime() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 每 socket 的消息令牌桶。休眠后丢失不影响正确性（只是重新计数）。 */
+  allow(ws) {
+    const now = Date.now();
+    const slot = this.sockets.get(ws);
+    if (!slot || now - slot.start > WS_MSG_WINDOW_MS) {
+      if (this.sockets.size > 1024) this.sockets.clear();
+      this.sockets.set(ws, { start: now, count: 1 });
+      return true;
+    }
+    slot.count += 1;
+    return slot.count <= WS_MSG_LIMIT;
+  }
+
+  send(ws, msg) {
+    try {
+      ws.send(JSON.stringify(msg));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  deliver(ws, msg) {
+    return this.send(ws, msg);
+  }
+
+  maxSeq() {
+    return this.sql.exec("SELECT COALESCE(MAX(id), 0) AS m FROM events").toArray()[0]?.m ?? 0;
+  }
+
+  /** 数据代次：服务端数据被重建（purge / 换库）后客户端据此判断要不要重新 register。 */
+  epoch() {
+    const row = this.sql.exec("SELECT v FROM meta WHERE k = 'epoch'").toArray()[0];
+    if (row) return row.v;
+    const next = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+    this.sql.exec("INSERT INTO meta (k, v) VALUES ('epoch', ?)", next);
+    return next;
+  }
+
   // ---- 管理面数据操作（checkAdmin 与 audit 仍留在 Worker） ------------------
 
   handleAdminNodes() {
@@ -3860,10 +4338,19 @@ export class NetworkRoom {
       return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
     }
 
+    const idx = this.socketIndex();
     const kicked = [];
     for (const id of ids) {
       const node = this.getNode(id);
       if (!node) continue;
+      // 先告诉它为什么，再关：光断连的话客户端只会当成网络抖动去重连
+      const ws = idx.get(id);
+      if (ws) {
+        this.send(ws, { t: "kick", reason: "被管理员移出网络" });
+        try {
+          ws.close(WS_CLOSE_UNAUTHORIZED, "kicked");
+        } catch {}
+      }
       this.deleteNode(id);
       this.dropNodeEvents(id);
       kicked.push({ node_id: id, name: node.name });

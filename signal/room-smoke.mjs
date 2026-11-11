@@ -123,7 +123,8 @@ check("超过 10 分钟且无 socket 的节点被删", !nodesLeft.includes(NODE_
 
 console.log("\n7. 端点状态");
 const wsRes = await room.fetch(req("GET", "/i/ws"));
-check("GET /i/ws → 501（P3 才做）", wsRes.status === 501, wsRes.status);
+// /i/ws 已在 P3 实现，完整用例在 ws-smoke.mjs；这里只确认参数校验在门口就挡住
+check("GET /i/ws 缺 node_id → 400", wsRes.status === 400, wsRes.status);
 const unknown = await room.fetch(req("GET", "/i/nope"));
 check("未知路径 → 404", unknown.status === 404, unknown.status);
 

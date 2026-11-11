@@ -154,12 +154,15 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | 方向 | t | 字段 | 语义 |
 | --- | --- | --- | --- |
 | 服务端→客户端 | hello | v、server\_ms、cursor、epoch、limits | 握手成功后第一条；cursor 是当前最大 seq；limits 下发 ping 间隔与宽限 |
-| 服务端→客户端 | event | seq、type 及原有载荷字段 | type 取 punch\_request、peer\_online，新增 peer\_offline；字段与 HTTP 事件完全一致 |
-| 服务端→客户端 | connect\_ok / error | req、与 HTTP ConnectReply 同构的字段 或 error、detail | 对客户端 connect 的应答 |
+| 服务端→客户端 | event | seq、type 及原有载荷字段 | type 取 punch\_request、peer\_online，新增 peer\_offline；除 `punch_at` 外字段与 HTTP 事件完全一致（见下方字段名冲突说明） |
+| 服务端→客户端 | connect\_ok / error | req、与 HTTP ConnectReply 同构的字段 或 error、detail | 对客户端 connect 的应答；打洞时间同样叫 `punch_at` |
+| 服务端→客户端 | resume\_ok | cursor | resume 补发结束的标记（不是逐事件 ack），客户端可忽略 |
 | 服务端→客户端 | kick | reason | 随后以 4401 关闭 |
 | 客户端→服务端 | connect | req、target | 请求撮合；身份取自 socket，不再逐条签名 |
 | 客户端→服务端 | resume | since | 补发 seq 大于 since 的事件（最多 50 条、5 分钟内） |
 | 客户端→服务端 | leave | — | 正常下线，随后服务端以 1000 关闭 |
+
+**字段名冲突（实现时发现）**：消息类型占用 `t`，而 `punch_request` 载荷里的 `t` 是打洞时间戳——平铺必然互相覆盖。约定：**WS 侧载荷的 `t` 改名 `punch_at`**，消息类型仍是 `t`；HTTP 的 `/v1/connect` 与 `/v1/events` 字段名不变，客户端只在 WS 解析处读 `punch_at`。`peer_offline` 用 `seq: 0` 表示不占序号、不落库。
 
 **刻意不做**：逐事件 ack（每次都会唤醒 DO 并计入请求）。游标由客户端自己保存，重连时用 `since` 或 `resume` 补齐。
 

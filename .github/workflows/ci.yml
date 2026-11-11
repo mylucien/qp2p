@@ -71,6 +71,10 @@ jobs:
       - name: NetworkRoom smoke
         run: node signal/room-smoke.mjs
 
+      # WebSocket：握手验签、hello、抢占旧连接、connect/resume/leave、限流、关闭码
+      - name: WebSocket smoke
+        run: node signal/ws-smoke.mjs
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
