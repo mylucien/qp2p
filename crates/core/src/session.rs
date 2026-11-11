@@ -42,6 +42,12 @@ const HOT_WINDOW: Duration = Duration::from_secs(45);
 /// 对端上线靠 `peer_online` 广播事件感知、公网映射变化靠周期 STUN 发现，
 /// 这里只是防漏的安全网（register 是最贵的请求：8 次查询 + 3 次写入）。
 const REGISTER_EVERY: Duration = Duration::from_secs(1800);
+/// 长连接模式下的兜底注册间隔。
+///
+/// 事件是服务端推来的，注册只剩"万一漏了事件"的安全网作用，可以放长四倍：
+/// 每个节点每天从 48 次降到 12 次，而 register 是最贵的一次请求
+/// （8 次查询 + 3 次写入）。断路器触发时会显式补一次，不受这个间隔影响。
+const REGISTER_EVERY_WS: Duration = Duration::from_secs(7200);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
 
@@ -1027,8 +1033,14 @@ impl Session {
                 }
             }
 
-            // 3) 重新注册：兜底定时，或候选地址变了要马上让对端知道
-            if (force_register || last_register.elapsed() >= REGISTER_EVERY) && err_streak < 2 {
+            // 3) 重新注册：兜底定时，或候选地址变了要马上让对端知道。
+            //    长连接在跑时隔四倍：事件是推来的，注册只是防漏的安全网。
+            let register_every = if ws_run.is_some() {
+                REGISTER_EVERY_WS
+            } else {
+                REGISTER_EVERY
+            };
+            if (force_register || last_register.elapsed() >= register_every) && err_streak < 2 {
                 last_register = Instant::now();
                 let (candidates, fp, nat) = {
                     let engine = self.engine.read().await;
@@ -1050,9 +1062,9 @@ impl Session {
                     }
                     Err(e) => {
                         tracing::debug!("[session] 刷新注册失败: {e:#}");
-                        // 失败了别等 30 分钟：一分钟后再试
+                        // 失败了别等满一个周期：一分钟后再试
                         last_register = Instant::now()
-                            .checked_sub(REGISTER_EVERY - Duration::from_secs(60))
+                            .checked_sub(register_every - Duration::from_secs(60))
                             .unwrap_or_else(Instant::now);
                     }
                 }

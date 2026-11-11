@@ -3330,6 +3330,9 @@ export class NetworkRoom {
     try {
       // 保持网络上下文最新：Worker 换了绑定或网络改名时会带新头过来
       this.loadNet(request);
+      // 重新部署后 DO 是空的，先把 D1 里的预留捞回来再处理任何请求
+      // （内部有一次性标记，正常运行时只是一次布尔判断）
+      await this.ensureReservations();
       if (path === "/i/init" && method === "POST") return await this.handleInit(request);
       if (path === "/i/net-updated" && method === "POST") return await this.handleNetUpdated(request);
       if (path === "/i/purge" && method === "POST") return await this.handlePurge();
@@ -3411,8 +3414,13 @@ export class NetworkRoom {
     if (!body || !body.net || !body.net.id) return err(400, "invalid_json");
     const prev = this.net();
     this.setMeta("net", JSON.stringify(body.net));
-    // 同一个 DO 换了网络 id：旧连接的上下文已经不对，直接关掉让客户端重新握手
-    if (prev && prev.id !== body.net.id) this.closeAll(WS_CLOSE_ROOM_GONE, "network reinit");
+    // 同一个 DO 换了网络 id：旧连接的上下文已经不对，直接关掉让客户端重新握手，
+    // 恢复标记也要重来（新网络对应 D1 里另一批预留）
+    if (prev && prev.id !== body.net.id) {
+      this.closeAll(WS_CLOSE_ROOM_GONE, "network reinit");
+      this.sql.exec("DELETE FROM meta WHERE k = 'reservations_restored'");
+      this._reservationsReady = false;
+    }
     this.sweepNow();
     return json({ ok: true, schema_version: ROOM_SCHEMA_VERSION });
   }
@@ -3459,8 +3467,12 @@ export class NetworkRoom {
     for (const table of ["nodes", "reservations", "events", "nonces"]) {
       this.sql.exec(`DELETE FROM ${table}`);
     }
-    // epoch 一起清掉：重建后会换新的，客户端据此判断本地 cursor 已失效
-    this.sql.exec("DELETE FROM meta WHERE k IN ('net', 'epoch')");
+    // epoch 一起清掉：重建后会换新的，客户端据此判断本地 cursor 已失效。
+    // 恢复标记也要清，否则重建网络后不会再从 D1 捞预留。
+    this.sql.exec(
+      "DELETE FROM meta WHERE k IN ('net', 'epoch', 'reservations_restored')",
+    );
+    this._reservationsReady = false;
     return json({ ok: true, removed });
   }
 
@@ -3592,14 +3604,110 @@ export class NetworkRoom {
          node_id = excluded.node_id, kind = excluded.kind, note = excluded.note`,
       r.ip, r.node_id, r.kind, r.note ?? "", r.created_at,
     );
+    this.backupReservation(r);
   }
 
   deleteReservation(ip) {
     this.sql.exec("DELETE FROM reservations WHERE ip = ?", ip);
+    this.backupRelease(ip);
   }
 
   dropAutoReservations(nodeId) {
     this.sql.exec("DELETE FROM reservations WHERE node_id = ? AND kind = 'auto'", nodeId);
+    this.backupDropAuto(nodeId);
+  }
+
+  // ---- D1 备份：重新部署后 DO 是空的，靠这份数据把预留捞回来 ---------------
+  //
+  // 单向以 DO 为准（D1 只是副本）：DO 里改了什么就往 D1 写什么。
+  // 用 waitUntil 而不是 await，避免把一次预留变更变成两次往返。
+
+  backupSql(sql, ...args) {
+    const db = this.env?.DB;
+    const net = this.net();
+    if (!db || !net) return;
+    // 用 Promise.resolve().then 包一层：本地替身（fakeD1）的 run() 是同步返回的，
+    // 直接 .catch 会报 "run(...).catch is not a function"
+    const p = Promise.resolve()
+      .then(() => db.prepare(sql).bind(...args).run())
+      .catch((e) => console.warn(`[room] 预留备份失败：${e}`));
+    // 构造期 / 本地替身上没有 waitUntil，退化成"发出去就不管"
+    if (typeof this.state.waitUntil === "function") this.state.waitUntil(p);
+    else p.catch(() => {});
+  }
+
+  backupReservation(r) {
+    this.backupSql(
+      `INSERT INTO reservations (network_id, ip, node_id, kind, note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(network_id, ip) DO UPDATE SET
+         node_id = excluded.node_id, kind = excluded.kind, note = excluded.note`,
+      this.net()?.id ?? "", r.ip, r.node_id, r.kind, r.note ?? "", r.created_at,
+    );
+  }
+
+  backupRelease(ip) {
+    this.backupSql(
+      "DELETE FROM reservations WHERE network_id = ? AND ip = ?",
+      this.net()?.id ?? "",
+      ip,
+    );
+  }
+
+  backupDropAuto(nodeId) {
+    this.backupSql(
+      "DELETE FROM reservations WHERE network_id = ? AND node_id = ? AND kind = 'auto'",
+      this.net()?.id ?? "",
+      nodeId,
+    );
+  }
+
+  /**
+   * 从 D1 恢复预留。只在 DO 首次带网络上下文运行时做一次。
+   *
+   * 用 `blockConcurrencyWhile` 包住：恢复期间不能让别的请求看到"半套预留"，
+   * 否则会把它正在用的地址当成空闲分给别人。
+   */
+  async ensureReservations() {
+    if (this._reservationsReady) return;
+    if (this.getMeta("reservations_restored") === "1") {
+      this._reservationsReady = true;
+      return;
+    }
+    const restore = async () => {
+      const net = this.net();
+      const db = this.env?.DB;
+      if (!net || !db) return false;
+      try {
+        const { results } = await db
+          .prepare(
+            "SELECT ip, node_id, kind, note, created_at FROM reservations WHERE network_id = ?",
+          )
+          .bind(net.id)
+          .all();
+        const rows = results ?? [];
+        for (const r of rows) {
+          // DO 里已有的不覆盖：它比 D1 新
+          this.sql.exec(
+            `INSERT INTO reservations (ip, node_id, kind, note, created_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(ip) DO NOTHING`,
+            r.ip, r.node_id, r.kind, r.note ?? "", Number(r.created_at) || Date.now(),
+          );
+        }
+        this.setMeta("reservations_restored", "1");
+        if (rows.length > 0) console.log(`[room] 从 D1 恢复了 ${rows.length} 条预留`);
+        return true;
+      } catch (e) {
+        console.warn(`[room] 恢复预留失败，下次再试：${e}`);
+        return false;
+      }
+    };
+
+    const ok =
+      typeof this.state.blockConcurrencyWhile === "function"
+        ? await this.state.blockConcurrencyWhile(restore)
+        : await restore();
+    this._reservationsReady = ok === true;
   }
 
   /**

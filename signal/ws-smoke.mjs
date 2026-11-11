@@ -176,6 +176,31 @@ async function run() {
 
   const room = env.ROOM.roomOf(net.id);
 
+  console.log("\n1.5 预留备份到 D1（重新部署后能恢复）");
+  // join 之后会有一条空载体产生的 auto 预留，备份是异步写 D1 的，等它落地
+  await new Promise((r) => setTimeout(r, 300));
+  const before = room.listReservations();
+  check("join 产生了预留", before.length >= 1, before);
+
+  // 模拟"重新部署"：DO 是全新的，只有 D1 里那份旧数据
+  room.sql.exec("DELETE FROM reservations");
+  room.sql.exec("DELETE FROM meta WHERE k = 'reservations_restored'");
+  room._reservationsReady = false;
+  check("清空 DO 后没有预留", room.listReservations().length === 0);
+
+  await room.ensureReservations();
+  const restored = room.listReservations();
+  check(
+    "从 D1 恢复回来",
+    restored.length === before.length,
+    { before: before.length, after: restored.length },
+  );
+  check(
+    "恢复的地址与原来一致",
+    before.every((b) => restored.some((r) => r.ip === b.ip && r.node_id === b.node_id)),
+    { before, restored },
+  );
+
   console.log("\n2. 握手前置条件");
   const noUpgrade = await call(env, "GET", `/v1/ws?node_id=${alice.nodeId}`, { token });
   check("缺 Upgrade → 426", noUpgrade.status === 426, noUpgrade.body);

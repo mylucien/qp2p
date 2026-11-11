@@ -562,9 +562,9 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | 编号 | 项 | 价值 | 成本 | 前置 |
 | --- | --- | --- | --- | --- |
 | B1 | 目标有存活 socket 时事件只推送、不落库 | 降 SQLite 写入 | 低 | P3 |
-| B2 | user 预留以 D1 为备份源，DO 首次初始化时恢复（重新部署后固定 IP 不丢） | 防数据丢失 | 低 | P2 |
+| B2 ✅ | user 预留以 D1 为备份源，DO 首次初始化时恢复（重新部署后固定 IP 不丢） | 防数据丢失 | 低 | 已做：DO→D1 单向备份 + 首次运行恢复，见 `backupReservation` / `ensureReservations` |
 | B3 | WS 内 register，省一次 HTTP | 降 Worker 调用 | 中 | P3 |
-| B4 | Ws 模式下取消 30 分钟定时 register，只在状态变化时发 | 降请求 | 低 | P4 |
+| B4 ✅ | Ws 模式下取消 30 分钟定时 register，只在状态变化时发 | 降请求 | 低 | 已做：长连接下保底注册从 30 分钟放宽到 2 小时（`REGISTER_EVERY_WS`） |
 | B5 | locationHint 与就近策略 | 降延迟 | 低 | V13 |
 | B6 | 多模块拆分，部署器多文件上传 | 可维护性 | 中 | P5 |
 | B7 | 管理页实时视图（订阅 `/i/stats`） | 体验 | 中 | P3 |
