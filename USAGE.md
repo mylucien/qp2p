@@ -35,13 +35,31 @@ Windows 更省事：双击 `qp2p.exe` 打开图形界面，把令牌粘进去点
 信令服务器只做三件事：登记节点、撮合打洞、维持在线状态。**它不转发业务流量**，
 带宽和额度压力都很小。
 
+### 方式一：部署器（推荐）
+
+```bash
+export CLOUDFLARE_API_TOKEN=...    # 权限：Workers Scripts:Edit、D1:Edit
+export CLOUDFLARE_ACCOUNT_ID=...
+
+qp2p-deploy init --dry-run         # 先看要上传什么（密钥已脱敏）
+qp2p-deploy init                   # 建库 → 上传 → 启用子域 → 冒烟
+```
+
+它会打印一次 `ADMIN_SECRET`（只显示这一次，丢了用 `qp2p-deploy rotate-admin` 重设）。
+以后升级只要 `qp2p-deploy up`：按迁移链补步骤，密钥和数据都保留。
+
+`qp2p-deploy status` 看部署到哪一步，`qp2p-deploy destroy` 删掉（Durable Object 数据一起销毁）。
+
+### 方式二：手工上传
+
 1. Cloudflare Dashboard → **Workers & Pages → Create → Worker** → Deploy
-2. **Edit code** → 全选删除 → 粘贴仓库里的 `signal/worker.js` 全文 → **Deploy**
-3. 建议绑定 D1（不绑也能跑，但状态只存在单个实例里）：
-   **Storage → D1 → Create database** → 回到 Worker →
-   **Settings → Bindings → Add → D1**，变量名必须是 **`DB`**
-4. **Settings → Variables and Secrets → Add**：名字 **`ADMIN_SECRET`**，类型 **Secret**，
-   值用随机串（`openssl rand -hex 32`）
+2. **Edit code** → 粘贴仓库里的 `signal/worker.js` 全文 → **Deploy**
+3. 加 D1 绑定：变量名必须是 **`DB`**
+4. 加 **`ADMIN_SECRET`**（Secret 类型，值用 `openssl rand -hex 32`）
+
+**手工方式做不了长连接**：`ROOM` 绑定指向的 `NetworkRoom` 是 SQLite 后端的 Durable Object，
+必须在上传时一并声明迁移（`new_sqlite_classes`），而 Dashboard 没有这个入口。
+手工部署的 Worker 只能走轮询——功能完整，只是请求多些。
 
 ### 验收
 
@@ -53,19 +71,22 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 ```
 ✓ Worker 可达
-  版本    : 2.5.0
+  版本    : 2.6.0
+  引擎    : room（支持 WebSocket 长连接）
   存储    : D1（多地域一致）
   管理密钥: 已配置
 ```
 
+引擎是 `legacy` 说明没绑上 Durable Object：能正常用，但客户端只能用轮询。
 这些详情只对带管理密钥的请求返回；不加 `--admin` 只会看到「✓ Worker 可达」和一行提示。
 根路径 `/` 返回 404，不提供任何接口清单。
 
 | 不符合 | 处理 |
 |---|---|
-| 版本低于 2.3 | 重新粘贴一次 `worker.js`（2.3 才有删网、列网络、自定义 IP） |
-| 存储显示「内存」 | 没绑 D1，重启 Worker 会丢网络，检查第 3 步 |
-| 管理密钥「未配置」 | 还能加入别人的网络，但建不了网络，检查第 4 步 |
+| 版本低于 2.6 | 重新上传一次 `worker.js`（2.6 才有长连接与 DO 数据面） |
+| 引擎显示 `legacy` | 没绑 `ROOM`，用部署器重来一次 |
+| 存储显示「内存」 | 没绑 D1，重启 Worker 会丢网络 |
+| 管理密钥「未配置」 | 还能加入别人的网络，但建不了网络 |
 
 国内访问 `*.workers.dev` 可能不通，给 Worker 绑定自己的域名再填进来。
 
@@ -77,11 +98,11 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.2-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.2-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.2-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.2-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 8+ | `qp2p-0.1.2-android.apk` | VpnService，debug 签名 |
+| Windows 10/11 x64 | `qp2p-0.1.3-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.3-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.3-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.3-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 8+ | `qp2p-0.1.3-android.apk` | VpnService，debug 签名 |
 
 下载后先校验：
 
@@ -92,8 +113,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.2-linux-x86_64-static
-sudo mv qp2p-0.1.2-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.3-linux-x86_64-static
+sudo mv qp2p-0.1.3-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -185,7 +206,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.2 · 网络 home
+qp2p 0.1.3 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
