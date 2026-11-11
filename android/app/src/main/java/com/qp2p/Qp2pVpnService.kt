@@ -86,10 +86,12 @@ class Qp2pVpnService : VpnService() {
 
     private fun runTunnel(config: String) {
         try {
+            // 分阶段报状态：注册和建隧道都可能卡上几秒，只写"正在连接"看不出卡在哪
+            status = "注册中…"
             val prepared = Native.prepare(config)
             val info = JSONObject(prepared)
             if (info.has("error")) {
-                finish("注册失败：" + info.optString("error"))
+                finish("注册失败：" + friendlyError(info.optString("error")))
                 return
             }
 
@@ -114,8 +116,9 @@ class Qp2pVpnService : VpnService() {
                 // 个别 ROM 上不支持，忽略即可：目标地址不在路由表里，本来也不会进隧道
             }
 
+            status = "建立隧道…"
             val pfd = builder.establish() ?: run {
-                finish("系统没批准建 VPN（可能被别的 VPN 占用）")
+                finish("系统没批准建 VPN（可能被别的 VPN 占用，或授权被撤销）")
                 return
             }
             tun = pfd
@@ -127,7 +130,7 @@ class Qp2pVpnService : VpnService() {
             val err = Native.start(pfd.fd)
             if (err != null) status = "已断开：$err" else status = "已断开"
         } catch (e: Throwable) {
-            status = "出错：" + (e.message ?: e.javaClass.simpleName)
+            status = friendlyError(e.message ?: e.javaClass.simpleName)
         } finally {
             connected = false
             try {
@@ -145,6 +148,25 @@ class Qp2pVpnService : VpnService() {
         connected = false
         stopForeground(true)
         stopSelf()
+    }
+
+    /**
+     * 把内核返回的错误翻成人能看懂的一句话。
+     *
+     * 不认识的错误原样带出去——猜错原因比报原文更误导人。
+     */
+    private fun friendlyError(raw: String): String = when {
+        raw.contains("invalid_token") || raw.contains("401") ->
+            "令牌格式不对，检查是否复制完整"
+        raw.contains("wrong_secret") || raw.contains("403") ->
+            "令牌被拒绝：网络可能已被删除，或密钥已更换"
+        raw.contains("network_not_found") || raw.contains("404") ->
+            "网络不存在，确认令牌来自哪个网络"
+        raw.contains("503") || raw.contains("room_unavailable") ->
+            "服务端暂时不可用，稍后重试"
+        raw.contains("timed out") || raw.contains("timeout") || raw.contains("连不上") ->
+            "连不上服务端，检查地址和手机网络"
+        else -> raw
     }
 
     override fun onDestroy() {

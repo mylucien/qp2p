@@ -15,13 +15,14 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import org.json.JSONObject
 
 /**
- * 最简界面：填三个值，连上，断开。
+ * 最简界面：填地址和令牌，一键启动，或只保存配置。
  *
  * 刻意不引入 AndroidX —— 少一个依赖就少一处 CI 上可能挂的地方，
- * 而这里需要的只是一个输入框和一个按钮。
+ * 而这里需要的只是几个输入框和两个按钮。
  */
 class MainActivity : Activity() {
 
@@ -35,6 +36,7 @@ class MainActivity : Activity() {
     private lateinit var subnetHint: TextView
     private lateinit var statusText: TextView
     private lateinit var connectButton: Button
+    private lateinit var saveButton: Button
 
     private var pendingConnect = false
 
@@ -60,11 +62,14 @@ class MainActivity : Activity() {
             }
         }
 
+        // 只保存、不连接：改完配置又不想现在连的时候用
+        saveButton.setOnClickListener { saveOnly() }
+
         // 状态在 Service 里更新，这里定时捞一次，省掉跨进程广播的复杂度
         ui.post(object : Runnable {
             override fun run() {
                 statusText.text = Qp2pVpnService.status.ifEmpty { "未连接" }
-                connectButton.text = if (Qp2pVpnService.connected) "断开" else "连接"
+                connectButton.text = if (Qp2pVpnService.connected) "断开" else "启动马上连接"
                 // 连上之后才知道网段，这里补一次提示
                 refreshIpHint()
                 ui.postDelayed(this, 800)
@@ -101,8 +106,19 @@ class MainActivity : Activity() {
         }
         root.addView(subnetHint)
 
-        connectButton = Button(this).apply { text = "连接" }
-        root.addView(connectButton)
+        // 两个按钮一行：「启动马上连接」是主操作，占两倍宽
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        connectButton = Button(this).apply { text = "启动马上连接" }
+        saveButton = Button(this).apply { text = "保存配置" }
+        buttons.addView(
+            connectButton,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f)
+        )
+        buttons.addView(
+            saveButton,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        root.addView(buttons)
 
         statusText = TextView(this).apply {
             text = "未连接"
@@ -214,10 +230,52 @@ class MainActivity : Activity() {
         subnetHint.setTextColor(
             if (problem != null) Color.parseColor("#D93025") else Color.parseColor("#888888")
         )
-        connectButton.isEnabled = problem == null
+    }
+
+    /**
+     * 逐字段校验，返回第一处问题的说明；全部合法返回 null。
+     *
+     * 只报告、不自动纠正——静默改写用户填的地址比直接报错更难排查。
+     */
+    private fun validate(): String? {
+        val worker = workerInput.text.toString().trim()
+        if (worker.isEmpty()) return "请填写信令地址（Worker 地址）"
+        // 只接受 https：Rust 侧 normalize_worker 同样拒绝明文地址，两端保持一致
+        if (!worker.startsWith("https://")) {
+            return "信令地址要以 https:// 开头，例如 https://p2p.example.com"
+        }
+        val host = worker.removePrefix("https://").substringBefore("/")
+        if (!host.contains(".") || host.startsWith(".") || host.endsWith(".")) {
+            return "信令地址不完整，例如 https://p2p.example.com"
+        }
+        val token = tokenInput.text.toString().trim()
+        if (token.isEmpty()) return "请填写加入令牌"
+        if (!token.startsWith("qp2p1_")) return "令牌应以 qp2p1_ 开头"
+        if (token.count { it == '_' } < 2) return "令牌格式应为 qp2p1_<网络>_<密钥>"
+        ipProblem(ipInput.text.toString().trim())?.let { return "虚拟 IP：$it" }
+        return null
+    }
+
+    /** 只保存、不连接。连接中点也可以保存，改动下次连接生效。 */
+    private fun saveOnly() {
+        val problem = validate()
+        if (problem != null) {
+            // 失败原因停在状态栏里，让人能看清是哪一项不对
+            Qp2pVpnService.status = "✗ $problem"
+            return
+        }
+        saveSettings()
+        // 成功用 Toast：这条信息不需要一直占着状态栏
+        val hint = if (Qp2pVpnService.connected) "已保存，下次连接生效" else "已保存"
+        Toast.makeText(this, hint, Toast.LENGTH_SHORT).show()
     }
 
     private fun ensurePermissionThenConnect() {
+        val problem = validate()
+        if (problem != null) {
+            Qp2pVpnService.status = "✗ $problem"
+            return
+        }
         saveSettings()
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -230,16 +288,13 @@ class MainActivity : Activity() {
     }
 
     private fun connect() {
-        val config = configJson()
-        if (config.contains("\"token\":\"\"")) {
-            Qp2pVpnService.status = "先填加入令牌"
-            return
-        }
-        val problem = ipProblem(ipInput.text.toString().trim())
+        // 授权回调也可能走到这里，再校验一遍，避免配置在这期间被改坏
+        val problem = validate()
         if (problem != null) {
-            Qp2pVpnService.status = "虚拟 IP 有问题：$problem"
+            Qp2pVpnService.status = "✗ $problem"
             return
         }
+        val config = configJson()
         Qp2pVpnService.status = "正在连接…"
         val intent = Intent(this, Qp2pVpnService::class.java).apply {
             action = Qp2pVpnService.ACTION_CONNECT
