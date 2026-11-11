@@ -22,7 +22,8 @@ if (!BASE || !ADMIN) {
   process.exit(2);
 }
 
-const PING_WAIT_MS = Number(process.env.PING_WAIT_MS ?? 26_000);
+// 要超过服务端的 WS_GRACE（75 秒）才能观察"不发 ping 会掉线"，默认留 5 秒余量
+const PING_WAIT_MS = Number(process.env.PING_WAIT_MS ?? 80_000);
 let passed = 0;
 let failed = 0;
 
@@ -141,17 +142,10 @@ async function connect(token, node, netId, caps = []) {
   return { ws, hello, inbox };
 }
 
-async function diag(netId) {
-  const r = await api("GET", `/__diag?net=${encodeURIComponent(netId)}`, { admin: ADMIN });
-  let body = r.body;
-  if (typeof body?.body === "string") {
-    try {
-      body = JSON.parse(body.body);
-    } catch {
-      /* 保持原样 */
-    }
-  }
-  return body;
+/** 管理面看到的单个节点。`via` 说明判定依据，`online` 是最终结论。 */
+async function nodeStatus(netId, nodeId) {
+  const r = await api("GET", `/v1/admin/networks/${netId}/nodes`, { admin: ADMIN });
+  return (r.body.nodes ?? []).find((n) => n.node_id === nodeId) ?? null;
 }
 
 async function main() {
@@ -198,35 +192,32 @@ async function main() {
   const b = await connect(token, bob, netId);
   check("bob 收到 hello", b.hello?.t === "hello");
 
-  console.log("\n3. V9：自动应答时间戳是否推进");
-  const d0 = await diag(netId);
-  const s0 = (d0.sockets ?? []).find((s) => s.node === alice.nodeId);
-  check("连接出现在 debug 里", !!s0, d0.sockets);
-  check("还没 ping 时 lastPingAt 为空", s0?.lastPingAt === null || s0?.lastPingAt === undefined, s0);
+  // V9：在线判定完全依赖 `getWebSocketAutoResponseTimestamp`。验证方式是看
+  // "不发 ping 会掉线、发了就回来"——这是走真实业务路径的观察，比读内部状态可靠。
+  console.log("\n3. V9：自动应答是否驱动在线判定");
+  const s0 = await nodeStatus(netId, alice.nodeId);
+  check("节点列表里 alice 的判定依据是 ws", s0?.via === "ws", s0);
+  check("刚连上算在线", s0?.online === true, s0);
+
+  // 服务端宽限 75 秒；这段时间一个 ping 都不发，时间戳会停在建立连接的时刻
+  const graceSec = Math.round(PING_WAIT_MS / 1000);
+  console.log(`  故意不发 ping，等 ${graceSec} 秒（超过 75 秒宽限）…`);
+  await sleep(PING_WAIT_MS);
+  const s1 = await nodeStatus(netId, alice.nodeId);
+  check("超过宽限没 ping → 判离线（说明判定真的看时间戳）", s1?.online === false, s1);
 
   a.ws.send("ping");
-  console.log(`  已发 ping，等 ${Math.round(PING_WAIT_MS / 1000)} 秒…`);
-  await sleep(PING_WAIT_MS);
-  const d1 = await diag(netId);
-  const s1 = (d1.sockets ?? []).find((s) => s.node === alice.nodeId);
-  check("ping 之后 lastPingAt 有值", typeof s1?.lastPingAt === "number", s1);
-  check("此时判定为存活", s1?.alive === true, s1);
-
-  a.ws.send("ping");
-  console.log(`  再发一次 ping，等 ${Math.round(PING_WAIT_MS / 1000)} 秒…`);
-  await sleep(PING_WAIT_MS);
-  const d2 = await diag(netId);
-  const s2 = (d2.sockets ?? []).find((s) => s.node === alice.nodeId);
-  check(
-    "V9 通过：时间戳在推进",
-    typeof s2?.lastPingAt === "number" && typeof s1?.lastPingAt === "number" && s2.lastPingAt > s1.lastPingAt,
-    { 第一次: s1?.lastPingAt, 第二次: s2?.lastPingAt },
-  );
-
-  const st = await api("GET", `/__diag?net=${encodeURIComponent(netId)}`, { admin: ADMIN });
-  check("debug 里 socket 数为 2", (st.body?.body ? JSON.parse(st.body.body).sockets : st.body.sockets)?.length === 2, st.body);
+  console.log("  发了 ping，等 3 秒…");
+  await sleep(3_000);
+  const s2 = await nodeStatus(netId, alice.nodeId);
+  check("ping 之后立刻回到在线（时间戳被刷新）→ V9 通过", s2?.online === true, s2);
 
   console.log("\n4. 真机投递：connect_ok 与 punch_request");
+  // 第 3 节为了验 V9 让 alice 闲置了 80 秒；bob 同样没发过 ping，这会儿也过期了。
+  // 撮合前先把两边都唤醒，否则拿到的是 target_offline 而不是 connect_ok。
+  a.ws.send("ping");
+  b.ws.send("ping");
+  await sleep(2_000);
   b.inbox.length = 0;
   a.ws.send(JSON.stringify({ t: "connect", req: 11, target: bob.nodeId }));
   const t0 = Date.now();
