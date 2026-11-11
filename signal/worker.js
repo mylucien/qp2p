@@ -3336,7 +3336,7 @@ export class NetworkRoom {
       if (path === "/i/stats" && method === "GET") return json(this.stats());
       if (path === "/i/debug" && method === "GET") return json(this.debug());
 
-      // 业务端点：HTTP 轮询模式（P2）。WebSocket 在 P3 接。
+      // 业务端点：同一套逻辑既服务 HTTP 轮询，也服务长连接（/i/ws 握手同样落到这里验签）
       if (path === "/i/join" && method === "POST") return await this.handleJoinRegister(request, false);
       if (path === "/i/register" && method === "POST") return await this.handleJoinRegister(request, true);
       if (path === "/i/connect" && method === "POST") return await this.handleConnect(request);
