@@ -17,4 +17,5 @@ serde_json.workspace = true
 tokio.workspace = true
 rand.workspace = true
 hex.workspace = true
-reqwest = { workspace = true, features = ["multipart"] }
+# workspace 里只开了 rustls-tls；json 用于解析 API 响应，multipart 用于上传脚本
+reqwest = { workspace = true, features = ["json", "multipart"] }
