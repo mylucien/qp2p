@@ -69,7 +69,7 @@ class MainActivity : Activity() {
         ui.post(object : Runnable {
             override fun run() {
                 statusText.text = Qp2pVpnService.status.ifEmpty { "未连接" }
-                connectButton.text = if (Qp2pVpnService.connected) "断开" else "启动马上连接"
+                connectButton.text = if (Qp2pVpnService.connected) "断开" else "自动连接"
                 // 连上之后才知道网段，这里补一次提示
                 refreshIpHint()
                 ui.postDelayed(this, 800)
@@ -106,9 +106,9 @@ class MainActivity : Activity() {
         }
         root.addView(subnetHint)
 
-        // 两个按钮一行：「启动马上连接」是主操作，占两倍宽
+        // 两个按钮一行：「自动连接」是主操作，占两倍宽
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        connectButton = Button(this).apply { text = "启动马上连接" }
+        connectButton = Button(this).apply { text = "自动连接" }
         saveButton = Button(this).apply { text = "保存配置" }
         buttons.addView(
             connectButton,
