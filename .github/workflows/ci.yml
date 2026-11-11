@@ -114,9 +114,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # runner 偶尔会解析不了 archive.ubuntu.com（Temporary failure resolving），
+      # 加几次重试＋超时，比一次失败就把整个 job 判死强
       - name: 安装 musl 工具链
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+        run: |
+          APT="sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30"
+          for i in 1 2 3; do
+            $APT update -qq && $APT install -y musl-tools && exit 0
+            echo "第 $i 次失败，20 秒后重试"; sleep 20
+          done
+          exit 1
 
       # musl-tools 只有 x86_64 的 musl-gcc，aarch64 得自己准备交叉工具链。
       # 试过 musl.cc 的预编译包，runner 上连不上（connect 超时 130s+），换成 zig cc：
