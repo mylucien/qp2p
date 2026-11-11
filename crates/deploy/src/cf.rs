@@ -243,7 +243,7 @@ fn describe_errors(body: &Value, status: u16) -> String {
             let code = e.get("code").and_then(Value::as_i64).unwrap_or(0);
             let text = e.get("message").and_then(Value::as_str).unwrap_or("");
             if !out.is_empty() {
-                out.push_str("；");
+                out.push('；');
             }
             out.push_str(&format!("[{code}] {text}"));
         }
