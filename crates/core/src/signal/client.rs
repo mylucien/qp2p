@@ -540,8 +540,23 @@ impl SignalClient {
     /// 排序后逗号拼接的字符串**——服务端按同样规则算，两边只需对一个字符串。
     /// 令牌不进 URL（会落进访问日志），由调用方用 `Authorization` 头发。
     pub fn ws_url(&self, identity: &Identity, since: i64, caps: &[&str]) -> Result<String> {
-        let mut sorted: Vec<&str> = caps.to_vec();
+        // 必须与 Worker 的归一化规则逐字一致：去空白、转小写、去空项、排序。
+        // 少做一步就是摘要对不上，而报错只会说"签名不匹配"。
+        let mut sorted: Vec<String> = caps
+            .iter()
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
         sorted.sort_unstable();
+        sorted.dedup();
+        for cap in &sorted {
+            if !cap
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!("能力标识 {cap:?} 只能含小写字母、数字、下划线和连字符");
+            }
+        }
         let caps_str = sorted.join(",");
 
         let ts = now_ms();

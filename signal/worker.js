@@ -3228,6 +3228,7 @@ const WS_HANDSHAKE_MAX = 30; // 握手限流：每 IP 每分钟
 const WS_MSG_MAX_BYTES = 4096; // 单条消息上限
 const WS_MSG_LIMIT = 20; // 每 socket 每窗口消息数
 const WS_MSG_WINDOW_MS = 10_000;
+const MAX_CAPS = 16; // 客户端能力项数上限（参与握手签名，两端必须一致）
 
 const WS_CLOSE_NORMAL = 1000;
 const WS_CLOSE_SUPERSEDED = 4000; // 被同 node 的新连接替换
@@ -4038,12 +4039,19 @@ export class NetworkRoom {
       return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
     }
     const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
-    const caps = (url.searchParams.get("caps") ?? "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-      .sort()
-      .slice(0, 16);
+    const capsRaw = (url.searchParams.get("caps") ?? "").trim();
+    const caps = capsRaw
+      ? capsRaw
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean)
+          .sort()
+      : [];
+    // 不能用 slice 截断：客户端签的是全量 caps，截断后摘要对不上，
+    // 表现为「bad_signature」，排查时根本想不到是条数问题。
+    if (caps.length > MAX_CAPS) {
+      return err(400, "too_many_caps", `caps 最多 ${MAX_CAPS} 项，收到 ${caps.length} 项`);
+    }
 
     const now = Date.now();
     const node = this.getNode(nodeId);
@@ -4133,7 +4141,8 @@ export class NetworkRoom {
     this.sweep();
 
     if (typeof raw !== "string") return; // 二进制帧一律忽略
-    if (raw.length > WS_MSG_MAX_BYTES) {
+    // 上限是**字节**数：raw.length 是 UTF-16 码元，一个汉字只算 1，会低估三倍
+    if (new TextEncoder().encode(raw).length > WS_MSG_MAX_BYTES) {
       try {
         ws.close(WS_CLOSE_RATE, "message too large");
       } catch {}
@@ -4199,11 +4208,11 @@ export class NetworkRoom {
     } catch {}
 
     if (!nodeId) return;
-    const now = Date.now();
-    // 非 leave 关闭：写一次 last_seen，给轮询侧留一个离线宽限
+    // leave 关闭时节点行已被删掉，这里拿到的就是 null，直接返回；
+    // 其余情况写一次 last_seen，给轮询侧留一个离线宽限
     const node = this.getNode(nodeId);
     if (!node) return;
-    if (now - node.last_seen > 0) this.touchNode(nodeId, now);
+    this.touchNode(nodeId, Date.now());
 
     // peer_offline 不落库：只推给声明了 offline_evt 能力的 socket（旧客户端永远看不到）
     const msg = { t: "event", seq: 0, type: "peer_offline", node_id: nodeId, name: node.name ?? "" };
@@ -4305,14 +4314,26 @@ export class NetworkRoom {
     const now = Date.now();
     const net = this.net() ?? {};
     const reservations = this.listReservations();
+    // 索引只建一次：每个节点各调一次 liveness() 会退化成 O(n²) 的
+    // attachment 反序列化，256 节点的网络打开管理页就能感到卡。
+    const idx = this.socketIndex();
     const rows = this.listNodes()
-      .map((n) => ({
-        ...publicNode(n, now),
-        node_id: n.node_id,
-        advertised: safeParseArray(n.advertise),
-        reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
-        via: this.liveness(n, now).via,
-      }))
+      .map((n) => {
+        const ws = idx.get(n.node_id);
+        // 有 socket 就看自动应答时间戳；没有才退回 last_seen
+        const idleMs = ws
+          ? now - (this.autoResponseAt(ws) ?? this.attachment(ws).joinedAt ?? now)
+          : now - n.last_seen;
+        return {
+          ...publicNode(n, now),
+          node_id: n.node_id,
+          advertised: safeParseArray(n.advertise),
+          reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
+          // publicNode 的 online 只看 last_seen，对长连接节点是错的，这里覆盖掉
+          online: idleMs <= (ws ? WS_GRACE_MS : OFFLINE_MS),
+          via: ws ? "ws" : "poll",
+        };
+      })
       .sort((a, b) => ipv4ToInt(a.virtual_ip) - ipv4ToInt(b.virtual_ip));
 
     return json({

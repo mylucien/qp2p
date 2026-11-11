@@ -18,7 +18,7 @@ use crate::link::tun::MeshLinks;
 use crate::peer::Role;
 use crate::route::Cidr;
 use crate::signal::client::{Event, PeerInfo, SignalClient, SignalError};
-use crate::signal::ws::{WsItem, WsLink};
+use crate::signal::ws::{HandshakeRejected, WsItem, WsLink};
 use crate::stun::NatKind;
 
 /// 事件轮询间隔：三档自适应。
@@ -140,6 +140,11 @@ enum WsFeed {
     Online,
     /// 连接坏了或握不上手，附带原因；任务自己会按退避重连。
     Down(String),
+    /// 服务端明确说"没有 Durable Object"（HTTP 501）：一次就该降级，
+    /// 不用等失败次数攒够。
+    Unsupported(String),
+    /// 令牌/签名被拒（HTTP 401/403）：再重试也不会成功，必须停下来告诉用户。
+    Fatal(String),
     /// 服务端主动关闭。
     Closed {
         code: u16,
@@ -227,7 +232,18 @@ async fn ws_feed(
                 let _ = link.close().await;
             }
             Err(e) => {
-                let _ = tx.try_send(WsFeed::Down(format!("{e:#}")));
+                let text = format!("{e:#}");
+                if let Some(rejected) = e.downcast_ref::<HandshakeRejected>() {
+                    if rejected.is_auth_failure() {
+                        let _ = tx.try_send(WsFeed::Fatal(text));
+                        return;
+                    }
+                    if rejected.is_unsupported() {
+                        let _ = tx.try_send(WsFeed::Unsupported(text));
+                        return;
+                    }
+                }
+                let _ = tx.try_send(WsFeed::Down(text));
                 if tx.is_closed() {
                     return;
                 }
@@ -624,6 +640,8 @@ impl Session {
         // 退回轮询后的探测间隔：每失败一次翻倍，最多 1 小时。
         // 旧服务端（没有 DO）上这是每天 20 多次 501，而不是每 5 分钟一次。
         let mut ws_retry_delay = WS_RETRY;
+        // "服务端没有 DO"只提示一次，之后每轮探测失败不再刷屏
+        let mut ws_unsupported_notified = false;
         // 休眠起始时刻：满 60 秒断长连接
         let mut sleeping_since: Option<Instant> = None;
 
@@ -679,6 +697,8 @@ impl Session {
             //    对端上线 / 换地址时会塞 peer_online 广播。
             //    WS 模式下这些事件是推来的，主循环只负责把队列掏空。
             let mut ws_failure: Option<String> = None;
+            // 服务端明说没有 DO：一次就降级，不用攒失败次数
+            let mut ws_unsupported = false;
             let fetched: Result<Vec<Event>, anyhow::Error> = match ws_run.as_mut() {
                 Some(run) => {
                     // 上一轮用来唤醒循环的那条也要一起处理（见 Wake::Ws 的注释）
@@ -709,6 +729,18 @@ impl Session {
                             WsFeed::Down(message) => {
                                 ws_failure = Some(message.clone());
                                 tracing::debug!("[session] WS 断开：{message}");
+                            }
+                            WsFeed::Unsupported(message) => {
+                                ws_unsupported = true;
+                                ws_failure = Some(message.clone());
+                            }
+                            WsFeed::Fatal(message) => {
+                                // 令牌被换掉 / 网络被删：和轮询模式的处理保持一致
+                                self.notify.say(&format!("⚠ 加入令牌被拒绝：{message}"));
+                                self.notify.say(
+                                    "  现有直连还能用，但新节点连不上来了。重新加入：qp2p join <新令牌>",
+                                );
+                                return;
                             }
                         }
                     }
@@ -841,11 +873,23 @@ impl Session {
             if let Some(reason) = ws_failure {
                 ws_failed.push(Instant::now());
                 ws_failed.retain(|t| t.elapsed() < WS_FAIL_WINDOW);
-                if ws_mode.falls_back() && ws_failed.len() >= WS_FAIL_LIMIT {
-                    self.notify.say(&format!(
-                        "⚠ 长连接连续失败（{reason}），改用轮询，{} 分钟后再试",
-                        ws_retry_delay.as_secs() / 60
-                    ));
+                let over_limit = ws_failed.len() >= WS_FAIL_LIMIT;
+                // 501 表示服务端没有 DO——这不是"连不上"，是"没这个功能"，
+                // 任何模式下都必须退回轮询，否则连事件源都没了。
+                // 其余失败只有 auto 模式才降级；强制模式继续按短退避重连。
+                let must_poll = ws_unsupported || (ws_mode.falls_back() && over_limit);
+                if must_poll {
+                    if ws_unsupported && !ws_unsupported_notified {
+                        ws_unsupported_notified = true;
+                        self.notify.say(&format!(
+                            "· 服务端没有 Durable Object（{reason}），本次只能用轮询；之后每隔一段时间再探一次"
+                        ));
+                    } else if !ws_unsupported {
+                        self.notify.say(&format!(
+                            "⚠ 长连接连续失败（{reason}），改用轮询，{} 分钟后再试",
+                            ws_retry_delay.as_secs() / 60
+                        ));
+                    }
                     // drop 会 abort 后台任务，别让它在轮询期间继续重连
                     ws_run = None;
                     ws_early = None;

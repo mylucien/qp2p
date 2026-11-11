@@ -27,11 +27,48 @@ use tokio_tungstenite::WebSocketStream;
 use super::client::{Event, SignalClient};
 use crate::identity::Identity;
 
+/// TCP + TLS + HTTP 升级三段的统一上限。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 等 hello 的上限：超时说明服务端卡在验签或建 socket 上。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// 服务端没下发 limits 时的兜底。
 const DEFAULT_PING_EVERY: Duration = Duration::from_secs(25);
 const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 握手被服务端以 HTTP 状态码拒绝。
+///
+/// 单独成一个错误类型，是为了让调用方能区分"网络抖一下"和"令牌已经废了"：
+/// 后者再重试一万次也不会成功，必须停下来告诉用户。
+#[derive(Debug, Clone)]
+pub struct HandshakeRejected {
+    pub status: u16,
+    /// 服务端错误体（`{ok:false,error,detail}` 的原文，截断过）
+    pub detail: String,
+}
+
+impl std::fmt::Display for HandshakeRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.detail.is_empty() {
+            write!(f, "服务端拒绝握手（HTTP {}）", self.status)
+        } else {
+            write!(f, "服务端拒绝握手（HTTP {}）：{}", self.status, self.detail)
+        }
+    }
+}
+
+impl std::error::Error for HandshakeRejected {}
+
+impl HandshakeRejected {
+    /// 令牌不对 / 签名不对 / 密钥已轮换：重试没有意义。
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(self.status, 401 | 403)
+    }
+
+    /// 服务端明确表示没有 Durable Object：直接退回轮询，不用等失败次数攒够。
+    pub fn is_unsupported(&self) -> bool {
+        self.status == 501
+    }
+}
 
 /// 握手成功后服务端下发的第一条消息。
 #[derive(Debug, Clone, Deserialize)]
@@ -170,12 +207,23 @@ impl WsLink {
             .to_string();
         let port = uri.port_u16().unwrap_or(443);
 
-        let tcp = TcpStream::connect((host.as_str(), port))
-            .await
-            .with_context(|| format!("连不上 {host}:{port}"))?;
-        tcp.set_nodelay(true).ok();
-
-        let stream = tls_connect(&host, tcp).await?;
+        // TCP 与 TLS 都必须设上限：对端丢包时 connect 会挂在系统默认的 ~20 秒，
+        // 而调用方（后台任务）在拿到结果前不会发任何通知，主循环会误以为
+        // "连接是好的，只是没有事件"——静默失联比直接报错难查得多。
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let tcp = TcpStream::connect((host.as_str(), port))
+                .await
+                .with_context(|| format!("连不上 {host}:{port}"))?;
+            tcp.set_nodelay(true).ok();
+            tls_connect(&host, tcp).await
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "连接 {host}:{port} 超时（{} 秒）",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
 
         let mut request = url
             .as_str()
@@ -187,9 +235,37 @@ impl WsLink {
                 .context("令牌里有不能放进请求头的字符")?,
         );
 
-        let (mut ws, _resp) = tokio_tungstenite::client_async(request, stream)
-            .await
-            .with_context(|| format!("WebSocket 握手被拒（{host}）"))?;
+        let (mut ws, _resp) = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::client_async(request, stream),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(anyhow!(
+                    "WebSocket 握手超时（{} 秒）",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            }
+            Ok(Ok(pair)) => pair,
+            // 服务端在升级前就用 HTTP 状态码拒绝：保留状态码与响应体，别让
+            // 调用方只看到一句"握手失败"（401 和 503 的处理方式完全不同）
+            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
+                let status = resp.status().as_u16();
+                let detail = resp
+                    .body()
+                    .as_ref()
+                    .and_then(|b| String::from_utf8(b.clone()).ok())
+                    .unwrap_or_default();
+                return Err(anyhow::Error::new(HandshakeRejected {
+                    status,
+                    detail: detail.chars().take(200).collect(),
+                }));
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow::Error::new(e).context(format!("WebSocket 握手被拒（{host}）")))
+            }
+        };
 
         let hello = tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut ws))
             .await

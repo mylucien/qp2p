@@ -202,6 +202,12 @@ async function run() {
   );
   check("签名错误 → 403", badSig.status === 403, badSig.status);
 
+  // 曾经用 slice(0,16) 静默截断，导致客户端签的是全量、服务端算的是截断后的，
+  // 表现为永远 bad_signature。现在必须明确拒绝。
+  const manyCaps = Array.from({ length: 17 }, (_, i) => `cap${i}`);
+  const tooMany = await openWs(env, token, alice, net, { caps: manyCaps });
+  check("caps 超过 16 项 → 400", tooMany.status === 400, tooMany.status);
+
   console.log("\n3. 握手成功与 hello");
   const resA = await openWs(env, token, alice, net, { caps: ["offline_evt"] });
   check("alice 升级 101", resA.status === 101, resA.status);
@@ -282,6 +288,14 @@ async function run() {
   await room.webSocketMessage(serverD, "x".repeat(5000));
   check("超大消息按 4429 关闭", sockD.closed?.code === 4429, sockD.closed);
 
+  // 上限按**字节**算：1500 个汉字只有 1500 个字符，但 4500 字节，必须被判超限
+  const resD2 = await openWs(env, token, bob, net);
+  const serverD2 = room.state
+    .getWebSockets()
+    .find((s) => s.deserializeAttachment().node === bob.nodeId);
+  await room.webSocketMessage(serverD2, "汉".repeat(1500));
+  check("中文按字节判定超限", resD2.webSocket.closed?.code === 4429, resD2.webSocket.closed);
+
   const resE = await openWs(env, token, bob, net);
   const serverE = room.state.getWebSockets().find((s) => s.deserializeAttachment().node === bob.nodeId);
   check("非法 JSON 不关闭连接", await (async () => {
@@ -303,6 +317,15 @@ async function run() {
   const live = room.liveness(room.getNode(bob.nodeId), Date.now());
   check("有 socket 时 via=ws", live.via === "ws", live);
   check("刚连上算在线", live.online === true, live);
+
+  // 管理面必须也按 socket 判定：以前它只看 last_seen，长连接节点会被显示成离线
+  const list = await call(env, "GET", `/v1/admin/networks/${net.id}/nodes`, { admin: ADMIN_SECRET });
+  const bobAdminRow = list.body.nodes?.find((n) => n.node_id === bob.nodeId);
+  check(
+    "管理面把长连接节点标成 ws 在线",
+    bobAdminRow?.via === "ws" && bobAdminRow?.online === true,
+    bobAdminRow,
+  );
 
   serverF._autoAt = Date.now() - 100_000; // 超过 WS_GRACE(75s)
   const stale = room.liveness(room.getNode(bob.nodeId), Date.now());
