@@ -1412,6 +1412,14 @@ pub fn token_rejected(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
+    /// 三种传输方式的语义：auto 允许长连接且会降级，always 不降级，never 不试。
+    #[test]
+    fn ws_mode_semantics() {
+        assert!(WsMode::Auto.wants_ws() && WsMode::Auto.falls_back());
+        assert!(WsMode::Always.wants_ws() && !WsMode::Always.falls_back());
+        assert!(!WsMode::Never.wants_ws() && !WsMode::Never.falls_back());
+    }
+
     #[test]
     fn only_dialable_candidates_are_reported() {
         let ok: SocketAddr = "203.0.113.7:51820".parse().unwrap();
