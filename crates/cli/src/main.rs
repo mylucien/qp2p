@@ -830,6 +830,16 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             }
             config.stun = list;
         }
+        "transport" | "signal_transport" => {
+            let choice = value.trim().to_lowercase();
+            if !matches!(
+                choice.as_str(),
+                "ws" | "websocket" | "poll" | "http" | "auto"
+            ) {
+                bail!("传输方式只能是 ws / poll / auto，你给的是 {value:?}");
+            }
+            config.signal_transport = Some(choice);
+        }
         "routes" | "route" => {
             let list = split_list(value);
             for raw in &list {
@@ -874,6 +884,7 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         "idle" => config.idle = None,
         "dev" => config.dev = None,
         "stun" => config.stun = Config::default().stun,
+        "transport" | "signal_transport" => config.signal_transport = None,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {
             if let Some(network) = config.network.as_mut() {
@@ -1035,6 +1046,7 @@ async fn cmd_up(args: &[String]) -> Result<()> {
              --dev <名字>      虚拟网卡名，默认 qp2p0\n  \
              --mtu <n>         虚拟网卡 MTU，默认 1400\n  \
              --route <网段>    额外让某个网段走隧道，可重复\n  \
+             --transport <方式> ws（事件由服务端推送，省请求）/ poll（轮询）/ auto（默认=轮询）\n  \
              --save            把这次给的 --name/--mtu/--dev/--route/--bind/--stun 存进配置\n  \
              --data-dir <dir>  身份目录，默认 ~/.qp2p\n\n             没给的选项会沿用 qp2p config 里保存的值。\n"
         );
@@ -1191,6 +1203,24 @@ async fn cmd_up(args: &[String]) -> Result<()> {
                 .filter(|secs| *secs > 0)
                 .map(Duration::from_secs),
             peers: reply.peers.clone(),
+            // --transport ws 走长连接；不填或 poll/auto 保持原来的轮询行为。
+            // 第一步是手动开关：ws 连不上就报错重试，不会自动退回轮询。
+            use_ws: {
+                let choice = flags
+                    .get("transport")
+                    .or(config.signal_transport.as_deref())
+                    .unwrap_or("auto");
+                match choice {
+                    "ws" | "websocket" => true,
+                    "poll" | "auto" | "http" => false,
+                    other => {
+                        println!(
+                            "⚠ 不认识的传输方式 {other:?}，按轮询处理（可选 ws / poll / auto）"
+                        );
+                        false
+                    }
+                }
+            },
         },
         engine.clone(),
         mesh.clone(),

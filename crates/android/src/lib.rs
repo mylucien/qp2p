@@ -297,6 +297,9 @@ pub fn start(fd: i32) -> Result<()> {
                 // 手机按流量计费：空闲 10 分钟就断链，有流量时自动重连
                 idle_timeout: Some(Duration::from_secs(600)),
                 peers,
+                // Android 暂时沿用轮询：长连接要配合"休眠断开 + 唤醒重连"才省电，
+                // 那部分在第二步做，现在打开反而更费电
+                use_ws: false,
             },
             engine.clone(),
             Some(mesh.clone()),

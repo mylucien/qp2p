@@ -17,7 +17,8 @@ use crate::identity::{Identity, NodeId};
 use crate::link::tun::MeshLinks;
 use crate::peer::Role;
 use crate::route::Cidr;
-use crate::signal::client::{PeerInfo, SignalClient, SignalError};
+use crate::signal::client::{Event, PeerInfo, SignalClient, SignalError};
+use crate::signal::ws::{WsItem, WsLink};
 use crate::stun::NatKind;
 
 /// 事件轮询间隔：三档自适应。
@@ -96,6 +97,111 @@ pub struct SessionConfig {
     pub idle_timeout: Option<Duration>,
     /// 注册时拿到的成员列表
     pub peers: Vec<PeerInfo>,
+    /// 事件源走 WebSocket 长连接（false = 沿用轮询）。
+    ///
+    /// 第一步只做手动开关：为 true 时连不上就报错重试，不会自动退回轮询。
+    /// 自动降级与断路器在第二步接。
+    pub use_ws: bool,
+}
+
+/// 后台 WS 任务往主循环送的东西。
+enum WsFeed {
+    Event(Event),
+    /// 连接坏了或握不上手，附带原因；任务自己会按退避重连。
+    Down(String),
+    /// 服务端主动关闭。
+    Closed {
+        code: u16,
+        reason: String,
+    },
+    /// 被踢下线：应当停止会话。
+    Kick(String),
+}
+
+/// 等下一轮时被什么叫醒的。
+enum Wake {
+    Tick,
+    Tun(Ipv4Addr),
+    /// 来了一条 WS 消息。**必须把它带回去**：`recv()` 已经从队列里取走了，
+    /// 不处理就等于丢事件（曾经在这里丢过一次）。
+    Ws(WsFeed),
+}
+
+/// 后台任务：维持一条 WS 连接，把事件推进队列。
+///
+/// 重连由它自己负责（退避 1 → 60 秒）。主循环不需要知道连接是怎么断的，
+/// 只会在下一轮看到"这一批没有事件"。
+async fn ws_feed(
+    client: SignalClient,
+    identity: Identity,
+    mut since: i64,
+    tx: tokio::sync::mpsc::Sender<WsFeed>,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match WsLink::open(&client, &identity, since, &[]).await {
+            Ok(mut link) => {
+                let opened = Instant::now();
+                loop {
+                    match link.next().await {
+                        WsItem::Event(event) => {
+                            // 队列满说明主循环一时没跟上：这条不推进游标，重连时服务端会补发。
+                            // 不能在这里 await——阻塞住就收不到 pong，服务端会把我们判成离线。
+                            match tx.try_send(WsFeed::Event(event.clone())) {
+                                Ok(()) => {
+                                    if event.seq > since {
+                                        since = event.seq;
+                                    }
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        "[session] WS 事件队列已满，丢弃一条，等重连补发"
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                            }
+                        }
+                        // 第一步撮合仍走 HTTP，socket 上的这几种应答只记日志
+                        WsItem::ConnectOk(reply) => {
+                            tracing::debug!("[ws] 收到 connect_ok：{reply}");
+                        }
+                        WsItem::ConnectError { req, error, detail } => {
+                            tracing::debug!("[ws] 撮合失败 req={req:?} {error}：{detail}");
+                        }
+                        WsItem::ResumeOk(cursor) => {
+                            tracing::debug!("[ws] resume 已补齐到 {cursor}");
+                        }
+                        WsItem::Kick(reason) => {
+                            let _ = tx.try_send(WsFeed::Kick(reason));
+                            let _ = link.close().await;
+                            return;
+                        }
+                        WsItem::Closed { code, reason } => {
+                            let _ = tx.try_send(WsFeed::Closed { code, reason });
+                            break;
+                        }
+                        WsItem::Down(message) => {
+                            let _ = tx.try_send(WsFeed::Down(message));
+                            break;
+                        }
+                    }
+                }
+                // 连接活得够久就把退避复位，别让偶发断线越退越慢
+                if opened.elapsed() >= Duration::from_secs(60) {
+                    backoff = Duration::from_secs(1);
+                }
+                let _ = link.close().await;
+            }
+            Err(e) => {
+                let _ = tx.try_send(WsFeed::Down(format!("{e:#}")));
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
 }
 
 struct PeerState {
@@ -442,6 +548,7 @@ impl Session {
             wanted_ip,
             idle_timeout,
             peers: initial,
+            use_ws,
         } = self.config;
 
         {
@@ -452,6 +559,19 @@ impl Session {
         }
 
         let mut cursor: i64 = 0;
+
+        // 事件源：WebSocket 长连接（手动开启）或轮询（默认）。
+        // 两者产出的 Event 完全同构，下游处理不分叉。
+        let mut ws_rx = if use_ws {
+            let (tx, rx) = tokio::sync::mpsc::channel::<WsFeed>(64);
+            tokio::spawn(ws_feed(client.clone(), identity.clone(), cursor, tx));
+            self.notify
+                .say("· 信令走 WebSocket 长连接，事件由服务端推送");
+            Some(rx)
+        } else {
+            None
+        };
+
         let mut last_register = Instant::now();
         let mut last_renew = Instant::now();
         let mut last_error = String::new();
@@ -474,17 +594,58 @@ impl Session {
         let mut sleeping = false;
         // 上一轮是否有直连：用来识别"原本连着、现在全断了"（多半是换网）
         let mut had_links = false;
+        // select 用来唤醒循环的那条 WS 消息，下一轮开头必须先处理掉
+        let mut ws_early: Option<WsFeed> = None;
 
         while !self.stop.load(Ordering::Relaxed) {
             // 本轮是否需要马上重新登记（事件、STUN 观测都可能置位）
             let mut need_register = false;
 
-            // 1) 拉事件：对端请求撮合时，服务端会往这里塞 punch_request；
-            //    对端上线 / 换地址时会塞 peer_online 广播
-            match client.events(&identity, cursor).await {
-                Ok(reply) => {
+            // 1) 取事件：对端请求撮合时，服务端会往这里塞 punch_request；
+            //    对端上线 / 换地址时会塞 peer_online 广播。
+            //    WS 模式下这些事件是推来的，主循环只负责把队列掏空。
+            let fetched: Result<Vec<Event>, anyhow::Error> = match ws_rx.as_mut() {
+                Some(rx) => {
+                    // 上一轮用来唤醒循环的那条也要一起处理（见 Wake::Ws 的注释）
+                    let mut items: Vec<WsFeed> = ws_early.take().into_iter().collect();
+                    while let Ok(item) = rx.try_recv() {
+                        items.push(item);
+                    }
+
+                    let mut batch = Vec::new();
+                    for item in items {
+                        match item {
+                            WsFeed::Event(event) => batch.push(event),
+                            WsFeed::Kick(reason) => {
+                                self.notify.say(&format!(
+                                    "⚠ {reason}（本节点已被移出这个网络，无法继续）"
+                                ));
+                                return;
+                            }
+                            WsFeed::Closed { code, reason } => {
+                                // 重连由后台任务负责，这里只留一条调试线索
+                                tracing::debug!("[session] WS 关闭 code={code} {reason}");
+                            }
+                            WsFeed::Down(message) => {
+                                tracing::debug!("[session] WS 断开：{message}");
+                            }
+                        }
+                    }
+                    Ok(batch)
+                }
+                None => client.events(&identity, cursor).await.map(|reply| {
                     cursor = reply.cursor;
-                    for event in reply.events {
+                    reply.events
+                }),
+            };
+
+            match fetched {
+                Ok(events) => {
+                    for event in events {
+                        // WS 模式下 cursor 靠事件自带 seq 推进，重连时当 since 用
+                        if event.seq > cursor {
+                            cursor = event.seq;
+                        }
                         match event.kind.as_str() {
                             "punch_request" => {
                                 let Some(from) = event.str("from").and_then(NodeId::parse) else {
@@ -792,9 +953,26 @@ impl Session {
                 // 信令出错时只会更慢，不会更快
                 .max(error_backoff(err_streak))
             };
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                Some(ip) = wake_rx.recv() => {
+            // WS 模式下事件会主动叫醒循环，定时器只当兜底（扫描链路状态、重注册）
+            let wake = match ws_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => Wake::Tick,
+                        Some(ip) = wake_rx.recv() => Wake::Tun(ip),
+                        Some(item) = rx.recv() => Wake::Ws(item),
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => Wake::Tick,
+                        Some(ip) = wake_rx.recv() => Wake::Tun(ip),
+                    }
+                }
+            };
+            match wake {
+                Wake::Tick => {}
+                Wake::Ws(item) => ws_early = Some(item),
+                Wake::Tun(ip) => {
                     // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
                     while wake_rx.try_recv().is_ok() {}
                     forced = Some(ip);

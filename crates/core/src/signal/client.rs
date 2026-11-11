@@ -520,6 +520,45 @@ impl SignalClient {
         serde_json::from_value(value).context("服务端返回的事件格式不对")
     }
 
+    /// 生成 WebSocket 握手地址（`wss://…/v1/ws?…&sig=…`）。
+    ///
+    /// 签名与 `/v1/events` 同规则，只是 op 换成 `ws`、摘要多一个 `caps` 字段：
+    /// 摘要是 `canonicalJson({node_id, since, ts, nonce, caps})`，其中 **caps 是
+    /// 排序后逗号拼接的字符串**——服务端按同样规则算，两边只需对一个字符串。
+    /// 令牌不进 URL（会落进访问日志），由调用方用 `Authorization` 头发。
+    pub fn ws_url(&self, identity: &Identity, since: i64, caps: &[&str]) -> Result<String> {
+        let mut sorted: Vec<&str> = caps.to_vec();
+        sorted.sort_unstable();
+        let caps_str = sorted.join(",");
+
+        let ts = now_ms();
+        let nonce = random_nonce();
+        let node_id = identity.node_id().to_string();
+
+        let mut body = Map::new();
+        body.insert("node_id".into(), Value::String(node_id.clone()));
+        body.insert("since".into(), Value::from(since));
+        body.insert("ts".into(), Value::from(ts));
+        body.insert("nonce".into(), Value::String(nonce.clone()));
+        body.insert("caps".into(), Value::String(caps_str.clone()));
+
+        let digest = body_digest(&Value::Object(body)).context("握手请求无法规范化（内部错误）")?;
+        let message = signing_message("ws", &self.network_id, ts, &nonce, &digest);
+        let sig = hex::encode(identity.sign(message.as_bytes()));
+
+        let ws_base = if let Some(rest) = self.base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = self.base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            anyhow::bail!("Worker 地址必须是 http(s) 开头");
+        };
+
+        Ok(format!(
+            "{ws_base}/v1/ws?node_id={node_id}&since={since}&ts={ts}&nonce={nonce}&caps={caps_str}&sig={sig}"
+        ))
+    }
+
     /// 下线：把本节点从网络里删掉，别人就不会再尝试连它。
     pub async fn leave(&self, identity: &Identity) -> Result<()> {
         let mut body = Map::new();

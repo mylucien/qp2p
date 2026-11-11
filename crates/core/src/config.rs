@@ -73,6 +73,12 @@ pub struct Config {
     pub routes: Vec<String>,
     #[serde(default = "default_true")]
     pub upnp: bool,
+    /// 信令传输方式：`auto`（默认，现在等同于 poll）、`ws`（长连接）、`poll`（轮询）。
+    ///
+    /// `ws` 需要服务端是绑定 Durable Object 的部署；连不上会直接报错，不会自动退回轮询
+    /// （自动降级在下一步做）。不填时保持原有轮询行为，升级不影响现有使用者。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
     #[serde(default, rename = "forward")]
@@ -234,6 +240,7 @@ impl Default for Config {
             dev: None,
             routes: Vec::new(),
             upnp: true,
+            signal_transport: None,
             network: None,
             forwards: Vec::new(),
         }
