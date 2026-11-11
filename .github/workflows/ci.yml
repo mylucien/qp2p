@@ -67,6 +67,10 @@ jobs:
       - name: Smoke test
         run: node signal/smoke.mjs
 
+      # NetworkRoom（DO）骨架：用 node:sqlite 冒充 storage.sql，验证建表/上下文/sweep
+      - name: NetworkRoom smoke
+        run: node signal/room-smoke.mjs
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

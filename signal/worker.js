@@ -2825,3 +2825,235 @@ api('/v1/admin/status').then(function(j){
 </script>
 </body>
 </html>`;
+
+// ---------------------------------------------------------------------------
+// NetworkRoom（Durable Object，每个网络一个）
+// ---------------------------------------------------------------------------
+//
+// 网络的全部数据面（节点、预留、事件、nonce）都在这个对象的 SQLite 里。
+//
+// 两条硬性约束，破坏任何一条都会让休眠失效、一天烧光 13,000 GB·秒的免费时长：
+//   1. 不注册任何定时器（setTimeout / setInterval / storage.setAlarm）
+//   2. 不发起任何出站连接（fetch / connect）
+// 清理靠惰性 sweep()：HTTP 与 WebSocket 消息入口都顺带调用，距上次满 5 分钟才执行。
+//
+// 设计文档：docs/signal-v3-design.md
+
+const ROOM_SCHEMA_VERSION = 1;
+
+const ROOM_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS nodes (
+    node_id      TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    pubkey       TEXT NOT NULL,
+    tls_fp       TEXT NOT NULL,
+    virtual_ip   TEXT NOT NULL UNIQUE,
+    nat_type     TEXT NOT NULL DEFAULT '',
+    advertise    TEXT NOT NULL DEFAULT '',
+    candidates   TEXT NOT NULL DEFAULT '',
+    candidates_at INTEGER NOT NULL DEFAULT 0,
+    last_seen    INTEGER NOT NULL,
+    first_seen   INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS reservations (
+    ip         TEXT PRIMARY KEY,
+    node_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_node    TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS events_to_node ON events (to_node, id)`,
+  `CREATE TABLE IF NOT EXISTS nonces (
+    nonce      TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+  )`,
+];
+
+export class NetworkRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.sql = state.storage.sql;
+    this.bootAt = Date.now();
+    // 仅内存：socket 对象本身休眠后由 state.getWebSockets() 恢复，
+    // 所以这张表只服务诊断与限流计数，丢了不影响正确性。
+    this.sockets = new Map();
+    this.lastSweep = 0;
+
+    // ping 由运行时自动应答：不唤醒对象、不计入请求（设计文档 §11 的容量假设依赖它）
+    if (
+      typeof state.setWebSocketAutoResponse === "function" &&
+      typeof WebSocketRequestResponsePair === "function"
+    ) {
+      state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    }
+
+    state.blockConcurrencyWhile?.(async () => this.initSchema());
+  }
+
+  /** 幂等建表并记录 schema_version。结构演进走内部迁移，DO 类名永久冻结。 */
+  initSchema() {
+    for (const stmt of ROOM_SCHEMA) this.sql.exec(stmt);
+    const row = this.sql.exec("SELECT v FROM meta WHERE k = 'schema_version'").toArray()[0];
+    if (!row) {
+      this.sql.exec(
+        "INSERT INTO meta (k, v) VALUES (?, ?)",
+        "schema_version",
+        String(ROOM_SCHEMA_VERSION),
+      );
+    }
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+    const method = request.method;
+
+    try {
+      // 保持网络上下文最新：Worker 换了绑定或网络改名时会带新头过来
+      this.loadNet(request);
+      if (path === "/i/init" && method === "POST") return await this.handleInit(request);
+      if (path === "/i/net-updated" && method === "POST") return await this.handleNetUpdated(request);
+      if (path === "/i/purge" && method === "POST") return await this.handlePurge();
+      if (path === "/i/stats" && method === "GET") return json(this.stats());
+      if (path === "/i/debug" && method === "GET") return json(this.debug());
+      // 业务端点（/i/join、/i/register、/i/connect、/i/events、/i/leave、/i/ws）
+      // 在 P2 接入；P1 明确返回未实现，避免调用方误以为已经能用。
+      return err(501, "not_implemented", `${method} ${path}（P2 实现）`);
+    } catch (e) {
+      return err(500, "internal_error", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** 读 x-qp2p-net；与 meta.net 不同就落库（Worker 换了网络上下文时必须更新）。 */
+  loadNet(request) {
+    const raw = request.headers.get("x-qp2p-net");
+    const cur = this.net();
+    if (!raw) return cur;
+    let ctx;
+    try {
+      ctx = JSON.parse(raw);
+    } catch {
+      return cur;
+    }
+    if (ctx.v !== 1 || !ctx.id) return cur;
+    if (!cur || cur.id !== ctx.id) {
+      const next = { v: 1, id: ctx.id, name: ctx.name, cidr: ctx.cidr };
+      this.setMeta("net", JSON.stringify(next));
+      return next;
+    }
+    return cur;
+  }
+
+  net() {
+    const row = this.sql.exec("SELECT v FROM meta WHERE k = 'net'").toArray()[0];
+    if (!row) return null;
+    try {
+      return JSON.parse(row.v);
+    } catch {
+      return null;
+    }
+  }
+
+  setMeta(k, v) {
+    this.sql.exec(
+      "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+      k,
+      String(v),
+    );
+  }
+
+  getMeta(k, fallback = null) {
+    const row = this.sql.exec("SELECT v FROM meta WHERE k = ?", k).toArray()[0];
+    return row ? row.v : fallback;
+  }
+
+  async handleInit(request) {
+    const body = await request.json().catch(() => null);
+    if (!body || !body.net || !body.net.id) return err(400, "invalid_json");
+    this.setMeta("net", JSON.stringify(body.net));
+    this.sweepNow();
+    return json({ ok: true, schema_version: ROOM_SCHEMA_VERSION });
+  }
+
+  async handleNetUpdated(request) {
+    const body = await request.json().catch(() => null);
+    if (body && body.net) this.setMeta("net", JSON.stringify(body.net));
+    // 换密钥/改网段时由调用方另发关闭指令；这里只更新上下文
+    return json({ ok: true });
+  }
+
+  async handlePurge() {
+    for (const table of ["nodes", "reservations", "events", "nonces"]) {
+      this.sql.exec(`DELETE FROM ${table}`);
+    }
+    this.sql.exec("DELETE FROM meta WHERE k = 'net'");
+    return json({ ok: true });
+  }
+
+  /** 统计。P1 只数表；在线数在 P2 接 liveness 后才有意义。 */
+  stats() {
+    const count = (table) => this.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]?.n ?? 0;
+    return {
+      ok: true,
+      nodes: count("nodes"),
+      online: 0,
+      sockets: this.state.getWebSockets?.().length ?? 0,
+      reservations: count("reservations"),
+      events: count("events"),
+      schema_version: ROOM_SCHEMA_VERSION,
+    };
+  }
+
+  debug() {
+    return {
+      ok: true,
+      bootAt: this.bootAt,
+      schema_version: ROOM_SCHEMA_VERSION,
+      net: this.net(),
+      sockets: (this.state.getWebSockets?.() ?? []).map((ws) => {
+        const a = ws.deserializeAttachment?.() ?? {};
+        return { node: a.node ?? null, joinedAt: a.joinedAt ?? null };
+      }),
+      lastSweep: this.lastSweep,
+    };
+  }
+
+  /** 惰性 GC 入口：HTTP 与 WebSocket 消息路径都要调，距上次满 5 分钟才真正执行。 */
+  sweep() {
+    if (Date.now() - this.lastSweep < SWEEP_INTERVAL_MS) return;
+    this.sweepNow();
+  }
+
+  sweepNow(now = Date.now()) {
+    this.lastSweep = now;
+    this.setMeta("last_sweep", String(now));
+
+    this.sql.exec("DELETE FROM events WHERE created_at < ?", now - EVENT_TTL_MS);
+    this.sql.exec("DELETE FROM nonces WHERE created_at < ?", now - EVENT_TTL_MS);
+
+    // 僵尸节点：10 分钟没心跳、且当前没有活跃 socket
+    const alive = new Set(
+      (this.state.getWebSockets?.() ?? [])
+        .map((ws) => ws.deserializeAttachment?.()?.node)
+        .filter(Boolean),
+    );
+    const stale = this.sql.exec("SELECT node_id FROM nodes WHERE last_seen < ?", now - NODE_TTL_MS).toArray();
+    for (const row of stale) {
+      if (alive.has(row.node_id)) continue;
+      this.sql.exec("DELETE FROM nodes WHERE node_id = ?", row.node_id);
+      this.sql.exec("DELETE FROM reservations WHERE node_id = ? AND kind = 'auto'", row.node_id);
+    }
+  }
+}
