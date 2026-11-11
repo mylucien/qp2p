@@ -287,6 +287,26 @@ qp2p up --idle 600      # 直连空闲 600 秒断开，有流量时自动重连
 
 桌面端默认不断，Android 固定 10 分钟。断链后第一次 ping 有 1~3 秒重连延迟。
 
+### 信令传输方式（省请求）
+
+默认是轮询：每个节点每分钟问一次服务端有没有新事件，一天约 1440 次请求。
+服务端是绑定 Durable Object 的部署时，可以换成 WebSocket 长连接，事件由服务端推，
+一天约 260 次请求，撮合延迟也从"最多等一个轮询周期"变成即时。
+
+```bash
+qp2p up --transport ws          # 这次用长连接
+qp2p config set transport ws    # 以后都用
+qp2p config set transport poll  # 改回轮询
+qp2p config unset transport     # 同上，回默认
+```
+
+- 只有服务端已经升级到带 Durable Object 的版本才连得上。旧服务端会直接握手失败，
+  程序会按 1→60 秒退避重试（**不会自动退回轮询**，这一步留到下一版）。
+- 不确定服务端支不支持：`qp2p init <地址> --admin <密钥>` 的输出里有一行
+  `引擎    : room（支持 WebSocket 长连接）` / `legacy（只能用轮询）`。
+- 连上后日志会打「信令走 WebSocket 长连接，事件由服务端推送」；链路本身不受影响，
+  长连接只承载"谁上线了、谁要连我"这类撮合消息。
+
 ### 其它本机配置
 
 ```bash
@@ -298,7 +318,7 @@ qp2p config set routes 192.168.1.0/24,192.168.2.0/24
 qp2p config unset mtu            # 回到默认
 ```
 
-可用项：`worker` `admin_secret` `node_name` `listen` `mtu` `dev` `stun` `routes` `ip`。
+可用项：`worker` `admin_secret` `node_name` `listen` `mtu` `dev` `stun` `routes` `transport` `ip`。
 取值顺序：命令行 > 配置文件 > 默认值。想让这次的命令行选择长期生效就加 `--save`：
 
 ```bash

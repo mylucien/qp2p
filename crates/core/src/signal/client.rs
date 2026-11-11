@@ -260,6 +260,19 @@ pub struct Health {
     pub warning: String,
     #[serde(default)]
     pub nodes: Option<i64>,
+    /// 数据面引擎：`room`（Durable Object，支持 WebSocket）或 `legacy`（D1 轮询）。
+    #[serde(default)]
+    pub engine: String,
+    /// 服务端能力列表；旧版本没有这个字段，反序列化成空。
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl Health {
+    /// 服务端是否支持 WebSocket 长连接。
+    pub fn supports_ws(&self) -> bool {
+        self.features.iter().any(|f| f == "ws")
+    }
 }
 
 /// 信令客户端：一个实例绑定一个网络令牌。

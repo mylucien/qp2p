@@ -382,6 +382,16 @@ async fn cmd_init(args: &[String]) -> Result<()> {
                 "内存（只存在单个实例里，重启就丢）"
             }
         );
+        if !health.engine.is_empty() {
+            println!(
+                "  引擎    : {}",
+                if health.supports_ws() {
+                    "room（支持 WebSocket 长连接）"
+                } else {
+                    "legacy（只能用轮询）"
+                }
+            );
+        }
         if !health.warning.is_empty() {
             println!("  注意    : {}", health.warning);
         }
