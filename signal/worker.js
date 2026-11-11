@@ -153,6 +153,10 @@ export default {
       ctx.waitUntil(sweep(env).catch(() => {}));
     }
 
+    if (!(res instanceof Response)) {
+      // 走到这里说明某个分支忘了 return Response，直接 500 会只剩一张空白错误页
+      return err(500, "bad_internal_response", `route 返回了 ${typeof res} ${String(res).slice(0, 120)}`);
+    }
     res.headers.set("x-qp2p-colo", colo);
     res.headers.set("x-qp2p-ms", String(Date.now() - started));
     return res;
@@ -163,7 +167,28 @@ async function route(request, url, env, ctx) {
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = request.method;
 
-  // 根路径不提供任何入口说明：外部扫描应该看不出这里跑的是什么服务。
+  // 诊断端点：只有显式设置 LAB_DEBUG=1 的部署才会启用，用来把 DO 的异常原样带出来
+  if (path === "/__diag" && env.LAB_DEBUG === "1") {
+    const net = { network_id: "home", name: "home", cidr: "10.78.0.0/16" };
+    const stub = roomStub(env, net);
+    if (!stub) return json({ ok: false, error: "no_room" });
+    try {
+      const r = await stub.fetch(
+        new Request("https://room/i/debug", { headers: { "x-qp2p-net": netContext(net) } }),
+      );
+      const text = await r.text();
+      return json({ status: r.status, body: text.slice(0, 800) });
+    } catch (e) {
+      return json({
+        threw: true,
+        name: e?.name ?? null,
+        message: String(e?.message ?? e).slice(0, 400),
+        stack: String(e?.stack ?? "").slice(0, 600),
+      });
+    }
+  }
+
+  // 根路径不提供任何入口信息：外部扫描应该看不出这里跑的是什么服务。
   if (path === "/admin") return adminPage();
   if (path === "/v1/health") return health(request, env);
   if (path === "/v1/admin/status" && method === "GET") return adminStatus(request, env);
@@ -205,6 +230,136 @@ async function route(request, url, env, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Durable Object 转发层
+// ---------------------------------------------------------------------------
+//
+// 引擎由「Worker 有没有绑定 ROOM」决定，与具体网络无关：绑了就全部走 room，
+// 没绑就走 legacy（D1 数据面）。两条路都保留，回退就是部署一份不带绑定的版本。
+
+/** 是否走 room 引擎。 */
+function roomEnabled(env) {
+  return Boolean(env?.ROOM);
+}
+
+/** 取某个网络的 DO 句柄。 */
+function roomStub(env, network) {
+  if (!env?.ROOM || !network?.network_id) return null;
+  return env.ROOM.get(env.ROOM.idFromName(network.network_id));
+}
+
+/** 传给 DO 的网络上下文。**不含 join_hash**，DO 不需要也不应该拿到它。 */
+function netContext(network) {
+  return JSON.stringify({
+    v: 1,
+    id: network.network_id,
+    name: network.name,
+    cidr: network.cidr,
+  });
+}
+
+/**
+ * 把业务请求转给 DO。
+ *
+ * 先做令牌鉴权（D1 是控制面权威），再剥掉客户端带来的所有 x-qp2p-* 头，
+ * 附上我们自己的网络上下文——不能让客户端伪造 x-qp2p-net 去指别的网络。
+ */
+async function forwardToRoom(request, env, url, path) {
+  const auth = await authenticate(request, env, url);
+  if (!auth.ok) return auth.response;
+
+  const stub = roomStub(env, auth.network);
+  if (!stub) return err(501, "room_unavailable", "没有绑定 Durable Object");
+
+  const headers = new Headers(request.headers);
+  for (const key of [...headers.keys()]) {
+    if (key.toLowerCase().startsWith("x-qp2p-")) headers.delete(key);
+  }
+  headers.set("x-qp2p-net", netContext(auth.network));
+
+  const target = new URL(request.url);
+  target.pathname = path;
+
+  const isBodyless = request.method === "GET" || request.method === "HEAD";
+
+  let payload;
+  if (!isBodyless) {
+    try {
+      payload = await request.arrayBuffer();
+    } catch (e) {
+      return err(400, "body_read_failed", `${e?.name}: ${e?.message}`.slice(0, 300));
+    }
+    // 手动设的 content-length 会和实际字节数对不上，交给运行时自己算
+    headers.delete("content-length");
+  }
+
+  let res;
+  try {
+    res = await stub.fetch(
+      new Request(target.toString(), { method: request.method, headers, body: payload }),
+    );
+  } catch (e) {
+    return err(502, "room_throw", `${e?.name}: ${e?.message}`.slice(0, 300));
+  }
+
+  // DO 崩了的时候平台会给一个 HTML 错误页，直接透出去调用方只会看到 500。
+  // 这里把原文截一段带出来，否则线上排查等于摸黑。
+  if (res.status >= 500) {
+    const text = await res.text().catch(() => "");
+    return err(502, "room_error", `DO 返回 ${res.status}：${text.replace(/\s+/g, " ").slice(0, 200)}`);
+  }
+
+  // 关键：stub.fetch() 拿到的 Response headers 是只读的，而入口还要加 x-qp2p-colo
+  // 和 x-qp2p-ms。直接改会抛「immutable headers」，未捕获后变成平台空白 500。
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: new Headers(res.headers),
+  });
+}
+
+/** 把管理面请求转给 DO 的数据面。调用方已经做过 checkAdmin。 */
+async function roomAdminApi(env, net, path, { method = "GET", body } = {}) {
+  const stub = roomStub(env, net);
+  if (!stub) return null;
+  const res = await stub.fetch(
+    new Request(`https://room${path}`, {
+      method,
+      headers: { "x-qp2p-net": netContext(net), "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  );
+  // DO 的 Response headers 只读，入口还要加 x-qp2p-*，复制成可写的
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: new Headers(res.headers),
+  });
+}
+
+/**
+ * 并发取每个网络的 /i/stats（上限 8 路）。
+ *
+ * 单个网络失败只是不进结果，不拖垮整个列表——管理页的计数本来就是参考值。
+ */
+async function roomStatsAll(env, networks) {
+  const out = new Map();
+  const queue = [...networks];
+  const lanes = Array.from({ length: Math.min(8, queue.length) || 1 }, async () => {
+    while (queue.length) {
+      const net = queue.shift();
+      try {
+        const res = await roomAdminApi(env, net, "/i/stats");
+        if (res?.ok) out.set(net.network_id, await res.json());
+      } catch {
+        // 忽略：这个网络的计数按 0 处理
+      }
+    }
+  });
+  await Promise.all(lanes);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // 基础接口
 // ---------------------------------------------------------------------------
 
@@ -222,6 +377,10 @@ async function health(request, env) {
     version: VERSION,
     storage,
     has_admin_secret: Boolean(env.ADMIN_SECRET),
+    engine: roomEnabled(env) ? "room" : "legacy",
+    room_bound: roomEnabled(env),
+    // WebSocket 在 P3 上线；在那之前不能报 ws，否则客户端会尝试握手再失败降级
+    features: [],
     colo: request.cf?.colo ?? "local",
     server_ms: Date.now(),
     limits: { offline_ms: OFFLINE_MS, heartbeat_ms: HEARTBEAT_MS, max_nodes: MAX_NODES },
@@ -393,7 +552,17 @@ async function deleteNetwork(request, env, networkId) {
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
-  const removed = await purgeNetwork(env, networkId);
+  let removed = 0;
+  if (roomEnabled(env)) {
+    // 数据面在 DO：先让 DO 清掉，再顺手清一遍 D1（旧表里可能有升级前的残留）
+    const res = await roomAdminApi(env, net, "/i/purge", { method: "POST", body: {} });
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!data?.ok) return err(502, "room_bad_response", "DO 清理失败，网络没有删除");
+    removed = data.removed ?? 0;
+    await purgeNetwork(env, networkId);
+  } else {
+    removed = await purgeNetwork(env, networkId);
+  }
   await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`, await adminActor(request, env));
   console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
 
@@ -436,6 +605,29 @@ async function updateNetwork(request, env, networkId) {
   }
 
   await putNetwork(env, net);
+
+  // room 引擎：节点数据在 DO 里，重分配只能由 DO 做
+  if (roomEnabled(env)) {
+    const res = await roomAdminApi(env, net, "/i/net-updated", {
+      method: "POST",
+      body: { net: JSON.parse(netContext(net)), reassign: body.cidr !== undefined },
+    });
+    const data = res ? await res.json().catch(() => null) : null;
+    const reassigned = data?.reassigned ?? 0;
+    await audit(
+      env,
+      "network.update",
+      networkId,
+      `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`,
+      await adminActor(request, env),
+    );
+    return json({
+      ok: true,
+      changed: true,
+      network: { id: net.network_id, name: net.name, cidr: net.cidr },
+      reassigned,
+    });
+  }
 
   // 网段变了：不在新网段里的节点重新分配，否则它们会顶着一个 ping 不通的地址
   let reassigned = 0;
@@ -487,6 +679,12 @@ async function listNetworkNodes(request, env, networkId) {
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
+  // room 引擎：数据面在 DO，Worker 只保留鉴权
+  if (roomEnabled(env)) {
+    const res = await roomAdminApi(env, net, "/i/admin/nodes");
+    if (res) return res;
+  }
+
   const now = Date.now();
   const nodes = await listNodes(env, networkId);
   const reservations = await listReservations(env, networkId);
@@ -512,6 +710,23 @@ async function kickNode(request, env, networkId, nodeId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
+  if (roomEnabled(env)) {
+    const net = await getNetwork(env, networkId);
+    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+    const res = await roomAdminApi(env, net, "/i/admin/kick", {
+      method: "POST",
+      body: { node_ids: [nodeId] },
+    });
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+    if (!data.ok) return json(data, res.status);
+    if (!data.removed) return err(404, "node_not_found", `没有节点 ${nodeId}`);
+    const hit = data.kicked[0];
+    await audit(env, "node.kick", `${networkId}/${nodeId}`, hit.name, await adminActor(request, env));
+    console.warn(`[room] 管理员踢下线 ${hit.name} (${nodeId})`);
+    return json({ ok: true, node: { node_id: hit.node_id, name: hit.name } });
+  }
+
   const node = await getNode(env, networkId, nodeId);
   if (!node) return err(404, "node_not_found", `没有节点 ${nodeId}`);
 
@@ -527,6 +742,22 @@ async function kickNode(request, env, networkId, nodeId) {
 async function kickNodes(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
+
+  if (roomEnabled(env)) {
+    const net = await getNetwork(env, networkId);
+    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+    const body = (await readJson(request)) ?? {};
+    const res = await roomAdminApi(env, net, "/i/admin/kick", {
+      method: "POST",
+      body: { node_ids: body.node_ids },
+    });
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+    if (!data.ok) return json(data, res.status);
+    await audit(env, "node.kick_batch", networkId, `清理 ${data.removed} 个节点`, await adminActor(request, env));
+    console.warn(`[room] 管理员批量踢下线 ${data.removed} 个节点（${networkId}）`);
+    return json({ ok: true, removed: data.removed });
+  }
 
   const body = (await readJson(request)) ?? {};
   const ids = Array.isArray(body.node_ids) ? body.node_ids.map((x) => String(x).toLowerCase()) : [];
@@ -558,6 +789,23 @@ async function reserveIp(request, env, networkId) {
 
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+
+  if (roomEnabled(env)) {
+    const body = await readJson(request);
+    if (body === null) return err(400, "invalid_json");
+    const res = await roomAdminApi(env, net, "/i/admin/reserve", { method: "POST", body });
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+    if (!data.ok) return json(data, res.status);
+    await audit(
+      env,
+      "reservation.put",
+      `${networkId}/${data.reservation.ip}`,
+      data.reservation.node_id || "(未绑定节点)",
+      await adminActor(request, env),
+    );
+    return json(data);
+  }
 
   const body = await readJson(request);
   if (body === null) return err(400, "invalid_json");
@@ -611,6 +859,17 @@ async function releaseIp(request, env, networkId, ip) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
+  if (roomEnabled(env)) {
+    const net = await getNetwork(env, networkId);
+    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+    const res = await roomAdminApi(env, net, "/i/admin/release", { method: "POST", body: { ip } });
+    const data = res ? await res.json().catch(() => null) : null;
+    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+    if (!data.ok) return json(data, res.status);
+    await audit(env, "reservation.delete", `${networkId}/${ip}`, "", await adminActor(request, env));
+    return json({ ok: true, released: ip });
+  }
+
   await deleteReservation(env, networkId, ip);
   await audit(env, "reservation.delete", `${networkId}/${ip}`, "", await adminActor(request, env));
   return json({ ok: true, released: ip });
@@ -621,6 +880,10 @@ async function listReservationsAdmin(request, env, networkId) {
   if (admin) return admin;
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+  if (roomEnabled(env)) {
+    const res = await roomAdminApi(env, net, "/i/admin/reservations");
+    if (res) return res;
+  }
   return json({ ok: true, reservations: await listReservations(env, networkId) });
 }
 
@@ -638,6 +901,12 @@ async function allNetworks(env) {
 }
 
 async function nodeCounts(env) {
+  if (roomEnabled(env)) {
+    const stats = await roomStatsAll(env, await allNetworks(env));
+    const out = {};
+    for (const [id, s] of stats) out[id] = s.nodes ?? 0;
+    return out;
+  }
   if ((await ready(env)) === "memory") {
     const out = {};
     for (const node of memory.nodes.values()) {
@@ -655,6 +924,12 @@ async function nodeCounts(env) {
 
 /** 每网络在线节点数（管理页用，一次查询拿全）。 */
 async function onlineCounts(env) {
+  if (roomEnabled(env)) {
+    const stats = await roomStatsAll(env, await allNetworks(env));
+    const out = {};
+    for (const [id, s] of stats) out[id] = s.online ?? 0;
+    return out;
+  }
   const now = Date.now();
   if ((await ready(env)) === "memory") {
     const out = {};
@@ -676,6 +951,12 @@ async function onlineCounts(env) {
 }
 
 async function reservationCounts(env) {
+  if (roomEnabled(env)) {
+    const stats = await roomStatsAll(env, await allNetworks(env));
+    const out = {};
+    for (const [id, s] of stats) out[id] = s.reservations ?? 0;
+    return out;
+  }
   if ((await ready(env)) === "memory") {
     const out = {};
     for (const r of memory.reservations.values()) {
@@ -1164,6 +1445,10 @@ function randomSecret() {
 // ---------------------------------------------------------------------------
 
 async function joinOrRegister(request, env, url, needCandidates) {
+  if (roomEnabled(env)) {
+    return forwardToRoom(request, env, url, needCandidates ? "/i/register" : "/i/join");
+  }
+
   const auth = await authenticate(request, env, url);
   if (!auth.ok) return auth.response;
 
@@ -1307,6 +1592,8 @@ async function joinOrRegister(request, env, url, needCandidates) {
 }
 
 async function connect(request, env, url) {
+  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/connect");
+
   const auth = await authenticate(request, env, url);
   if (!auth.ok) return auth.response;
 
@@ -1388,6 +1675,8 @@ async function connect(request, env, url) {
 }
 
 async function events(request, env, url) {
+  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/events");
+
   const auth = await authenticate(request, env, url);
   if (!auth.ok) return auth.response;
 
@@ -1458,6 +1747,8 @@ async function events(request, env, url) {
 }
 
 async function leave(request, env, url) {
+  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/leave");
+
   const auth = await authenticate(request, env, url);
   if (!auth.ok) return auth.response;
 
@@ -2928,9 +3219,29 @@ export class NetworkRoom {
       if (path === "/i/purge" && method === "POST") return await this.handlePurge();
       if (path === "/i/stats" && method === "GET") return json(this.stats());
       if (path === "/i/debug" && method === "GET") return json(this.debug());
-      // 业务端点（/i/join、/i/register、/i/connect、/i/events、/i/leave、/i/ws）
-      // 在 P2 接入；P1 明确返回未实现，避免调用方误以为已经能用。
-      return err(501, "not_implemented", `${method} ${path}（P2 实现）`);
+
+      // 业务端点：HTTP 轮询模式（P2）。WebSocket 在 P3 接。
+      if (path === "/i/join" && method === "POST") return await this.handleJoinRegister(request, false);
+      if (path === "/i/register" && method === "POST") return await this.handleJoinRegister(request, true);
+      if (path === "/i/connect" && method === "POST") return await this.handleConnect(request);
+      if (path === "/i/events" && method === "GET") return await this.handleEvents(request);
+      if (path === "/i/leave" && method === "POST") return await this.handleLeave(request);
+
+      // 管理面：鉴权与审计留在 Worker（控制面），这里只做数据面
+      if (path === "/i/admin/nodes" && method === "GET") return this.handleAdminNodes();
+      if (path === "/i/admin/kick" && method === "POST") {
+        return this.handleAdminKick(await readJson(request));
+      }
+      if (path === "/i/admin/reservations" && method === "GET") return this.handleAdminReservations();
+      if (path === "/i/admin/reserve" && method === "POST") {
+        return this.handleAdminReserve(await readJson(request));
+      }
+      if (path === "/i/admin/release" && method === "POST") {
+        return this.handleAdminRelease((await readJson(request))?.ip);
+      }
+
+      if (path === "/i/ws") return err(501, "not_implemented", "WebSocket 在 P3 实现");
+      return err(404, "not_found", `${method} ${path}`);
     } catch (e) {
       return err(500, "internal_error", e instanceof Error ? e.message : String(e));
     }
@@ -2987,28 +3298,59 @@ export class NetworkRoom {
     return json({ ok: true, schema_version: ROOM_SCHEMA_VERSION });
   }
 
+  /** 网络改名 / 改网段。reassign=true 时把落到新网段外的节点重新分配。 */
   async handleNetUpdated(request) {
     const body = await request.json().catch(() => null);
-    if (body && body.net) this.setMeta("net", JSON.stringify(body.net));
-    // 换密钥/改网段时由调用方另发关闭指令；这里只更新上下文
-    return json({ ok: true });
+    if (!body || !body.net || !body.net.id) return err(400, "invalid_json");
+
+    const net = { v: 1, id: body.net.id, name: body.net.name, cidr: body.net.cidr };
+    this.setMeta("net", JSON.stringify(net));
+
+    let reassigned = 0;
+    if (body.reassign === true) {
+      const nodes = this.listNodes();
+      for (const node of nodes) {
+        if (ipInCidr(net.cidr, node.virtual_ip)) continue;
+        const oldIp = node.virtual_ip;
+        const fresh = await assignIp(net, node.node_id, nodes, []);
+        this.deleteReservation(oldIp);
+        node.virtual_ip = fresh;
+        this.putNode(node);
+        this.putReservation({
+          ip: fresh,
+          node_id: node.node_id,
+          kind: "auto",
+          note: "网段变更后重新分配",
+          created_at: Date.now(),
+        });
+        reassigned += 1;
+      }
+      // 落在新网段外的预留不可能再生效，一并清掉
+      for (const r of this.listReservations()) {
+        if (!ipInCidr(net.cidr, r.ip)) this.deleteReservation(r.ip);
+      }
+    }
+    return json({ ok: true, reassigned });
   }
 
   async handlePurge() {
+    const removed = this.listNodes().length;
     for (const table of ["nodes", "reservations", "events", "nonces"]) {
       this.sql.exec(`DELETE FROM ${table}`);
     }
     this.sql.exec("DELETE FROM meta WHERE k = 'net'");
-    return json({ ok: true });
+    return json({ ok: true, removed });
   }
 
-  /** 统计。P1 只数表；在线数在 P2 接 liveness 后才有意义。 */
+  /** 统计：节点、在线、socket、预留、事件。 */
   stats() {
+    const now = Date.now();
+    const nodes = this.listNodes();
     const count = (table) => this.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]?.n ?? 0;
     return {
       ok: true,
-      nodes: count("nodes"),
-      online: 0,
+      nodes: nodes.length,
+      online: nodes.filter((n) => this.liveness(n, now).online).length,
       sockets: this.state.getWebSockets?.().length ?? 0,
       reservations: count("reservations"),
       events: count("events"),
@@ -3055,5 +3397,524 @@ export class NetworkRoom {
       this.sql.exec("DELETE FROM nodes WHERE node_id = ?", row.node_id);
       this.sql.exec("DELETE FROM reservations WHERE node_id = ? AND kind = 'auto'", row.node_id);
     }
+  }
+
+  // ---- 存储访问（SQLite 版，对应 legacy 那组 D1 函数） ----------------------
+
+  listNodes() {
+    return this.sql.exec("SELECT * FROM nodes").toArray();
+  }
+
+  getNode(nodeId) {
+    return this.sql.exec("SELECT * FROM nodes WHERE node_id = ?", nodeId).toArray()[0] ?? null;
+  }
+
+  putNode(n) {
+    this.sql.exec(
+      `INSERT INTO nodes (node_id, name, pubkey, tls_fp, virtual_ip, nat_type, advertise,
+                          candidates, candidates_at, last_seen, first_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(node_id) DO UPDATE SET
+         name = excluded.name,
+         tls_fp = excluded.tls_fp,
+         virtual_ip = excluded.virtual_ip,
+         nat_type = excluded.nat_type,
+         advertise = excluded.advertise,
+         candidates = excluded.candidates,
+         candidates_at = excluded.candidates_at,
+         last_seen = excluded.last_seen`,
+      n.node_id, n.name, n.pubkey, n.tls_fp, n.virtual_ip, n.nat_type,
+      n.advertise, n.candidates, n.candidates_at, n.last_seen, n.first_seen,
+    );
+  }
+
+  deleteNode(nodeId) {
+    this.sql.exec("DELETE FROM nodes WHERE node_id = ?", nodeId);
+  }
+
+  touchNode(nodeId, now) {
+    this.sql.exec("UPDATE nodes SET last_seen = ? WHERE node_id = ?", now, nodeId);
+  }
+
+  listReservations() {
+    return this.sql.exec("SELECT * FROM reservations").toArray();
+  }
+
+  putReservation(r) {
+    this.sql.exec(
+      `INSERT INTO reservations (ip, node_id, kind, note, created_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(ip) DO UPDATE SET
+         node_id = excluded.node_id, kind = excluded.kind, note = excluded.note`,
+      r.ip, r.node_id, r.kind, r.note ?? "", r.created_at,
+    );
+  }
+
+  deleteReservation(ip) {
+    this.sql.exec("DELETE FROM reservations WHERE ip = ?", ip);
+  }
+
+  dropAutoReservations(nodeId) {
+    this.sql.exec("DELETE FROM reservations WHERE node_id = ? AND kind = 'auto'", nodeId);
+  }
+
+  /** 写一条事件并返回 seq。v3.0 一律落库，B1（有 socket 就不落库）留到 P3 之后。 */
+  emit(to, type, payload) {
+    this.sql.exec(
+      "INSERT INTO events (to_node, type, payload, created_at) VALUES (?, ?, ?, ?)",
+      to, type, JSON.stringify(payload ?? {}), Date.now(),
+    );
+    return this.sql.exec("SELECT last_insert_rowid() AS id").toArray()[0].id;
+  }
+
+  /** 踢人时清掉这个节点待投递的事件。 */
+  dropNodeEvents(nodeId) {
+    this.sql.exec("DELETE FROM events WHERE to_node = ?", nodeId);
+  }
+
+  pullEvents(nodeId, since, limit, minCreatedAt = 0) {
+    return this.sql.exec(
+      `SELECT * FROM events
+        WHERE (to_node = ? OR to_node = '*') AND id > ? AND created_at >= ?
+        ORDER BY id LIMIT ?`,
+      nodeId, since, minCreatedAt, limit,
+    ).toArray();
+  }
+
+  consumeNonce(key, now) {
+    const seen = this.sql.exec("SELECT 1 AS x FROM nonces WHERE nonce = ?", key).toArray().length > 0;
+    if (seen) return false;
+    this.sql.exec("INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", key, now);
+    return true;
+  }
+
+  /** 在线判定。P2 只有 HTTP 轮询，按 last_seen；P3 接入 socket 后补 WebSocket 分支。 */
+  liveness(node, now) {
+    const idleMs = now - node.last_seen;
+    return { online: idleMs <= OFFLINE_MS, via: "poll", idleMs };
+  }
+
+  // ---- 验签（与 legacy 的 verifySignedRequest 同规则，nonce 落 SQLite） ------
+
+  async verifyReq({ op, body, pubkey, now, trackReplay }) {
+    const network = this.net();
+    if (!network) return "缺少网络上下文";
+
+    const stamp = Number(body?.ts);
+    if (!Number.isFinite(stamp)) return "缺少 ts（毫秒时间戳）";
+    if (Math.abs(now - stamp) > TS_WINDOW_MS) return "ts 超出 ±120 秒窗口";
+
+    const nonce = String(body?.nonce ?? "").toLowerCase();
+    if (!/^[0-9a-f]{16,64}$/.test(nonce)) return "nonce 必须是 16~64 位十六进制";
+
+    let digest;
+    try {
+      digest = await bodyDigest(body);
+    } catch (e) {
+      return `请求体无法规范化：${e instanceof Error ? e.message : String(e)}`;
+    }
+    const message = signingMessage(op, network.id, stamp, nonce, digest);
+    const mismatch = await verifySignature(pubkey, message, body?.sig);
+    if (mismatch) return mismatch;
+
+    if (trackReplay && !this.consumeNonce(`${network.id}:${nonce}`, now)) {
+      return "nonce 已用过（疑似重放）";
+    }
+    return null;
+  }
+
+  // ---- 业务（移植 legacy 的同名逻辑，D1 换 SQLite） -------------------------
+
+  /** join（needCandidates=false）与 register（true）共用：语义与 legacy 逐字一致。 */
+  async handleJoinRegister(request, needCandidates) {
+    this.sweep();
+    const network = this.net();
+    if (!network) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const body = await readJson(request);
+    if (body === null) return err(400, "invalid_json");
+
+    const nodeId = String(body.node_id ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(nodeId)) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+
+    const pubkey = String(body.pubkey ?? "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) {
+      return err(400, "invalid_pubkey", "pubkey 必须是 64 位十六进制（32 字节 Ed25519 公钥）");
+    }
+    if ((await sha256Hex(hexToBytes(pubkey))).slice(0, 32) !== nodeId) {
+      return err(403, "node_id_mismatch", "node_id 必须等于 sha256(pubkey)[..32]");
+    }
+
+    const candidates = parseCandidates(body.candidates);
+    if (candidates === null) {
+      return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
+    }
+    if (needCandidates && candidates.length === 0) {
+      return err(400, "missing_candidates", "register 至少需要一个候选地址");
+    }
+
+    const now = Date.now();
+    // join / register 幂等：不占 nonce（省两次写入），与 legacy 一致
+    const bad = await this.verifyReq({
+      op: needCandidates ? "register" : "join",
+      body,
+      pubkey,
+      now,
+      trackReplay: false,
+    });
+    if (bad) return err(403, "bad_signature", bad);
+
+    let others = this.listNodes();
+    const existing = others.find((n) => n.node_id === nodeId) ?? null;
+    if (!existing && others.length >= MAX_NODES) {
+      const victim = others
+        .filter((n) => now - n.last_seen > OFFLINE_MS)
+        .sort((a, b) => a.last_seen - b.last_seen)[0];
+      if (!victim) {
+        return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);
+      }
+      this.deleteNode(victim.node_id);
+      console.warn(`[room] 淘汰僵尸节点 ${victim.node_id}`);
+      others = others.filter((n) => n.node_id !== victim.node_id);
+    }
+
+    const reservations = this.listReservations();
+
+    const requested =
+      body.virtual_ip === undefined || body.virtual_ip === null
+        ? null
+        : String(body.virtual_ip).trim();
+    if (requested !== null) {
+      const badIp = validateVirtualIp(network, requested, nodeId, others, reservations);
+      if (badIp) return badIp;
+    }
+
+    // 优先级：这次指定 > 已有记录 > 自己的预留 > 自动分配
+    let virtualIp = requested ?? existing?.virtual_ip ?? null;
+    if (!virtualIp) {
+      const mine = reservations.find((r) => r.node_id === nodeId);
+      const stolen = mine && others.some((n) => n.node_id !== nodeId && n.virtual_ip === mine.ip);
+      if (mine && !stolen) virtualIp = mine.ip;
+    }
+    if (!virtualIp || !ipInCidr(network.cidr, virtualIp)) {
+      virtualIp = await assignIp(network, nodeId, others, reservations);
+    }
+
+    const oldRes = reservations.find((r) => r.node_id === nodeId && r.ip !== virtualIp);
+    if (oldRes) this.deleteReservation(oldRes.ip);
+    if (!reservations.some((r) => r.ip === virtualIp && r.node_id === nodeId)) {
+      this.putReservation({
+        ip: virtualIp,
+        node_id: nodeId,
+        kind: requested !== null ? "user" : "auto",
+        note: reservations.find((r) => r.ip === virtualIp)?.note ?? "",
+        created_at: now,
+      });
+    }
+
+    const record = {
+      node_id: nodeId,
+      name: String(body.name ?? existing?.name ?? nodeId.slice(0, 8)).slice(0, 48),
+      pubkey,
+      tls_fp: String(body.tls_fp ?? existing?.tls_fp ?? "").slice(0, 128),
+      virtual_ip: virtualIp,
+      nat_type: String(body.nat_type ?? existing?.nat_type ?? "unknown").slice(0, 16),
+      advertise: JSON.stringify(
+        Array.isArray(body.advertise)
+          ? body.advertise.slice(0, 8).map(String)
+          : JSON.parse(existing?.advertise ?? "[]"),
+      ),
+      candidates: JSON.stringify(
+        candidates.length > 0 ? candidates : JSON.parse(existing?.candidates ?? "[]"),
+      ),
+      // 地址最后上报时间与 last_seen 分开：换网判断看这个
+      candidates_at: candidates.length > 0 ? now : Number(existing?.candidates_at ?? 0),
+      last_seen: now,
+      first_seen: Number(existing?.first_seen ?? 0) || now,
+    };
+
+    try {
+      this.putNode(record);
+    } catch (e) {
+      // virtual_ip 有 UNIQUE 约束：并发下两个节点同时算到同一地址的概率极低，但一旦发生要让调用方重试
+      return err(409, "virtual_ip_taken", `地址 ${virtualIp} 刚被占用，重试一次：${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const wasOnline = existing !== null && now - existing.last_seen <= OFFLINE_MS;
+    const moved = existing !== null && existing.candidates !== record.candidates;
+    if ((!wasOnline || moved) && safeParseArray(record.candidates).length > 0) {
+      this.emit(BROADCAST, "peer_online", publicNode(record, now));
+    }
+
+    const peers = others.filter((n) => n.node_id !== nodeId).map((n) => publicNode(n, now));
+
+    return json({
+      ok: true,
+      network: { id: network.id, name: network.name, cidr: network.cidr },
+      node: { node_id: nodeId, virtual_ip: virtualIp, name: record.name },
+      peers,
+      durable: true,
+      server_ms: now,
+    });
+  }
+
+  async handleConnect(request) {
+    this.sweep();
+    const network = this.net();
+    if (!network) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const body = await readJson(request);
+    if (body === null) return err(400, "invalid_json");
+
+    const from = String(body.from ?? "").toLowerCase();
+    const target = String(body.target ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(from) || !/^[0-9a-f]{32}$/.test(target)) {
+      return err(400, "invalid_node_id", "from 与 target 都必须是 32 位十六进制 node_id");
+    }
+    if (from === target) return err(400, "self_connect", "不能连自己");
+
+    const now = Date.now();
+    const self = this.getNode(from);
+    if (!self) return err(404, "unknown_node", "发起方尚未注册");
+
+    const bad = await this.verifyReq({
+      op: "connect",
+      body,
+      pubkey: self.pubkey,
+      now,
+      trackReplay: false,
+    });
+    if (bad) return err(403, "bad_signature", bad);
+
+    const peer = this.getNode(target);
+    if (!peer) return err(404, "target_not_found", "对端不在这个网络里");
+    if (!this.liveness(peer, now).online) {
+      return err(410, "target_offline", "对端心跳已超时");
+    }
+
+    const targetAge = now - peer.last_seen;
+    const staleMs = Number(this.env.STALE_MS ?? STALE_MS);
+    if (targetAge > staleMs) {
+      return err(
+        409,
+        "target_stale",
+        `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
+      );
+    }
+
+    const peerCandidates = JSON.parse(peer.candidates || "[]");
+    if (peerCandidates.length === 0) {
+      return err(409, "target_no_candidates", "对端还没有上报候选地址");
+    }
+
+    // 到这里才有副作用，此时才占 nonce（与 legacy 一致）
+    const nonce = String(body.nonce ?? "").toLowerCase();
+    if (!this.consumeNonce(`${network.id}:${nonce}`, now)) {
+      return err(403, "bad_signature", "nonce 已用过（疑似重放）");
+    }
+
+    const t = now + 500;
+    this.emit(target, "punch_request", {
+      from,
+      from_name: self.name,
+      virtual_ip: self.virtual_ip,
+      candidates: JSON.parse(self.candidates || "[]"),
+      t,
+      server_ms: now,
+    });
+
+    return json({
+      ok: true,
+      t,
+      target_last_seen: peer.last_seen,
+      target_candidates: peerCandidates,
+      target_virtual_ip: peer.virtual_ip,
+      target_tls_fp: peer.tls_fp,
+      server_ms: now,
+    });
+  }
+
+  async handleEvents(request) {
+    this.sweep();
+    const network = this.net();
+    if (!network) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const url = new URL(request.url);
+    const nodeId = (url.searchParams.get("node_id") ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(nodeId)) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+    const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
+
+    const now = Date.now();
+    const node = this.getNode(nodeId);
+    if (!node) return err(404, "unknown_node", "先 register 再拉事件");
+
+    // GET 没有请求体：把参与签名的查询参数拼成同样结构再算摘要
+    const signedBody = {
+      node_id: nodeId,
+      since,
+      ts: Number(url.searchParams.get("ts")),
+      nonce: url.searchParams.get("nonce"),
+    };
+    const bad = await this.verifyReq({
+      op: "events",
+      body: { ...signedBody, sig: url.searchParams.get("sig") },
+      pubkey: node.pubkey,
+      now,
+      trackReplay: false,
+    });
+    if (bad) return err(403, "bad_signature", bad);
+
+    const wasOffline = now - node.last_seen > OFFLINE_MS;
+    if (now - node.last_seen >= HEARTBEAT_MS) this.touchNode(nodeId, now);
+
+    const minCreatedAt = since === 0 ? now - 30_000 : 0;
+    const rows = this.pullEvents(nodeId, since, MAX_EVENTS, minCreatedAt);
+    const cursor = rows.length > 0 ? rows[rows.length - 1].id : since;
+
+    if (wasOffline && safeParseArray(node.candidates).length > 0) {
+      this.emit(BROADCAST, "peer_online", publicNode({ ...node, last_seen: now }, now));
+    }
+
+    return json({
+      ok: true,
+      cursor,
+      events: rows.map((r) => ({ seq: r.id, type: r.type, ...safeParse(r.payload) })),
+      server_ms: now,
+    });
+  }
+
+  async handleLeave(request) {
+    this.sweep();
+    const network = this.net();
+    if (!network) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const body = await readJson(request);
+    if (body === null) return err(400, "invalid_json");
+
+    const nodeId = String(body.node_id ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(nodeId)) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+
+    const pubkey = String(body.pubkey ?? "").toLowerCase();
+    if (
+      !/^[0-9a-f]{64}$/.test(pubkey) ||
+      (await sha256Hex(hexToBytes(pubkey))).slice(0, 32) !== nodeId
+    ) {
+      return err(403, "node_id_mismatch", "leave 需要提供与 node_id 对应的 pubkey");
+    }
+
+    const bad = await this.verifyReq({
+      op: "leave",
+      body,
+      pubkey,
+      now: Date.now(),
+      trackReplay: true,
+    });
+    if (bad) return err(403, "bad_signature", bad);
+
+    // 预留不删：手填的地址在节点离线后仍然归它（与 legacy 一致）
+    this.deleteNode(nodeId);
+    return json({ ok: true });
+  }
+
+  // ---- 管理面数据操作（checkAdmin 与 audit 仍留在 Worker） ------------------
+
+  handleAdminNodes() {
+    const now = Date.now();
+    const net = this.net() ?? {};
+    const reservations = this.listReservations();
+    const rows = this.listNodes()
+      .map((n) => ({
+        ...publicNode(n, now),
+        node_id: n.node_id,
+        advertised: safeParseArray(n.advertise),
+        reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
+        via: this.liveness(n, now).via,
+      }))
+      .sort((a, b) => ipv4ToInt(a.virtual_ip) - ipv4ToInt(b.virtual_ip));
+
+    return json({
+      ok: true,
+      network: { id: net.id ?? "", name: net.name ?? "", cidr: net.cidr ?? "" },
+      nodes: rows,
+      reservations,
+    });
+  }
+
+  /** 单个与批量踢人共用：node_id 或 node_ids 都接受。 */
+  handleAdminKick(body) {
+    const raw = Array.isArray(body?.node_ids)
+      ? body.node_ids
+      : body?.node_id !== undefined
+        ? [body.node_id]
+        : [];
+    const ids = raw.map((x) => String(x).toLowerCase());
+    if (ids.length === 0 || ids.length > MAX_NODES) {
+      return err(400, "invalid_node_ids", `node_ids 必须是 1~${MAX_NODES} 个 node_id 的数组`);
+    }
+    if (ids.some((id) => !/^[0-9a-f]{32}$/.test(id))) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+
+    const kicked = [];
+    for (const id of ids) {
+      const node = this.getNode(id);
+      if (!node) continue;
+      this.deleteNode(id);
+      this.dropNodeEvents(id);
+      kicked.push({ node_id: id, name: node.name });
+    }
+    return json({ ok: true, removed: kicked.length, kicked });
+  }
+
+  handleAdminReservations() {
+    return json({ ok: true, reservations: this.listReservations() });
+  }
+
+  handleAdminReserve(body) {
+    const net = this.net();
+    if (!net) return err(503, "room_unavailable", "这个 DO 还没有网络上下文");
+
+    const ip = String(body?.ip ?? "").trim();
+    const nodeId = String(body?.node_id ?? "").trim().toLowerCase();
+    if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip) || ip.split(".").some((p) => Number(p) > 255)) {
+      return err(400, "invalid_virtual_ip", `IP 格式不对：${ip}`);
+    }
+    if (nodeId && !/^[0-9a-f]{32}$/.test(nodeId)) {
+      return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
+    }
+    if (!ipInCidr(net.cidr, ip)) {
+      return err(400, "virtual_ip_not_in_network", `${ip} 不在网段 ${net.cidr} 里`);
+    }
+
+    const holder = this.listNodes().find((n) => n.virtual_ip === ip && n.node_id !== nodeId);
+    if (holder) {
+      return err(409, "virtual_ip_taken", `${ip} 当前被「${holder.name}」占用，先踢下线再预留`);
+    }
+
+    // 一个节点只保留一条预留：给新地址就把旧的删掉
+    if (nodeId) {
+      for (const old of this.listReservations()) {
+        if (old.node_id === nodeId && old.ip !== ip) this.deleteReservation(old.ip);
+      }
+    }
+
+    this.putReservation({
+      ip,
+      node_id: nodeId,
+      kind: "user",
+      note: String(body?.note ?? "").slice(0, 100),
+      created_at: Date.now(),
+    });
+    return json({ ok: true, reservation: { ip, node_id: nodeId } });
+  }
+
+  handleAdminRelease(ip) {
+    this.deleteReservation(String(ip ?? ""));
+    return json({ ok: true, released: String(ip ?? "") });
   }
 }

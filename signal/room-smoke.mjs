@@ -121,17 +121,19 @@ const nodesLeft = room.sql.exec("SELECT node_id FROM nodes").toArray().map((r) =
 check("超过 10 分钟但挂着 socket 的节点保留", nodesLeft.includes(NODE_A), nodesLeft);
 check("超过 10 分钟且无 socket 的节点被删", !nodesLeft.includes(NODE_B), nodesLeft);
 
-console.log("\n7. 未实现的业务端点");
-for (const [method, path] of [
-  ["POST", "/i/join"],
-  ["POST", "/i/register"],
-  ["POST", "/i/connect"],
-  ["GET", "/i/events"],
-  ["GET", "/i/ws"],
-]) {
-  const r = await room.fetch(req(method, path, method === "POST" ? { body: {} } : {}));
-  check(`${method} ${path} → 501`, r.status === 501, r.status);
-}
+console.log("\n7. 端点状态");
+const wsRes = await room.fetch(req("GET", "/i/ws"));
+check("GET /i/ws → 501（P3 才做）", wsRes.status === 501, wsRes.status);
+const unknown = await room.fetch(req("GET", "/i/nope"));
+check("未知路径 → 404", unknown.status === 404, unknown.status);
+
+// 业务端点在没注册节点时应给出 404 而不是崩：
+// /i/events 与 /i/leave 需要节点身份，这里只验证「没有网络上下文时统一 503」
+const bare = new RoomFakeState();
+const bareRoom = new NetworkRoom(bare, {});
+await bare.ready();
+const noNet = await bareRoom.fetch(req("POST", "/i/join", { body: {} }));
+check("没有网络上下文 → 503", noNet.status === 503, noNet.status);
 
 console.log("\n8. /i/purge 清空");
 await room.fetch(req("POST", "/i/purge", { body: {} }));

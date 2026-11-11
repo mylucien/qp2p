@@ -12,6 +12,7 @@ import { createHmac } from "node:crypto";
 
 import worker, { deriveVirtualIp, canonicalJson as serverCanonicalJson } from "./worker.js";
 import { fakeD1 } from "./fake-d1.mjs";
+import { fakeRoomBinding } from "./fake-room.mjs";
 
 const ADMIN_SECRET = "smoke-secret";
 const ctx = { waitUntil: () => {} };
@@ -145,7 +146,10 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const call = async (method, path, { token, admin, body, query } = {}) => {
     const url = new URL(`${base}${path}`);
     for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
-    const headers = { "content-type": "application/json", "cf-connecting-ip": clientIp };
+    // 本地跑时用伪造的 cf-connecting-ip 隔离限流桶；打真机时不能带——
+    // Cloudflare 边缘会把它当成伪造请求直接 403。
+    const headers = { "content-type": "application/json" };
+    if (!remote) headers["cf-connecting-ip"] = clientIp;
     if (token) headers.authorization = `Bearer ${token}`;
     if (admin) headers["x-admin-secret"] = admin;
     const request = new Request(url, {
@@ -154,10 +158,35 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const res = remote ? await fetch(request) : await worker.fetch(request, env, ctx);
-    return { status: res.status, body: await res.json().catch(() => null) };
+    const text = await res.text();
+    let parsed = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      // 边缘返回 HTML（403 挑战页、5xx）时保留一小段原文，断言失败但不中断整轮
+      parsed = { _raw: text.slice(0, 200), _status: res.status };
+    }
+    return { status: res.status, body: parsed };
   };
 
   console.log(`\n=== ${label} ===`);
+
+  // 远端模式：先把上一轮可能残留的测试网络删掉，保证每轮都从干净状态开始。
+  // 本地模式不需要——每次都是新的内存/D1 替身。
+  if (remote) {
+    for (const name of ["home-lab", "lab", "weak-key-test", "rotate-test", "resv-test", "tiny"]) {
+      try {
+        await fetch(`${base}/v1/admin/networks/${name}`, {
+          method: "DELETE",
+          headers: { "x-admin-secret": secret, "content-type": "application/json" },
+          body: JSON.stringify({ confirm: name }),
+        });
+      } catch {
+        // 不存在就是最好情况
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 
   console.log("\n1. 健康检查");
   const anon = await call("GET", "/v1/health");
@@ -1073,6 +1102,11 @@ if (remoteUrl) {
 } else {
   await runSuite("内存后端", { ADMIN_SECRET }, "memory", "198.18.0.1");
   await runSuite("D1 后端", { ADMIN_SECRET, DB: fakeD1() }, "d1", "198.18.0.2");
+  // 同一套用例跑一遍 room 引擎（DO + SQLite 替身）：数据面全在 DO，控制面仍在 D1。
+  // ROOM 与 Worker 共用同一个 env 对象，这样用例临时改的 env 变量也能传进 DO。
+  const roomEnv = { ADMIN_SECRET, DB: fakeD1() };
+  roomEnv.ROOM = fakeRoomBinding(roomEnv);
+  await runSuite("DO 后端", roomEnv, "d1", "198.18.0.4");
 }
 
 console.log(`\n结果：${totals.passed} 通过，${totals.failed} 失败\n`);
