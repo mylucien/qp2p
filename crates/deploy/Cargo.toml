@@ -1,0 +1,20 @@
+[package]
+name = "qp2p-deploy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "qp2p 信令部署器：建库、上传 Worker、规划迁移"
+
+[[bin]]
+name = "qp2p-deploy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+rand.workspace = true
+hex.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
