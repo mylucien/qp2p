@@ -44,6 +44,15 @@ const HOT_WINDOW: Duration = Duration::from_secs(45);
 const REGISTER_EVERY: Duration = Duration::from_secs(1800);
 /// 一个都连不上时，重新做 STUN 的间隔。
 const RENEW_EVERY: Duration = Duration::from_secs(600);
+
+/// 断路器窗口：这段时间内连续失败够次数就退回轮询。
+const WS_FAIL_WINDOW: Duration = Duration::from_secs(120);
+/// 窗口内的失败次数上限。
+const WS_FAIL_LIMIT: usize = 3;
+/// 退回轮询后隔多久再试长连接。
+const WS_RETRY: Duration = Duration::from_secs(300);
+/// 休眠满这么久就断开长连接（手机省电）。
+const WS_SLEEP_AFTER: Duration = Duration::from_secs(60);
 /// 两次"重绑端口 + 重探 STUN"之间的最小间隔。
 /// 对端不可达时不能每轮都重绑，否则端口一直在变，打洞永远开不了。
 const RENEW_MIN: Duration = Duration::from_secs(30);
@@ -97,16 +106,38 @@ pub struct SessionConfig {
     pub idle_timeout: Option<Duration>,
     /// 注册时拿到的成员列表
     pub peers: Vec<PeerInfo>,
-    /// 事件源走 WebSocket 长连接（false = 沿用轮询）。
-    ///
-    /// 第一步只做手动开关：为 true 时连不上就报错重试，不会自动退回轮询。
-    /// 自动降级与断路器在第二步接。
-    pub use_ws: bool,
+    /// 事件源怎么选。
+    pub ws_mode: WsMode,
+}
+
+/// 事件源的选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsMode {
+    /// 先试长连接，连续失败就退回轮询，过一阵再探测（默认）。
+    Auto,
+    /// 只用长连接：连不上就一直按退避重试，不退回轮询。
+    Always,
+    /// 只用轮询。
+    Never,
+}
+
+impl WsMode {
+    /// 允不允许用长连接（`Never` 之外的两种都允许起一条）。
+    fn wants_ws(self) -> bool {
+        !matches!(self, WsMode::Never)
+    }
+
+    /// 连不上时要不要退回轮询。强制模式不退回：那是用户明确要求的。
+    fn falls_back(self) -> bool {
+        matches!(self, WsMode::Auto)
+    }
 }
 
 /// 后台 WS 任务往主循环送的东西。
 enum WsFeed {
     Event(Event),
+    /// 连上了：主循环据此清空失败计数。
+    Online,
     /// 连接坏了或握不上手，附带原因；任务自己会按退避重连。
     Down(String),
     /// 服务端主动关闭。
@@ -142,6 +173,7 @@ async fn ws_feed(
         match WsLink::open(&client, &identity, since, &[]).await {
             Ok(mut link) => {
                 let opened = Instant::now();
+                let _ = tx.try_send(WsFeed::Online);
                 loop {
                     match link.next().await {
                         WsItem::Event(event) => {
@@ -202,6 +234,25 @@ async fn ws_feed(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
+}
+
+/// 正在跑的一条后台 WS 任务。
+struct WsRun {
+    rx: tokio::sync::mpsc::Receiver<WsFeed>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WsRun {
+    fn drop(&mut self) {
+        // 丢掉它就必须停掉：否则退回轮询期间后台还在偷偷重连，白烧请求
+        self.task.abort();
+    }
+}
+
+fn start_ws(client: &SignalClient, identity: &Identity, since: i64) -> WsRun {
+    let (tx, rx) = tokio::sync::mpsc::channel::<WsFeed>(64);
+    let task = tokio::spawn(ws_feed(client.clone(), identity.clone(), since, tx));
+    WsRun { rx, task }
 }
 
 struct PeerState {
@@ -548,7 +599,7 @@ impl Session {
             wanted_ip,
             idle_timeout,
             peers: initial,
-            use_ws,
+            ws_mode,
         } = self.config;
 
         {
@@ -560,17 +611,27 @@ impl Session {
 
         let mut cursor: i64 = 0;
 
-        // 事件源：WebSocket 长连接（手动开启）或轮询（默认）。
-        // 两者产出的 Event 完全同构，下游处理不分叉。
-        let mut ws_rx = if use_ws {
-            let (tx, rx) = tokio::sync::mpsc::channel::<WsFeed>(64);
-            tokio::spawn(ws_feed(client.clone(), identity.clone(), cursor, tx));
-            self.notify
-                .say("· 信令走 WebSocket 长连接，事件由服务端推送");
-            Some(rx)
-        } else {
-            None
-        };
+        // 事件源：WebSocket 长连接或轮询，两者产出的 Event 完全同构。
+        // `ws_run` 为 Some 表示此刻用长连接，None 表示轮询——断路器、休眠、
+        // 探测重试都只改这一个状态，下游的事件处理不分叉。
+        let mut ws_run: Option<WsRun> = None;
+        // 断路器退回轮询后，到点再试长连接
+        let mut ws_retry_at: Option<Instant> = None;
+        // 窗口内的失败时刻（连上就清空）
+        let mut ws_failed: Vec<Instant> = Vec::new();
+        // 退回轮询后的探测间隔：每失败一次翻倍，最多 1 小时。
+        // 旧服务端（没有 DO）上这是每天 20 多次 501，而不是每 5 分钟一次。
+        let mut ws_retry_delay = WS_RETRY;
+        // 休眠起始时刻：满 60 秒断长连接
+        let mut sleeping_since: Option<Instant> = None;
+
+        if ws_mode.wants_ws() {
+            ws_run = Some(start_ws(&client, &identity, cursor));
+            self.notify.say(match ws_mode {
+                WsMode::Always => "· 信令走 WebSocket 长连接（强制，连不上会一直重试）",
+                _ => "· 优先用 WebSocket 长连接；不可用时自动退回轮询",
+            });
+        }
 
         let mut last_register = Instant::now();
         let mut last_renew = Instant::now();
@@ -601,14 +662,26 @@ impl Session {
             // 本轮是否需要马上重新登记（事件、STUN 观测都可能置位）
             let mut need_register = false;
 
+            // 0) 到点就（重新）试长连接：断路器退避结束、或者休眠被唤醒。
+            //    休眠期间不重连——刚为省电断开的连接不能立刻又建回来。
+            if ws_run.is_none() && ws_mode.wants_ws() && !sleeping {
+                let due = ws_retry_at.is_none_or(|t| Instant::now() >= t);
+                if due {
+                    // 从 cursor 续上：断线期间攒的事件由服务端按 since 补发一次
+                    ws_run = Some(start_ws(&client, &identity, cursor));
+                    ws_retry_at = None;
+                }
+            }
+
             // 1) 取事件：对端请求撮合时，服务端会往这里塞 punch_request；
             //    对端上线 / 换地址时会塞 peer_online 广播。
             //    WS 模式下这些事件是推来的，主循环只负责把队列掏空。
-            let fetched: Result<Vec<Event>, anyhow::Error> = match ws_rx.as_mut() {
-                Some(rx) => {
+            let mut ws_failure: Option<String> = None;
+            let fetched: Result<Vec<Event>, anyhow::Error> = match ws_run.as_mut() {
+                Some(run) => {
                     // 上一轮用来唤醒循环的那条也要一起处理（见 Wake::Ws 的注释）
                     let mut items: Vec<WsFeed> = ws_early.take().into_iter().collect();
-                    while let Ok(item) = rx.try_recv() {
+                    while let Ok(item) = run.rx.try_recv() {
                         items.push(item);
                     }
 
@@ -616,6 +689,11 @@ impl Session {
                     for item in items {
                         match item {
                             WsFeed::Event(event) => batch.push(event),
+                            WsFeed::Online => {
+                                ws_failed.clear();
+                                // 连上了就把探测间隔复位，下次断了还从 5 分钟起
+                                ws_retry_delay = WS_RETRY;
+                            }
                             WsFeed::Kick(reason) => {
                                 self.notify.say(&format!(
                                     "⚠ {reason}（本节点已被移出这个网络，无法继续）"
@@ -623,10 +701,11 @@ impl Session {
                                 return;
                             }
                             WsFeed::Closed { code, reason } => {
-                                // 重连由后台任务负责，这里只留一条调试线索
+                                ws_failure = Some(format!("连接被关闭 code={code}"));
                                 tracing::debug!("[session] WS 关闭 code={code} {reason}");
                             }
                             WsFeed::Down(message) => {
+                                ws_failure = Some(message.clone());
                                 tracing::debug!("[session] WS 断开：{message}");
                             }
                         }
@@ -753,6 +832,26 @@ impl Session {
                             last_error = text;
                         }
                     }
+                }
+            }
+
+            // 1.2) 断路器：长连接连着失败够次数就退回轮询，过一阵再探
+            if let Some(reason) = ws_failure {
+                ws_failed.push(Instant::now());
+                ws_failed.retain(|t| t.elapsed() < WS_FAIL_WINDOW);
+                if ws_mode.falls_back() && ws_failed.len() >= WS_FAIL_LIMIT {
+                    self.notify.say(&format!(
+                        "⚠ 长连接连续失败（{reason}），改用轮询，{} 分钟后再试",
+                        ws_retry_delay.as_secs() / 60
+                    ));
+                    // drop 会 abort 后台任务，别让它在轮询期间继续重连
+                    ws_run = None;
+                    ws_early = None;
+                    ws_retry_at = Some(Instant::now() + ws_retry_delay);
+                    ws_retry_delay = (ws_retry_delay * 2).min(Duration::from_secs(3600));
+                    ws_failed.clear();
+                    // 断开期间的事件可能已被服务端清理（5 分钟 TTL），补一次全量同步
+                    need_register = true;
                 }
             }
 
@@ -930,6 +1029,25 @@ impl Session {
                 }
             }
 
+            // 5.5) 休眠联动：进入休眠满 60 秒就断长连接，省电也省服务端 socket。
+            //      不设 ws_retry_at，所以一有流量唤醒就会立刻接回来。
+            if sleeping {
+                match sleeping_since {
+                    Some(t) if t.elapsed() >= WS_SLEEP_AFTER && ws_run.is_some() => {
+                        ws_run = None;
+                        ws_early = None;
+                        tracing::debug!(
+                            "[session] 休眠满 {} 秒，断开长连接",
+                            WS_SLEEP_AFTER.as_secs()
+                        );
+                    }
+                    None => sleeping_since = Some(Instant::now()),
+                    _ => {}
+                }
+            } else {
+                sleeping_since = None;
+            }
+
             // 6) 等下一轮：按"现在有没有值得抢时间的事"选档位；TUN 来了包就立刻醒
             let interval = {
                 let now = Instant::now();
@@ -953,13 +1071,13 @@ impl Session {
                 // 信令出错时只会更慢，不会更快
                 .max(error_backoff(err_streak))
             };
-            // WS 模式下事件会主动叫醒循环，定时器只当兜底（扫描链路状态、重注册）
-            let wake = match ws_rx.as_mut() {
-                Some(rx) => {
+            // 长连接在跑时事件会主动叫醒循环，定时器只当兜底（扫描链路、重注册）
+            let wake = match ws_run.as_mut() {
+                Some(run) => {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => Wake::Tick,
                         Some(ip) = wake_rx.recv() => Wake::Tun(ip),
-                        Some(item) = rx.recv() => Wake::Ws(item),
+                        Some(item) = run.rx.recv() => Wake::Ws(item),
                     }
                 }
                 None => {
@@ -977,6 +1095,8 @@ impl Session {
                     while wake_rx.try_recv().is_ok() {}
                     forced = Some(ip);
                     hot_until = Instant::now() + HOT_WINDOW;
+                    // 休眠里断开的长连接：一有流量就立刻接回来
+                    ws_retry_at = None;
                 }
             }
         }

@@ -1213,21 +1213,24 @@ async fn cmd_up(args: &[String]) -> Result<()> {
                 .filter(|secs| *secs > 0)
                 .map(Duration::from_secs),
             peers: reply.peers.clone(),
-            // --transport ws 走长连接；不填或 poll/auto 保持原来的轮询行为。
-            // 第一步是手动开关：ws 连不上就报错重试，不会自动退回轮询。
-            use_ws: {
+            // auto（默认）：先试长连接，不可用自动退回轮询
+            // ws：强制长连接，连不上一直重试；poll：只用轮询
+            ws_mode: {
                 let choice = flags
                     .get("transport")
                     .or(config.signal_transport.as_deref())
-                    .unwrap_or("auto");
-                match choice {
-                    "ws" | "websocket" => true,
-                    "poll" | "auto" | "http" => false,
+                    .unwrap_or("auto")
+                    .trim()
+                    .to_lowercase();
+                match choice.as_str() {
+                    "ws" | "websocket" => qp2p_core::session::WsMode::Always,
+                    "poll" | "http" => qp2p_core::session::WsMode::Never,
+                    "auto" | "" => qp2p_core::session::WsMode::Auto,
                     other => {
                         println!(
-                            "⚠ 不认识的传输方式 {other:?}，按轮询处理（可选 ws / poll / auto）"
+                            "⚠ 不认识的传输方式 {other:?}，按自动处理（可选 ws / poll / auto）"
                         );
-                        false
+                        qp2p_core::session::WsMode::Auto
                     }
                 }
             },
