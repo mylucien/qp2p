@@ -156,6 +156,8 @@ enum Wake {
     /// 来了一条 WS 消息。**必须把它带回去**：`recv()` 已经从队列里取走了，
     /// 不处理就等于丢事件（曾经在这里丢过一次）。
     Ws(WsFeed),
+    /// 后台任务的 channel 关了：它已经彻底退出，不会再有任何消息。
+    WsDead,
 }
 
 /// 后台任务：维持一条 WS 连接，把事件推进队列。
@@ -1077,7 +1079,10 @@ impl Session {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => Wake::Tick,
                         Some(ip) = wake_rx.recv() => Wake::Tun(ip),
-                        Some(item) = run.rx.recv() => Wake::Ws(item),
+                        item = run.rx.recv() => match item {
+                            Some(item) => Wake::Ws(item),
+                            None => Wake::WsDead,
+                        },
                     }
                 }
                 None => {
@@ -1090,6 +1095,14 @@ impl Session {
             match wake {
                 Wake::Tick => {}
                 Wake::Ws(item) => ws_early = Some(item),
+                Wake::WsDead => {
+                    // 后台任务彻底退出了（panic / 被 abort）。不清掉的话主循环会
+                    // 永远等一个再也不会来的事件：既不收事件，也不重连。
+                    tracing::warn!("[session] 长连接任务已退出，5 秒后重建");
+                    ws_run = None;
+                    ws_early = None;
+                    ws_retry_at = Some(Instant::now() + Duration::from_secs(5));
+                }
                 Wake::Tun(ip) => {
                     // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
                     while wake_rx.try_recv().is_ok() {}
