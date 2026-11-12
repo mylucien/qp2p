@@ -139,6 +139,15 @@ impl WsMode {
     }
 }
 
+/// 该不该从长连接退回轮询。
+///
+/// `unsupported` 表示服务端明确说"没有 Durable Object"（HTTP 501）——这不是
+/// "连不上"，是"没这个功能"，任何模式都必须退回轮询，否则连事件源都没有。
+/// 其余失败只有 `auto` 模式才降级，`always` 会继续按短退避重连。
+fn should_fall_back(mode: WsMode, unsupported: bool, failures: usize) -> bool {
+    unsupported || (mode.falls_back() && failures >= WS_FAIL_LIMIT)
+}
+
 /// 后台 WS 任务往主循环送的东西。
 enum WsFeed {
     Event(Event),
@@ -898,11 +907,7 @@ impl Session {
             if let Some(reason) = ws_failure {
                 ws_failed.push(Instant::now());
                 ws_failed.retain(|t| t.elapsed() < WS_FAIL_WINDOW);
-                let over_limit = ws_failed.len() >= WS_FAIL_LIMIT;
-                // 501 表示服务端没有 DO——这不是"连不上"，是"没这个功能"，
-                // 任何模式下都必须退回轮询，否则连事件源都没了。
-                // 其余失败只有 auto 模式才降级；强制模式继续按短退避重连。
-                let must_poll = ws_unsupported || (ws_mode.falls_back() && over_limit);
+                let must_poll = should_fall_back(ws_mode, ws_unsupported, ws_failed.len());
                 if must_poll {
                     if ws_unsupported && !ws_unsupported_notified {
                         ws_unsupported_notified = true;
@@ -1499,6 +1504,16 @@ pub fn token_rejected(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 降级判据：auto 攒够失败才退，always 只有"服务端没这功能"时才退。
+    #[test]
+    fn fallback_decision() {
+        assert!(!should_fall_back(WsMode::Auto, false, WS_FAIL_LIMIT - 1));
+        assert!(should_fall_back(WsMode::Auto, false, WS_FAIL_LIMIT));
+        assert!(!should_fall_back(WsMode::Always, false, 100));
+        assert!(should_fall_back(WsMode::Always, true, 0));
+        assert!(should_fall_back(WsMode::Auto, true, 0));
+    }
 
     /// 三种传输方式的语义：auto 允许长连接且会降级，always 不降级，never 不试。
     #[test]
