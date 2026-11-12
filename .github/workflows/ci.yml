@@ -212,7 +212,7 @@ jobs:
           # 只有 musl 目标需要；其它目标忽略。两个 musl 目标都由 zig 提供工具链，
           # 环境变量在各自的安装步骤里已经写进 GITHUB_ENV。
           CC_x86_64_unknown_linux_musl: zigcc
-        run: cargo build --release --target ${{ matrix.target }} -p qp2p-cli
+        run: cargo build --release --target ${{ matrix.target }} -p qp2p-cli -p qp2p-deploy
 
       # WinTun 是运行期加载的 dll，不打包进去用户就得自己找，
       # 版本对不上还会报看不懂的错。这里直接连 dll 一起放进产物目录。
@@ -225,6 +225,7 @@ jobs:
           Expand-Archive wintun.zip -DestinationPath wintun -Force
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/qp2p.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/release/qp2p-deploy.exe" dist/
           # 压缩包内部的层级可能随版本变，按名字找而不是写死路径
           $dll = Get-ChildItem -Path wintun -Recurse -Filter 'wintun.dll' |
             Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1
@@ -233,11 +234,21 @@ jobs:
           Copy-Item USAGE.md dist/
           Get-ChildItem dist | Select-Object Name, Length
 
+      # 部署器和客户端分开发：前者要拿 Cloudflare 令牌，不该跟 VPN 客户端绑在一个包里。
+      - name: 准备 Linux 运行包
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/qp2p" dist/
+          cp "target/${{ matrix.target }}/release/qp2p-deploy" dist/
+          ls -lh dist
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ runner.os == 'Windows' && 'dist' || format('target/{0}/release/qp2p', matrix.target) }}
+          path: dist
           if-no-files-found: error
 
   # Android 只能在这一步编出来：交叉编译要 NDK，打 APK 要 SDK + Gradle，
@@ -360,6 +371,11 @@ jobs:
           cp "artifacts/qp2p-linux-x86_64/qp2p"        "dist/qp2p-${VERSION}-linux-x86_64"
           cp "artifacts/qp2p-linux-x86_64-static/qp2p" "dist/qp2p-${VERSION}-linux-x86_64-static"
           cp "artifacts/qp2p-linux-aarch64-static/qp2p" "dist/qp2p-${VERSION}-linux-aarch64-static"
+          # 部署器：和客户端同版本，但单独命名，方便只给需要的人
+          cp "artifacts/qp2p-windows-x86_64/qp2p-deploy.exe" "dist/qp2p-deploy-${VERSION}-windows-x86_64.exe"
+          cp "artifacts/qp2p-linux-x86_64/qp2p-deploy" "dist/qp2p-deploy-${VERSION}-linux-x86_64"
+          cp "artifacts/qp2p-linux-x86_64-static/qp2p-deploy" "dist/qp2p-deploy-${VERSION}-linux-x86_64-static"
+          cp "artifacts/qp2p-linux-aarch64-static/qp2p-deploy" "dist/qp2p-deploy-${VERSION}-linux-aarch64-static"
           APK=$(find artifacts/qp2p-android-apk -name '*.apk' -print -quit)
           if [ -z "$APK" ]; then
             echo "::error::Android 产物里没找到 apk"
@@ -367,7 +383,10 @@ jobs:
           fi
           cp "$APK" "dist/qp2p-${VERSION}-android.apk"
           chmod +x "dist/qp2p-${VERSION}-linux-x86_64" "dist/qp2p-${VERSION}-linux-x86_64-static" \
-                   "dist/qp2p-${VERSION}-linux-aarch64-static"
+                   "dist/qp2p-${VERSION}-linux-aarch64-static" \
+                   "dist/qp2p-deploy-${VERSION}-linux-x86_64" \
+                   "dist/qp2p-deploy-${VERSION}-linux-x86_64-static" \
+                   "dist/qp2p-deploy-${VERSION}-linux-aarch64-static"
 
           (cd dist && sha256sum qp2p-* > SHA256SUMS.txt)
           ls -lh dist
