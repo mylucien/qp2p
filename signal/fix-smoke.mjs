@@ -297,23 +297,34 @@ async function run() {
 
   // ---------------------------------------------------------------- ⑥ sweep 节流
   console.log("\n⑤b 删网要把 D1 里的预留备份一起清掉");
-  await call(env, "POST", `/v1/admin/networks/${net.id}/reservations`, {
+  // 用一个独立网络做这件事：删掉主测试网络会让后面的用例全挂
+  const mk2 = await call(env, "POST", "/v1/admin/networks", {
     admin: ADMIN,
-    body: { ip: "10.99.0.250" },
-  }).catch(() => null);
-  room.putReservation({ ip: "10.99.0.250", node_id: "", kind: "user", note: "", created_at: Date.now() });
-  await room.backupReservation({ ip: "10.99.0.250", node_id: "", kind: "user", note: "", created_at: Date.now() }, "put");
+    body: { name: "purge-test", join_key: "purge-test-key-0001" },
+  });
+  const net2 = { id: mk2.body.network.id, cidr: mk2.body.network.cidr };
+  const room2b = env.ROOM.roomOf(net2.id);
+  await call(env, "GET", `/v1/admin/networks/${net2.id}/nodes`, { admin: ADMIN }); // 让 DO 建好上下文
+  const resv = {
+    ip: net2.cidr.replace(/0\.0\/16$/, "0.250"),
+    node_id: "",
+    kind: "user",
+    note: "",
+    created_at: Date.now(),
+  };
+  room2b.putReservation(resv);
+  await room2b.backupReservation(resv, "put");
   await sleep(300);
   const backupBefore = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM reservations WHERE network_id = ?",
-  ).bind(net.id).first();
-  const del2 = await call(env, "DELETE", `/v1/admin/networks/${net.id}`, {
+  ).bind(net2.id).first();
+  const del2 = await call(env, "DELETE", `/v1/admin/networks/${net2.id}`, {
     admin: ADMIN,
-    body: { confirm: net.id },
+    body: { confirm: net2.id },
   });
   const backupAfter = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM reservations WHERE network_id = ?",
-  ).bind(net.id).first();
+  ).bind(net2.id).first();
   check("删网前备份表里有行", Number(backupBefore?.n ?? 0) > 0, backupBefore);
   check("删网后备份表清空", del2.status === 200 && Number(backupAfter?.n ?? 0) === 0, backupAfter);
 
