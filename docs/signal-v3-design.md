@@ -9,6 +9,7 @@ Durable Object + WebSocket 混合架构 · 定稿 v1.1 · 2026-11-11 · 基线�
 **修订记录**
 
 - **v0.2**（2026-11-09）：①不做在线数据迁移，升级一律由用户重新部署，因此删除了 `setNetworkEngine`、`importState`、逐网络 engine 字段与原 F6 的迁移流程；②新增 Android 端「保存配置」「自动连接」两个按钮（§7.3）；③更正降级语义：只有 WebSocket 不可用（代理拦截、握手失败）才退回轮询，DO 额度耗尽时轮询同样不可用。
+- **v1.2**（2026-11-12，缺陷修复）：①`matchmake` 的地址新鲜度按传输分开——长连接节点以「socket 活着」为准，轮询节点仍比 `last_seen` 与 `STALE_MS`（原来一律比 `last_seen`，WS 节点两分钟后就再也撮合不到）；②游标钳制：`since` 大于当前最大 seq 时按 0 处理（HTTP events、WS 握手、resume 三处），替代此前未实现的 epoch 校验；③`rotateJoinKey` 补上 `closeAll(4401)`；④同 node 换连接（4000）不再广播 `peer_offline`；⑤HTTP leave / WS leave / 踢人都立刻广播 `peer_offline`，HTTP leave 同时关闭 socket；⑥`sweep` 的 `last_sweep` 从 meta 读回；⑦`loadNet` 比对整个上下文；⑧DO 不可用统一 503 `room_unavailable`；另补 `getNetworkCached`（15 秒）与 room 模式下跳过 D1 数据面清理。
 - **v1.1**（2026-11-11，评审后）：①`sweep` 触发点补 WebSocket 消息入口——B4 之后它是唯一的 GC 来源（§6.3）；②新增「连接代次」规则，解决自己重连时被 4000 误停的问题（§5.2、§7.1）；③V14 确认通过，写入 Free 计划额度（§2）；④V9 的机器验证前移到 P1，并明确它同时决定 §11 的 ping 折算是否成立（§2、§15）；⑤§11 补「多网络放大」与「混合期最坏情况」两个场景；⑥`region_hint` 降级为调试参数（§16）；⑦P6 验收补「固定 IP 预留核对」（B2 未提前的代价），回退场景补数据可见性说明（§8.4、§15）。
 
 **定稿说明**：v1.0（2026-11-09）：V9（保活与自动应答）由用户确认通过，不再作为阻塞项（我没有看到测试日志，未经复核）；原未决问题 1～4 按推荐默认值定稿，见 §16；其余待验证项 V10～V14 在对应阶段验收。
@@ -131,7 +132,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 - 查询参数：`node_id`、`ts`、`nonce`、`sig`，可选 `since`（断线重连的游标）、`caps`（逗号分隔）、`token`（无法带头的客户端）。令牌也可用 `Authorization: Bearer`。
 - 签名：复用现有规则，签名消息是 `qp2p1`、op、网络 id、ts、nonce、摘要六项用竖线连接；op 固定为 `ws`，摘要是 canonicalJson 化的 node\_id、since、ts、nonce、caps 的 SHA-256。**签名消息格式冻结，只允许追加新 op。**
 - 前置条件：节点必须已通过 HTTP join 或 register 登记（pubkey 来自登记记录）。未登记返回 404 `unknown_node`，客户端应先 register 再重连。
-- 同一 node 只允许一条 socket：新连接到来时旧连接以 4000 关闭。客户端必须按「连接代次」处理：自己发起重连时把旧连接标为 superseded，旧代次收到的任何 Closed 都丢弃，不上报 Down（见 §7.1）。否则网络切换时旧 socket 半开、客户端先重连、服务端以 4000 关掉旧连接，这条 4000 会落到同一进程里，客户端照表执行就会把自己刚建好的新连接停掉。
+- 同一 node 只允许一条 socket：新连接到来时旧连接以 4000 关闭。客户端的重连是「先放弃旧连接、再建新的」，旧连接上的 4000 到不了 `next()`；所以当前连接收到 4000 就说明身份真的被另一个实例接管了——**停止重连并提示**（见 §7.1）。这条取代了 v1.1 里的「连接代次」方案：单任务串行重连本来就不会误伤自己，代次只是多余的机制。
 
 握手失败（升级前）沿用现有错误结构 `{ok:false, error, detail}`：401 令牌格式、403 验签/重放/密钥错误、404 未登记、426 缺少 Upgrade、501 未绑定 DO（客户端退回轮询）、429 握手限流、503 `room_unavailable`（DO 异常或额度耗尽；WebSocket 与轮询同样受影响，客户端按 1 到 60 秒退避重试，已建立的隧道不受影响）。
 
@@ -166,6 +167,8 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 
 **刻意不做**：逐事件 ack（每次都会唤醒 DO 并计入请求）。游标由客户端自己保存，重连时用 `since` 或 `resume` 补齐。
 
+**游标钳制**：`since` 大于当前最大 seq 时按 0 处理（HTTP events、WS 握手、resume 三处）。换引擎后旧游标是 D1 自增 id（可能上万），DO 的 seq 从 1 开始；不钳制的话客户端会一直拿到空列表，只能靠重启自愈。客户端另外在握手时取 `min(本地 since, hello.cursor)`，让两边的计数一致。
+
 ### 5.4 Worker 与 NetworkRoom 的内部路由
 
 | 内部路径 | 调用方 | 作用 |
@@ -186,7 +189,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- | --- | --- |
 | `fetch(request, env, ctx)` | 现有·小改 | 总入口：限流 → CORS → 体积限制 → `route`；捕获 DO 异常（含额度耗尽）并转成 503 `room_unavailable` | Request → Response | `limited`、`route` |
 | `route(request, url, env, ctx)` | 现有·扩展 | 路径分发；新增 `/v1/ws`；业务端点先判 `roomEnabled` | → Response | 全部处理函数 |
-| `authenticate(request, env, url)` | 现有·小改 | 解析令牌、校验 join\_hash（兼容旧令牌）、返回 network | → `{ok, network}` 或错误响应 | `getNetworkCached` |
+| `authenticate(request, env, url)` | 现有·小改 | 解析令牌、校验 join\_hash（兼容旧令牌）、返回 network | → `{ok, network}` 或错误响应 | `getNetworkCached`（已实现） |
 | `getNetworkCached(env, id)` | 新增 | isolate 内 Map，TTL 15 秒；未命中读 D1 | 网络 id → network 或 null | D1 `networks` |
 | `invalidateNetwork(id)` | 新增 | 管理变更后清缓存（同 isolate 即时，其他 isolate 最多滞后 15 秒） | — | 管理面写路径调用 |
 | `roomEnabled(env)` | 新增 | 绑定了 `ROOM`（DO）则全部网络走 room，否则走 legacy；与网络无关 | → 布尔 | 纯函数 |
@@ -236,7 +239,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- |
 | `handleJoinRegister(body, needCandidates)` | 移植 `joinOrRegister`：校验 node\_id 等于 sha256(pubkey) 前 32 位、验签（幂等不占 nonce）、容量与僵尸淘汰、IP 分配与预留、upsert、状态变化时 emit peer\_online | → 与现有一致的 JSON（network、node、peers、durable、server\_ms）；原先约 8 读 3 写的 D1 往返变成本地调用 |
 | `allocateIp(net, nodeId, others, reservations)` | 移植 `validateVirtualIp` 与 `assignIp`；优先级：本次指定 > 已有 > 自己的预留 > 自动分配 | → ip 或错误；纯 SQLite |
-| `matchmake(fromId, targetId, now)` | 撮合核心：目标存在、在线、地址未过期（candidates\_at 与 STALE\_MS）、有候选；通过则 emit punch\_request | → `{ok, reply}` 或 `{error, status}`；HTTP 与 WS 共用 |
+| `matchmake(fromId, targetId, now)` | 撮合核心：目标存在、在线、地址新鲜（长连接看 socket，轮询看 `last_seen` 与 STALE\_MS）、有候选；通过则 emit punch\_request | → `{ok, reply}` 或 `{error, status}`；HTTP 与 WS 共用 |
 | `handleConnect(body)` | HTTP 入口：先验签（暂不占 nonce）→ `matchmake` → 成功路径再占 nonce | → ConnectReply JSON |
 | `handleEvents(url)` | HTTP 轮询入口：验签；`touch`；wasOffline 时补发 peer\_online；`pullEvents`（首次 since=0 只给近 30 秒） | → `{ok, cursor, events, server_ms}` |
 | `handleLeave(body)` | 验签（占 nonce）→ 删节点 → 关闭其 socket（1000）→ emit peer\_offline | → `{ok}` |
@@ -292,7 +295,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | `WsLink::connect_peer(target)` | 新增 | 分配 req id → 发 connect → 用 oneshot 等 connect\_ok 或 error，超时 10 秒 | → `ConnectReply`，与 HTTP 版返回同构，调用方无需区分 |
 | `WsLink::close(code)` | 新增 | 主动关闭 | 休眠、退出时调用 |
 | keepalive 任务 | 新增 | 每 25 秒发 `ping`；10 秒内无 `pong` 判定半开，主动关闭并上报 Down | 在线判定的客户端侧，对应服务端 `liveness` |
-| 连接代次 | 新增 | `WsLink` 每次重连递增 generation；发起重连时把旧连接标 superseded，旧代次 `next()` 产出的任何 Closed 一律丢弃、不上报 Down | 防止自己的重连被服务端 4000 回推时误判成「本机有另一个实例」而停止；与 §5.2 的关闭码处理配套 |
+| 4000 语义 | 新增 | `WsLink` 收到 4000 时不再重连，向主循环上报 `Superseded` 并提示「身份被另一条连接接管」 | 自己的重连不会把 4000 送到当前连接，收到即为真·多实例；继续重连会互相踢成死循环 |
 | `Backoff` | 新增 | 1 秒到 60 秒指数退避，±50% 抖动；连接稳定 60 秒后复位 | 避免发布期惊群 |
 | `session.rs` 的 `handle_event(event, ctx)` | **重构** | 把现在内联在轮询循环里的事件分发（punch\_request、peer\_online 及其热窗口、拨号触发）抽成函数，供两个事件源共用 | **耦合最紧的一步，先做纯重构、不改行为，靠现有测试兜底** |
 | `TransportMode` 与 `TransportCtl` | 新增 | 三态：Probing、Ws、Poll(until)；决定本轮使用哪个事件源 | 配置 `signal_transport` 为 auto、ws 或 poll |

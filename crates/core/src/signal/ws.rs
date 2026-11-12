@@ -278,7 +278,9 @@ impl WsLink {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let pong_timeout = hello.limits.pong_timeout();
-        let cursor = since.max(0);
+        // 服务端的游标可能比本地小（换引擎、数据被重建）：以服务端为准。
+        // 否则本地游标永远大于真实 seq，重连补发永远是空的，只能靠重启自愈。
+        let cursor = since.max(0).min(hello.cursor.max(0));
         let (tx, rx) = ws.split();
 
         Ok(Self {
@@ -304,8 +306,18 @@ impl WsLink {
     /// 读下一件事。内部顺带保活：到点发 `ping`，超时没 `pong` 就判半开。
     pub async fn next(&mut self) -> WsItem {
         loop {
+            // pong 的超时要单独等：只在 25 秒的心跳拍子上检查，会把半开检测
+            // 从设计的 10 秒拖到最多 25 秒（补发一条 ping 之后的下一拍才发现）。
+            let deadline = self.ping_sent.map(|t| t + self.pong_timeout);
             tokio::select! {
                 biased;
+
+                _ = sleep_until_opt(deadline) => {
+                    return WsItem::Down(format!(
+                        "{} 秒没收到 pong，连接可能已经半开",
+                        self.pong_timeout.as_secs()
+                    ));
+                }
 
                 frame = self.rx.next() => {
                     match frame {
@@ -349,14 +361,8 @@ impl WsLink {
                 }
 
                 _ = self.ticker.tick() => {
-                    if let Some(sent) = self.ping_sent {
-                        if sent.elapsed() > self.pong_timeout {
-                            return WsItem::Down(format!(
-                                "{} 秒没收到 pong，连接可能已经半开",
-                                self.pong_timeout.as_secs()
-                            ));
-                        }
-                        // 还没到判定线：这一拍不重复发 ping，等下一拍
+                    // 上一条 ping 还在等 pong：不重复发，超时由上面的 deadline 分支管
+                    if self.ping_sent.is_some() {
                         continue;
                     }
                     if self.tx.send(Message::Text("ping".into())).await.is_err() {
@@ -520,4 +526,15 @@ async fn tls_connect(host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>>
         .connect(server_name, tcp)
         .await
         .with_context(|| format!("与 {host} 建立 TLS 失败"))
+}
+
+/// 等到 `deadline`；没有 deadline 就永远挂着（交给 `select!` 的其它分支）。
+///
+/// 存在的理由：pong 超时是一个"从发出 ping 起算的绝对时刻"，而心跳是 25 秒一拍。
+/// 若只在拍子上检查，最坏要等到下一拍才发现半开（实测 25 秒，设计写的是 10 秒）。
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending::<()>().await,
+    }
 }

@@ -15,12 +15,13 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.6.0";
+const VERSION = "2.7.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
-// 心跳超过这个时间就算"可能刚换网"：120 秒 > 两轮 60 秒轮询，
-// 正常节点不会到这个数，宁可让发起方等 10 秒重试，也别拿旧地址打 35 秒空炮
+// 轮询节点的 last_seen 超过这个时间就算"可能刚换网"：120 秒 > 两轮 60 秒轮询。
+// 长连接节点不看它——socket 活着就是地点没变的证据，用它反而会把一直挂着的
+// WS 节点在两分钟后判成"地址过期"（见 matchmake 里的注释）。
 const STALE_MS = 120_000;
 // last_seen 最快多久写一次（省 D1 写额度）。
 // 取 55 秒而不是 60：客户端空闲时 60 秒一轮询，紧贴 60 秒的话请求间隔稍有抖动
@@ -150,7 +151,8 @@ export default {
     }
 
     if (typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(sweep(env).catch(() => {}));
+      // room 模式下 D1 只剩控制面数据，别再对旧表跑全表 DELETE
+      ctx.waitUntil(sweep(env, { dataPlane: !roomEnabled(env) }).catch(() => {}));
     }
 
     if (!(res instanceof Response)) {
@@ -309,14 +311,20 @@ async function forwardToRoom(request, env, url, path) {
       new Request(target.toString(), { method: request.method, headers, body: payload }),
     );
   } catch (e) {
-    return err(502, "room_throw", `${e?.name}: ${e?.message}`.slice(0, 300));
+    // 503 room_unavailable 是设计约定的"DO 不可用/额度耗尽"信号：客户端按 1→60 秒
+    // 退避重试，Android 也靠它区分提示。502 会被当成网关错误，语义不对。
+    return err(503, "room_unavailable", `${e?.name}: ${e?.message}`.slice(0, 300));
   }
 
   // DO 崩了的时候平台会给一个 HTML 错误页，直接透出去调用方只会看到 500。
   // 这里把原文截一段带出来，否则线上排查等于摸黑。
   if (res.status >= 500) {
     const text = await res.text().catch(() => "");
-    return err(502, "room_error", `DO 返回 ${res.status}：${text.replace(/\s+/g, " ").slice(0, 200)}`);
+    return err(
+      503,
+      "room_unavailable",
+      `DO 返回 ${res.status}：${text.replace(/\s+/g, " ").slice(0, 200)}`,
+    );
   }
 
   // 关键：stub.fetch() 拿到的 Response headers 是只读的，而入口还要加 x-qp2p-colo
@@ -581,6 +589,15 @@ async function rotateJoinKey(request, env, networkId) {
   const joinKey = preset ?? randomSecret();
   net.join_hash = await sha256Hex(joinKey);
   await putNetwork(env, net);
+
+  // room 引擎：把新上下文推进 DO，并让它在同一事务里关掉所有旧连接（4401）。
+  // 旧令牌已失效，那些 socket 已经没有继续撮合的资格。
+  if (roomEnabled(env)) {
+    await roomAdminApi(env, net, "/i/net-updated", {
+      method: "POST",
+      body: { net: JSON.parse(netContext(net)), close: true },
+    });
+  }
 
   return json({
     ok: true,
@@ -1081,6 +1098,7 @@ async function purgeNetwork(env, networkId) {
   await env.DB.prepare("DELETE FROM events WHERE network_id = ?").bind(networkId).run();
   await env.DB.prepare("DELETE FROM reservations WHERE network_id = ?").bind(networkId).run();
   await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
+  invalidateNetwork(env, networkId);
   return Number(count?.n ?? 0);
 }
 
@@ -1975,12 +1993,41 @@ async function ready(env) {
   return "d1";
 }
 
+/**
+ * 网络行缓存。
+ *
+ * 每个请求（包括每一次 WS 握手）都要拿一次 network 行做令牌校验，room 模式下
+ * 一次 events 请求就多一次 D1 读。这里按 isolate 缓存 15 秒，写路径显式失效。
+ * 代价：跨 isolate 的改名/换密钥最多滞后 15 秒可见——设计 §6.1 接受这一点，
+ * 因为 kick 与 rotate 都直达 DO，不依赖这张表。
+ */
+const NET_CACHE_TTL_MS = 15_000;
+const netCache = new WeakMap(); // env.DB（对象身份）→ Map<id, { at, net }>
+
+function invalidateNetwork(env, id) {
+  if (!env.DB || !id) return;
+  netCache.get(env.DB)?.delete(id);
+}
+
 async function getNetwork(env, id) {
   if ((await ready(env)) === "memory") return memory.networks.get(id) ?? null;
-  return env.DB.prepare("SELECT * FROM networks WHERE network_id = ?").bind(id).first();
+
+  let box = netCache.get(env.DB);
+  if (!box) {
+    box = new Map();
+    netCache.set(env.DB, box);
+  }
+  const hit = box.get(id);
+  if (hit && Date.now() - hit.at < NET_CACHE_TTL_MS) return { ...hit.net };
+
+  const net = await env.DB.prepare("SELECT * FROM networks WHERE network_id = ?").bind(id).first();
+  if (net) box.set(id, { at: Date.now(), net: { ...net } });
+  else box.delete(id);
+  return net;
 }
 
 async function putNetwork(env, net) {
+  invalidateNetwork(env, net.network_id);
   if ((await ready(env)) === "memory") {
     memory.networks.set(net.network_id, net);
     return;
@@ -2672,7 +2719,14 @@ function err(status, code, detail) {
 const sweeper = { last: 0 };
 let healthCache = { at: 0, nodes: null };
 
-async function sweep(env) {
+/**
+ * D1 清理。
+ *
+ * `dataPlane=false` 时只清控制面（登录失败记录）：room 模式下 nodes/events/
+ * reservations/nonces 都已经搬进 DO，再对 D1 那几张表跑 4 条全表 DELETE 纯属浪费
+ * 额度（每个 isolate 每 5 分钟一次）。
+ */
+async function sweep(env, { dataPlane = true } = {}) {
   const now = Date.now();
   if (now - sweeper.last < SWEEP_INTERVAL_MS) return 0;
   sweeper.last = now;
@@ -2681,6 +2735,7 @@ async function sweep(env) {
   const nodeCutoff = now - NODE_TTL_MS;
 
   if (!env.DB) {
+    if (!dataPlane) return 0;
     memory.events = memory.events.filter((e) => e.created_at >= staleCutoff);
     for (const [key, node] of memory.nodes) {
       if (node.last_seen < nodeCutoff) memory.nodes.delete(key);
@@ -2697,25 +2752,30 @@ async function sweep(env) {
     return 0;
   }
 
-  const { meta } = await env.DB.prepare("DELETE FROM events WHERE created_at < ?")
-    .bind(staleCutoff)
-    .run();
-  await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
-  await env.DB.prepare(
-    `DELETE FROM reservations
-      WHERE kind != 'user'
-        AND NOT EXISTS (
-          SELECT 1 FROM nodes n
-           WHERE n.network_id = reservations.network_id AND n.node_id = reservations.node_id
-        )`,
-  ).run();
-  await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
-    .bind(now - NONCE_TTL_MS)
-    .run();
+  let changes = 0;
+  if (dataPlane) {
+    const { meta } = await env.DB.prepare("DELETE FROM events WHERE created_at < ?")
+      .bind(staleCutoff)
+      .run();
+    changes = meta?.changes ?? 0;
+    await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
+    await env.DB.prepare(
+      `DELETE FROM reservations
+        WHERE kind != 'user'
+          AND NOT EXISTS (
+            SELECT 1 FROM nodes n
+             WHERE n.network_id = reservations.network_id AND n.node_id = reservations.node_id
+          )`,
+    ).run();
+    await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
+      .bind(now - NONCE_TTL_MS)
+      .run();
+  }
+  // 控制面：管理页登录失败记录，与引擎无关，一直要清
   await env.DB.prepare("DELETE FROM login_attempts WHERE last_at < ?")
     .bind(now - 24 * 60 * 60_000)
     .run();
-  return meta?.changes ?? 0;
+  return changes;
 }
 
 // ---------------------------------------------------------------------------
@@ -3378,7 +3438,14 @@ export class NetworkRoom {
       return cur;
     }
     if (ctx.v !== 1 || !ctx.id) return cur;
-    if (!cur || cur.id !== ctx.id) {
+    // 比整个上下文，不只比 id：改名、改网段后 DO 里的话术也得跟着变。
+    // 以前只比 id，updateNetwork 那次 /i/net-updated 一旦失败，DO 会永远停在旧网段。
+    if (
+      !cur ||
+      cur.id !== ctx.id ||
+      cur.name !== ctx.name ||
+      cur.cidr !== ctx.cidr
+    ) {
       const next = { v: 1, id: ctx.id, name: ctx.name, cidr: ctx.cidr };
       this.setMeta("net", JSON.stringify(next));
       return next;
@@ -3457,6 +3524,13 @@ export class NetworkRoom {
         if (!ipInCidr(net.cidr, r.ip)) this.deleteReservation(r.ip);
       }
     }
+
+    // 换密钥：旧令牌必须立刻作废。只改 D1 的话，已经握上手的 socket 不受影响，
+    // 攻击者能一直用旧连接撮合（新握手才会被拒）。设计 §5.2/§6.3 要求 closeAll(4401)。
+    if (body.close === true) {
+      this.closeAll(WS_CLOSE_UNAUTHORIZED, "join key rotated");
+    }
+
     return json({ ok: true, reassigned });
   }
 
@@ -3531,6 +3605,9 @@ export class NetworkRoom {
 
   /** 惰性 GC 入口：HTTP 与 WebSocket 消息路径都要调，距上次满 5 分钟才真正执行。 */
   sweep() {
+    // last_sweep 必须从 meta 读回：对象休眠后内存全丢，只留这个字段为 0 的话，
+    // 每次唤醒都会白跑一轮 GC（多写一条 meta，也违背容量估算）。
+    if (this.lastSweep === 0) this.lastSweep = Number(this.getMeta("last_sweep", 0)) || 0;
     if (Date.now() - this.lastSweep < SWEEP_INTERVAL_MS) return;
     this.sweepNow();
   }
@@ -3790,18 +3867,27 @@ export class NetworkRoom {
 
     const peer = this.getNode(target);
     if (!peer) return { ok: false, status: 404, error: "target_not_found", detail: "对端不在这个网络里" };
-    if (!this.liveness(peer, now).online) {
+    const live = this.liveness(peer, now);
+    if (!live.online) {
       return { ok: false, status: 410, error: "target_offline", detail: "对端心跳已超时" };
     }
 
-    const targetAge = now - peer.last_seen;
-    if (targetAge > Number(this.env.STALE_MS ?? STALE_MS)) {
-      return {
-        ok: false,
-        status: 409,
-        error: "target_stale",
-        detail: `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
-      };
+    // 地址新鲜度：两种传输的"存活证据"不同，不能共用 last_seen。
+    // - 长连接节点：socket 活着就证明它还在原地，地址视为新鲜。客户端换网后会重新
+    //   register（候选地址变化即强制上报），所以不需要按时间卡它。
+    // - 轮询节点：events 每 55 秒写一次 last_seen，超过 STALE_MS 说明可能刚换网。
+    // 曾经这里一律比 last_seen，而 WS 节点只在 register 时写（间隔 2 小时），
+    // 于是长连接建好约两分钟后，任何人都撮合不到它（报 target_stale）。
+    if (live.via === "poll") {
+      const targetAge = now - peer.last_seen;
+      if (targetAge > Number(this.env.STALE_MS ?? STALE_MS)) {
+        return {
+          ok: false,
+          status: 409,
+          error: "target_stale",
+          detail: `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
+        };
+      }
     }
 
     const peerCandidates = safeParseArray(peer.candidates);
@@ -4073,12 +4159,16 @@ export class NetworkRoom {
     });
     if (bad) return err(403, "bad_signature", bad);
 
+    // 签名用的是客户端发来的 since，校验通过后再钳制：换引擎后旧游标会大于
+    // 当前最大 seq，不钳制的话客户端会一直拿到空列表（只能靠重启自愈）。
+    const from = this.clampSince(since);
+
     const wasOffline = now - node.last_seen > OFFLINE_MS;
     if (now - node.last_seen >= HEARTBEAT_MS) this.touchNode(nodeId, now);
 
-    const minCreatedAt = since === 0 ? now - 30_000 : 0;
-    const rows = this.pullEvents(nodeId, since, MAX_EVENTS, minCreatedAt);
-    const cursor = rows.length > 0 ? rows[rows.length - 1].id : since;
+    const minCreatedAt = from === 0 ? now - 30_000 : 0;
+    const rows = this.pullEvents(nodeId, from, MAX_EVENTS, minCreatedAt);
+    const cursor = rows.length > 0 ? rows[rows.length - 1].id : from;
 
     if (wasOffline && safeParseArray(node.candidates).length > 0) {
       this.emit(BROADCAST, "peer_online", publicNode({ ...node, last_seen: now }, now));
@@ -4123,7 +4213,18 @@ export class NetworkRoom {
     if (bad) return err(403, "bad_signature", bad);
 
     // 预留不删：手填的地址在节点离线后仍然归它（与 legacy 一致）
+    const node = this.getNode(nodeId);
     this.deleteNode(nodeId);
+
+    // 主动下线要立刻让对端知道，否则它们只能等 liveness 超时（100 多秒）。
+    // 同时把这条连接的 socket 关掉：HTTP leave 之后它已经没有任何资格继续撮合。
+    this.announceOffline(nodeId, node?.name);
+    const ws = this.socketIndex().get(nodeId);
+    if (ws) {
+      try {
+        ws.close(WS_CLOSE_NORMAL, "bye");
+      } catch {}
+    }
     return json({ ok: true });
   }
 
@@ -4234,13 +4335,19 @@ export class NetworkRoom {
     return upgradeResponse(client);
   }
 
-  /** 补发 seq 大于 since 的事件（最多 MAX_EVENTS 条、只在事件 TTL 内）。 */
+  /**
+   * 补发 seq 大于 since 的事件（最多 MAX_EVENTS 条、只在事件 TTL 内）。
+   *
+   * since 一律先过 clampSince：换引擎（D1 自增 id → DO 的 seq）或数据被重建后，
+   * 客户端手里的游标会大于当前最大 seq，那时它永远拿不到事件，只能靠重启自愈。
+   */
   replay(ws, nodeId, since) {
-    const rows = this.pullEvents(nodeId, since, MAX_EVENTS, Date.now() - EVENT_TTL_MS);
+    const from = this.clampSince(since);
+    const rows = this.pullEvents(nodeId, from, MAX_EVENTS, Date.now() - EVENT_TTL_MS);
     for (const r of rows) {
       this.send(ws, wsEvent(r.id, r.type, safeParse(r.payload)));
     }
-    return rows.length > 0 ? rows[rows.length - 1].id : since;
+    return rows.length > 0 ? rows[rows.length - 1].id : from;
   }
 
   async webSocketMessage(ws, raw) {
@@ -4278,8 +4385,10 @@ export class NetworkRoom {
     if (m.t === "connect") return this.onConnectMsg(ws, nodeId, m);
     if (m.t === "resume") return this.onResumeMsg(ws, nodeId, m);
     if (m.t === "leave") {
-      // 主动下线：不留 last_seen 宽限，直接当离线
+      // 主动下线：不留 last_seen 宽限，直接当离线，并立刻告诉声明的对端
+      const node = this.getNode(nodeId);
       this.deleteNode(nodeId);
+      this.announceOffline(nodeId, node?.name, ws);
       try {
         ws.close(WS_CLOSE_NORMAL, "bye");
       } catch {}
@@ -4320,13 +4429,30 @@ export class NetworkRoom {
     // 其余情况写一次 last_seen，给轮询侧留一个离线宽限
     const node = this.getNode(nodeId);
     if (!node) return;
-    this.touchNode(nodeId, Date.now());
 
-    // peer_offline 不落库：只推给声明了 offline_evt 能力的 socket（旧客户端永远看不到）
-    const msg = { t: "event", seq: 0, type: "peer_offline", node_id: nodeId, name: node.name ?? "" };
+    // 同一节点已经有新 socket 接管（4000 抢占、或客户端刚重连）：这是"换了一条连接"，
+    // 不是"人走了"。无条件广播 peer_offline 会让对端误判它离线，而且不会补发 peer_online。
+    const stillHere = (this.state.getWebSockets?.() ?? []).some(
+      (s) => s !== ws && this.attachment(s).node === nodeId,
+    );
+    this.touchNode(nodeId, Date.now());
+    if (stillHere) return;
+
+    this.announceOffline(nodeId, node.name, ws);
+  }
+
+  /**
+   * 告诉声明了 `offline_evt` 能力的 socket：某个节点下线了。
+   *
+   * 不落库（不占 SQLite 写、也不会被迟到的事件补发出来）。旧客户端不声明这个能力，
+   * 所以永远看不到这条消息，行为与升级前一致。
+   */
+  announceOffline(nodeId, name, exceptWs = null) {
+    const msg = { t: "event", seq: 0, type: "peer_offline", node_id: nodeId, name: name ?? "" };
     for (const other of this.state.getWebSockets?.() ?? []) {
+      if (other === exceptWs) continue;
       const ao = this.attachment(other);
-      if (ao.node === nodeId) continue;
+      if (!ao.node || ao.node === nodeId) continue;
       if (!(ao.caps ?? []).includes("offline_evt")) continue;
       this.deliver(other, msg);
     }
@@ -4407,6 +4533,18 @@ export class NetworkRoom {
     return this.sql.exec("SELECT COALESCE(MAX(id), 0) AS m FROM events").toArray()[0]?.m ?? 0;
   }
 
+  /**
+   * 把"超出当前最大 seq"的游标当成 0。
+   *
+   * 旧引擎的游标是 D1 自增 id（可能上万），DO 的 seq 每个网络从 1 开始；换引擎、
+   * purge、重建数据之后，客户端手里的游标一定大于当前最大值。此时退回 0 让它重新
+   * 从最近的事件开始读，比让它静默饿死强（事件只有 5 分钟 TTL，重放代价很小）。
+   */
+  clampSince(since) {
+    const n = Math.max(0, Number(since) || 0);
+    return n > this.maxSeq() ? 0 : n;
+  }
+
   /** 数据代次：服务端数据被重建（purge / 换库）后客户端据此判断要不要重新 register。 */
   epoch() {
     const row = this.sql.exec("SELECT v FROM meta WHERE k = 'epoch'").toArray()[0];
@@ -4482,6 +4620,7 @@ export class NetworkRoom {
       }
       this.deleteNode(id);
       this.dropNodeEvents(id);
+      this.announceOffline(id, node.name);
       kicked.push({ node_id: id, name: node.name });
     }
     return json({ ok: true, removed: kicked.length, kicked });

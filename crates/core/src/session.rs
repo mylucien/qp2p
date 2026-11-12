@@ -151,6 +151,8 @@ enum WsFeed {
     Unsupported(String),
     /// 令牌/签名被拒（HTTP 401/403）：再重试也不会成功，必须停下来告诉用户。
     Fatal(String),
+    /// 同一身份被另一条连接接管（关闭码 4000）。继续重连只会互相踢、无限抖动。
+    Superseded,
     /// 服务端主动关闭。
     Closed {
         code: u16,
@@ -222,6 +224,14 @@ async fn ws_feed(
                             return;
                         }
                         WsItem::Closed { code, reason } => {
+                            // 4000 = 同一 node 的新连接接管。自己的重连是"先放弃旧连接、
+                            // 再建新的"，旧连接上的 4000 到不了这里；所以收到就是真的
+                            // 有另一个实例在用同一身份。继续重连会互相踢成死循环。
+                            if code == 4000 {
+                                let _ = tx.try_send(WsFeed::Superseded);
+                                let _ = link.close().await;
+                                return;
+                            }
                             let _ = tx.try_send(WsFeed::Closed { code, reason });
                             break;
                         }
@@ -746,6 +756,15 @@ impl Session {
                                 self.notify.say(
                                     "  现有直连还能用，但新节点连不上来了。重新加入：qp2p join <新令牌>",
                                 );
+                                return;
+                            }
+                            WsFeed::Superseded => {
+                                // 另一条连接用了同一个身份：继续跑只会两边互相踢
+                                self.notify.say(
+                                    "⚠ 这个节点身份被另一条连接接管了（多半是另一台设备用了同一份配置）",
+                                );
+                                self.notify
+                                    .say("  已停止重连。要在这台设备上用，先关掉另一台。");
                                 return;
                             }
                         }

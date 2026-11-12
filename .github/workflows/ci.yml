@@ -75,6 +75,10 @@ jobs:
       - name: WebSocket smoke
         run: node signal/ws-smoke.mjs
 
+      # 评审报告的回归：撮合新鲜度、游标钳制、换密钥踢人、下线通知、sweep 节流、503 语义
+      - name: 修复回归
+        run: node signal/fix-smoke.mjs
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
