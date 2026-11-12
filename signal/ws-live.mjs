@@ -233,15 +233,14 @@ async function main() {
   check("bob 直接收到 punch_request", !!punch && punch.from === alice.nodeId, punch);
   check("punch_request 有 seq 与 punch_at", typeof punch?.seq === "number" && typeof punch?.punch_at === "number", punch);
 
-  console.log("\n5. resume 与关闭");
+  console.log("\n5. resume 补发");
   b.inbox.length = 0;
   b.ws.send(JSON.stringify({ t: "resume", since: 0 }));
   const t2 = Date.now();
   while (Date.now() - t2 < 5_000 && !b.inbox.some((m) => m.t === "resume_ok")) await sleep(150);
   check("收到 resume_ok", b.inbox.some((m) => m.t === "resume_ok"), b.inbox.map((m) => m.t));
 
-  a.ws.close(1000, "done");
-  b.ws.close(1000, "done");
+  // 连接留到第 7 节由 rotate 关闭：回归用例要用"还活着的长连接"
   await sleep(1_500);
 
   // ---- 回归：评审报告里的三处缺陷 ----
