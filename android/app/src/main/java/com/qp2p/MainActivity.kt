@@ -413,7 +413,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
         }
         connectButton = Button(this).apply {
-            text = "连接"
+            text = "自动连接"
             textSize = 16f
             isAllCaps = false
             background = roundRect(BLUE, 12)
@@ -561,7 +561,7 @@ class MainActivity : Activity() {
         }
 
         // 已连接用白底绿框的"断开连接"，绿色始终是"在线"的意思
-        connectButton.text = if (phase == Qp2pVpnService.Phase.CONNECTED) "断开连接" else "连接"
+        connectButton.text = if (phase == Qp2pVpnService.Phase.CONNECTED) "断开连接" else "自动连接"
         if (phase == Qp2pVpnService.Phase.CONNECTED) {
             connectButton.background = roundRect(Color.WHITE, 12, 1, GREEN)
             connectButton.setTextColor(GREEN)

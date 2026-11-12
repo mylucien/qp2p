@@ -507,7 +507,10 @@ mod tests {
             serde_json::from_str(r#"{"worker":"https://w.dev","token":"t"}"#).unwrap();
         assert!(!cfg.keep_online, "默认不保持在线");
         assert_eq!(cfg.idle_secs, 600);
-        assert_eq!(idle_timeout(cfg.keep_online, cfg.idle_secs), Some(Duration::from_secs(600)));
+        assert_eq!(
+            idle_timeout(cfg.keep_online, cfg.idle_secs),
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]

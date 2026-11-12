@@ -90,19 +90,6 @@ class Qp2pVpnService : VpnService() {
         val connected: Boolean
             get() = phase == Phase.CONNECTED
 
-        /** 界面保存配置时的即时反馈，不用 Toast（那是浮层，也算弹窗） */
-        @Volatile
-        var notice: String = ""
-            private set
-
-        fun setNotice(text: String) {
-            notice = text
-        }
-
-        fun clearNotice() {
-            notice = ""
-        }
-
         private fun setState(p: Phase, text: String, hint: String = "") {
             detail = text
             advice = hint
