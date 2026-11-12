@@ -52,14 +52,9 @@ qp2p-deploy init                   # 建库 → 上传 → 启用子域 → 冒�
 
 ### 方式二：手工上传
 
-1. Cloudflare Dashboard → **Workers & Pages → Create → Worker** → Deploy
-2. **Edit code** → 粘贴仓库里的 `signal/worker.js` 全文 → **Deploy**
-3. 加 D1 绑定：变量名必须是 **`DB`**
-4. 加 **`ADMIN_SECRET`**（Secret 类型，值用 `openssl rand -hex 32`）
-
-**手工方式做不了长连接**：`ROOM` 绑定指向的 `NetworkRoom` 是 SQLite 后端的 Durable Object，
-必须在上传时一并声明迁移（`new_sqlite_classes`），而 Dashboard 没有这个入口。
-手工部署的 Worker 只能走轮询——功能完整，只是请求多些。
+**手工方式已经不适用了**：数据面在 Durable Object 里，`ROOM` 绑定指向的 `NetworkRoom` 是
+SQLite 后端的 DO，必须在上传时一并声明迁移（`new_sqlite_classes`），而 Dashboard 没有这个入口。
+用 Dashboard 粘出来的 Worker 能启动，但所有业务接口都会返回 503。请用 `qp2p-deploy`。
 
 ### 验收
 
@@ -71,21 +66,21 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 ```
 ✓ Worker 可达
-  版本    : 2.6.0
+  版本    : 2.8.0
   引擎    : room（支持 WebSocket 长连接）
   存储    : D1（多地域一致）
   管理密钥: 已配置
 ```
 
-引擎是 `legacy` 说明没绑上 Durable Object：能正常用，但客户端只能用轮询。
+引擎只有 `room` 一种；如果 `qp2p-deploy status` 提示线上已存在但探测失败，
+先确认 Worker 是否真的绑了 `ROOM`（没绑的话业务接口全部 503）。
 这些详情只对带管理密钥的请求返回；不加 `--admin` 只会看到「✓ Worker 可达」和一行提示。
 根路径 `/` 返回 404，不提供任何接口清单。
 
 | 不符合 | 处理 |
 |---|---|
-| 版本低于 2.6 | 重新上传一次 `worker.js`（2.6 才有长连接与 DO 数据面） |
-| 引擎显示 `legacy` | 没绑 `ROOM`，用部署器重来一次 |
-| 存储显示「内存」 | 没绑 D1，重启 Worker 会丢网络 |
+| 版本低于 2.8 | 用最新 `qp2p-deploy up` 重新部署 |
+| 接口全部返回 503 | 没绑 `ROOM`（Durable Object），用部署器重来一次 |
 | 管理密钥「未配置」 | 还能加入别人的网络，但建不了网络 |
 
 国内访问 `*.workers.dev` 可能不通，给 Worker 绑定自己的域名再填进来。
@@ -331,10 +326,10 @@ qp2p config unset transport     # 回默认（auto）
 | `ws` | 强制长连接，连不上按 1→60 秒一直重试，**不退回轮询**（确认服务端支持时用） |
 | `poll` | 完全不试长连接 |
 
-- 旧服务端（没有 Durable Object）握手会返回 501，`auto` 模式十几秒内就会退回轮询，
+- **旧版服务端**（2.7 及更早、没有 Durable Object）握手会返回 501，`auto` 模式十几秒内就会退回轮询，
   日志打一条「长连接连续失败（…），改用轮询，N 分钟后再试」。默认配置下不会有任何不适。
 - 想知道服务端支不支持：`qp2p init <地址> --admin <密钥>` 会打一行
-  `引擎    : room（支持 WebSocket 长连接）` / `legacy（只能用轮询）`。
+  `引擎    : room（支持 WebSocket 长连接）`；2.8 之后服务端只有这一种引擎。
 - 休眠联动：进入空闲休眠满 60 秒会断开长连接（手机省电），有流量唤醒后立刻接回来。
 - 长连接只承载"谁上线了、谁要连我"这类撮合消息，隧道数据不经过它。
 

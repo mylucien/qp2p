@@ -1100,13 +1100,11 @@ if (remoteUrl) {
     secret,
   });
 } else {
-  await runSuite("内存后端", { ADMIN_SECRET }, "memory", "198.18.0.1");
-  await runSuite("D1 后端", { ADMIN_SECRET, DB: fakeD1() }, "d1", "198.18.0.2");
-  // 同一套用例跑一遍 room 引擎（DO + SQLite 替身）：数据面全在 DO，控制面仍在 D1。
+  // 只有一种引擎了：控制面在 D1 替身，数据面在 DO 替身。
   // ROOM 与 Worker 共用同一个 env 对象，这样用例临时改的 env 变量也能传进 DO。
   const roomEnv = { ADMIN_SECRET, DB: fakeD1() };
   roomEnv.ROOM = fakeRoomBinding(roomEnv);
-  await runSuite("DO 后端", roomEnv, "d1", "198.18.0.4");
+  await runSuite("端到端", roomEnv, "d1", "198.18.0.4");
 }
 
 console.log(`\n结果：${totals.passed} 通过，${totals.failed} 失败\n`);

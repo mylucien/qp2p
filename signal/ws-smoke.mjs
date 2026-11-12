@@ -211,7 +211,11 @@ async function run() {
     legacyEnv,
     ctx,
   );
-  check("未绑定 DO → 501", legacyRes.status === 501, await legacyRes.text());
+  // legacy 引擎已退役：没绑 DO 不再是"可以退回轮询"，而是部署不完整
+  {
+    const text = await legacyRes.text();
+    check("未绑定 DO → 503", legacyRes.status === 503 && text.includes("room_unavailable"), text);
+  }
 
   const unknown = await identity();
   const r404 = await openWs(env, token, unknown, net);

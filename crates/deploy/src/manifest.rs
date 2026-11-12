@@ -16,8 +16,6 @@ pub const MAIN_MODULE: &str = "worker.js";
 
 pub struct Options<'a> {
     pub d1_id: &'a str,
-    /// 是否绑定 Durable Object。`false` 用于紧急回退到 legacy 数据面。
-    pub with_room: bool,
     /// 首次部署要带密钥明文；升级时传 `None`，靠 `keep_bindings` 保住已有密钥。
     pub admin_secret: Option<&'a str>,
     /// 这次要执行的迁移步骤；空表示只改代码。
@@ -31,13 +29,12 @@ pub fn metadata(opts: &Options<'_>) -> Value {
         "id": opts.d1_id,
     })];
 
-    if opts.with_room {
-        bindings.push(json!({
-            "type": "durable_object_namespace",
-            "name": "ROOM",
-            "class_name": "NetworkRoom",
-        }));
-    }
+    // 数据面只在 Durable Object 里（legacy 引擎已退役），ROOM 是必需绑定
+    bindings.push(json!({
+        "type": "durable_object_namespace",
+        "name": "ROOM",
+        "class_name": "NetworkRoom",
+    }));
 
     if let Some(secret) = opts.admin_secret {
         bindings.push(json!({
@@ -107,7 +104,6 @@ mod tests {
     fn first_deploy_has_secret_and_migration() {
         let meta = metadata(&Options {
             d1_id: "db-1",
-            with_room: true,
             admin_secret: Some("s3cret"),
             steps: &[step()],
         });
@@ -126,7 +122,6 @@ mod tests {
     fn upgrade_keeps_secret_and_omits_migrations() {
         let meta = metadata(&Options {
             d1_id: "db-1",
-            with_room: true,
             admin_secret: None,
             steps: &[],
         });
@@ -137,24 +132,9 @@ mod tests {
     }
 
     #[test]
-    fn no_room_drops_the_binding() {
-        let meta = metadata(&Options {
-            d1_id: "db-1",
-            with_room: false,
-            admin_secret: None,
-            steps: &[],
-        });
-        let bindings = meta["bindings"].as_array().unwrap();
-        assert!(!bindings
-            .iter()
-            .any(|b| b["type"] == "durable_object_namespace"));
-    }
-
-    #[test]
     fn secret_is_redacted_for_display() {
         let meta = metadata(&Options {
             d1_id: "db-1",
-            with_room: true,
             admin_secret: Some("abcdef"),
             steps: &[],
         });

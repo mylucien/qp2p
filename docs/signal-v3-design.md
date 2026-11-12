@@ -9,6 +9,7 @@ Durable Object + WebSocket 混合架构 · 定稿 v1.1 · 2026-11-11 · 基线�
 **修订记录**
 
 - **v0.2**（2026-11-09）：①不做在线数据迁移，升级一律由用户重新部署，因此删除了 `setNetworkEngine`、`importState`、逐网络 engine 字段与原 F6 的迁移流程；②新增 Android 端「保存配置」「自动连接」两个按钮（§7.3）；③更正降级语义：只有 WebSocket 不可用（代理拦截、握手失败）才退回轮询，DO 额度耗尽时轮询同样不可用。
+- **v1.3**（2026-11-12，B10 退役 legacy）：Worker 里那套 D1 数据面（内存后端 + nodes/events/nonces + 四个业务端点的 legacy 分支 + 管理面的 D1 分支）全部删除，数据面只剩 Durable Object；没绑 `ROOM` 的部署返回 503 并提示重新部署；`qp2p-deploy --no-room` 一并移除，紧急回退改用 Cloudflare 的部署历史（Workers 原生保留每次上传的版本）。
 - **v1.2**（2026-11-12，缺陷修复）：①`matchmake` 的地址新鲜度按传输分开——长连接节点以「socket 活着」为准，轮询节点仍比 `last_seen` 与 `STALE_MS`（原来一律比 `last_seen`，WS 节点两分钟后就再也撮合不到）；②游标钳制：`since` 大于当前最大 seq 时按 0 处理（HTTP events、WS 握手、resume 三处），替代此前未实现的 epoch 校验；③`rotateJoinKey` 补上 `closeAll(4401)`；④同 node 换连接（4000）不再广播 `peer_offline`；⑤HTTP leave / WS leave / 踢人都立刻广播 `peer_offline`，HTTP leave 同时关闭 socket；⑥`sweep` 的 `last_sweep` 从 meta 读回；⑦`loadNet` 比对整个上下文；⑧DO 不可用统一 503 `room_unavailable`；另补 `getNetworkCached`（15 秒）与 room 模式下跳过 D1 数据面清理。
 - **v1.1**（2026-11-11，评审后）：①`sweep` 触发点补 WebSocket 消息入口——B4 之后它是唯一的 GC 来源（§6.3）；②新增「连接代次」规则，解决自己重连时被 4000 误停的问题（§5.2、§7.1）；③V14 确认通过，写入 Free 计划额度（§2）；④V9 的机器验证前移到 P1，并明确它同时决定 §11 的 ping 折算是否成立（§2、§15）；⑤§11 补「多网络放大」与「混合期最坏情况」两个场景；⑥`region_hint` 降级为调试参数（§16）；⑦P6 验收补「固定 IP 预留核对」（B2 未提前的代价），回退场景补数据可见性说明（§8.4、§15）。
 
@@ -134,7 +135,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 - 前置条件：节点必须已通过 HTTP join 或 register 登记（pubkey 来自登记记录）。未登记返回 404 `unknown_node`，客户端应先 register 再重连。
 - 同一 node 只允许一条 socket：新连接到来时旧连接以 4000 关闭。客户端的重连是「先放弃旧连接、再建新的」，旧连接上的 4000 到不了 `next()`；所以当前连接收到 4000 就说明身份真的被另一个实例接管了——**停止重连并提示**（见 §7.1）。这条取代了 v1.1 里的「连接代次」方案：单任务串行重连本来就不会误伤自己，代次只是多余的机制。
 
-握手失败（升级前）沿用现有错误结构 `{ok:false, error, detail}`：401 令牌格式、403 验签/重放/密钥错误、404 未登记、426 缺少 Upgrade、501 未绑定 DO（客户端退回轮询）、429 握手限流、503 `room_unavailable`（DO 异常或额度耗尽；WebSocket 与轮询同样受影响，客户端按 1 到 60 秒退避重试，已建立的隧道不受影响）。
+握手失败（升级前）沿用现有错误结构 `{ok:false, error, detail}`：401 令牌格式、403 验签/重放/密钥错误、404 未登记、426 缺少 Upgrade、503 未绑定 DO（部署不完整，客户端按退避重试）、429 握手限流、503 `room_unavailable`（DO 异常或额度耗尽；WebSocket 与轮询同样受影响，客户端按 1 到 60 秒退避重试，已建立的隧道不受影响）。
 
 **关闭码**
 
@@ -387,7 +388,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | 回滚 | 上传旧版本代码；迁移标签不回退；DO 数据保留 |
 | 灾难（Worker 被删） | DO 数据随之销毁；网络需从 D1 控制面重建、节点重新 register。**用户手填的 IP 预留若只在 DO 里会丢**，因此 B2（预留同步备份到 D1）应尽早做 |
 | 重新部署（线上是 v2 或更早、没有 DO 的旧 Worker） | 读到的 current\_tag 为空，plan 从 v1 开始；ensure\_d1 复用同名 D1，networks、令牌、管理员账号原样保留，旧数据面表闲置；ADMIN\_SECRET 默认用 keep\_bindings 保留，需要时加 --reset-secret；上传后各节点的下一次请求就落到 DO，节点 register 一次即恢复。不迁移任何数据：手填的固定 IP 预留需在管理页重设（B2 之后自动恢复） |
-| 紧急回退（DO 不可用或额度耗尽） | deploy up --no-room：上传不带 ROOM 绑定的版本，Worker 退回 legacy（D1 + 轮询）；DO 里的数据保留但不再使用；节点重新 register 即恢复。**注意**：legacy 读的是 D1 里那份旧 reservations（升级前快照），DO 运行期间新增/释放的预留看不到，回退后要在管理页核对一遍 |
+| 紧急回退（新版本出问题） | Cloudflare Dashboard → Worker → Deployments（或 `wrangler rollback`）选上一个版本重新部署；DO 里的数据跟着脚本版本保留，节点下一次请求就落到旧代码上。也可以用上一版 `qp2p-deploy` 重跑 `up`。**legacy 数据面已退役，不再有"退回轮询"这条路** |
 
 ## 9. 关键流程
 
@@ -535,7 +536,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | P5 部署器 | `deploy init、up、status` | 全新账号 5 分钟内完成 init；迁移链逐步升级；冒烟通过 | 手工粘贴 legacy 流程仍可用 |
 | P6 发布 | 自用 Worker 重新部署（`deploy up`），观察 7 天；其余用户按发布说明重新部署，不做在线迁移 | 各网络日志无异常；用量在预期内；**手填的固定 IP 预留已在管理页核对并重设**（B2 未做的代价，见 R8） | `deploy up --no-room` |
 | P7 优化 | 见 §17 | 逐项验收 | 逐项回退 |
-| P8（可选） | 退役 legacy 数据面 | 全部网络稳定运行超过 1 个月 | 保留 D1 表，只关入口 |
+| P8 ✅ | 退役 legacy 数据面 | 已删除全部 legacy 代码（见 v1.3）；D1 只留控制面与预留备份 | 回退走 Cloudflare 部署历史 |
 
 ## 16. 风险与未决问题
 
@@ -573,7 +574,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | B7 | 管理页实时视图（订阅 `/i/stats`） | 体验 | 中 | P3 |
 | B8 | 自适应心跳：弱网拉长 ping，休眠态拉长 | 省电 | 中 | P4 |
 | B9 | Android 省电策略细化 | 移动端体验 | 高 | P4 |
-| B10 | 退役 legacy 引擎 | 简化代码 | 中 | P6 之后一个月以上 |
+| B10 ✅ | 退役 legacy 引擎 | 简化代码 | 中 | 已做：worker.js 4675 → 3890 行，只剩 DO 一条数据面 |
 | B11 | 事件批量发送 | 降唤醒 | 低 | P3 |
 | B12 | 按网络的速率与配额策略 | 抗滥用 | 中 | P6 |
 

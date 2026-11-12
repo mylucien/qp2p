@@ -37,7 +37,7 @@ qp2p-deploy — 部署 / 升级 qp2p 信令 Worker
 
 用法：
   qp2p-deploy init [--worker 名字] [--db 名字] [--dry-run]
-  qp2p-deploy up   [--worker 名字] [--tag v1] [--no-room] [--dry-run]
+  qp2p-deploy up   [--worker 名字] [--tag v1] [--dry-run]
   qp2p-deploy status [--worker 名字]
   qp2p-deploy rotate-admin [--worker 名字]
   qp2p-deploy destroy [--worker 名字]
@@ -77,7 +77,6 @@ struct Args {
     worker: String,
     db: String,
     tag: Option<String>,
-    no_room: bool,
     dry_run: bool,
 }
 
@@ -89,7 +88,6 @@ fn parse_args() -> Result<Args> {
         worker: DEFAULT_WORKER.to_string(),
         db: DEFAULT_DB.to_string(),
         tag: None,
-        no_room: false,
         dry_run: false,
     };
 
@@ -98,7 +96,6 @@ fn parse_args() -> Result<Args> {
             "--worker" => args.worker = next_value(&mut argv, "--worker")?,
             "--db" => args.db = next_value(&mut argv, "--db")?,
             "--tag" => args.tag = Some(next_value(&mut argv, "--tag")?),
-            "--no-room" => args.no_room = true,
             "--dry-run" => args.dry_run = true,
             "-h" | "--help" => args.cmd = "help".to_string(),
             other => bail!("不认识的参数 {other}"),
@@ -212,7 +209,6 @@ async fn cmd_init(args: &Args) -> Result<()> {
     })?;
     let meta = manifest::metadata(&manifest::Options {
         d1_id: &d1,
-        with_room: !args.no_room,
         admin_secret: Some(&secret),
         steps: &steps,
     });
@@ -294,7 +290,6 @@ async fn cmd_up(args: &Args) -> Result<()> {
     // 升级一律不带密钥明文，靠 keep_bindings 保住已有的
     let meta = manifest::metadata(&manifest::Options {
         d1_id: &d1,
-        with_room: !args.no_room,
         admin_secret: None,
         steps: &steps,
     });

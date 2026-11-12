@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.7.0";
+const VERSION = "2.8.0";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -53,34 +53,10 @@ const DDL_STATEMENTS = [
   )`,
   // 老库补列：重复执行会报 duplicate column，下面的循环会忽略
   `ALTER TABLE networks ADD COLUMN join_hash TEXT NOT NULL DEFAULT ''`,
-  `CREATE TABLE IF NOT EXISTS nodes (
-    network_id TEXT NOT NULL,
-    node_id    TEXT NOT NULL,
-    name       TEXT NOT NULL,
-    pubkey     TEXT NOT NULL,
-    tls_fp     TEXT NOT NULL,
-    virtual_ip TEXT NOT NULL,
-    nat_type   TEXT NOT NULL,
-    advertise  TEXT NOT NULL,
-    candidates TEXT NOT NULL,
-    last_seen  INTEGER NOT NULL,
-    PRIMARY KEY (network_id, node_id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    network_id TEXT NOT NULL,
-    node_id    TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    payload    TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS events_by_node ON events (network_id, node_id, id)`,
-  `CREATE TABLE IF NOT EXISTS nonces (
-    nonce      TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL
-  )`,
-  // IP 预留：用户手填的地址要"固定"下来，节点离线清理后不能被别人抢走。
-  // kind=user 永久保留（除非管理员释放）；kind=auto 跟随节点存在。
+  // 数据面（nodes / events / nonces）在 Durable Object 里，D1 不再建这三张表。
+  // 升级前遗留的旧表不读不写，留着不影响任何行为，想清就自己 DROP。
+  // 预留备份：DO 是权威，这张表只是它的备份（B2）。DO 首次初始化时从这里恢复，
+  // 免得重新部署后管理员手填的固定 IP 全丢。
   `CREATE TABLE IF NOT EXISTS reservations (
     network_id TEXT NOT NULL,
     ip         TEXT NOT NULL,
@@ -118,7 +94,6 @@ const DDL_STATEMENTS = [
     locked_until INTEGER NOT NULL DEFAULT 0
   )`,
   // 老库补列必须放在建表之后：新库上 ALTER 会报 no such table
-  `ALTER TABLE nodes ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE admin_actions ADD COLUMN actor TEXT NOT NULL DEFAULT ''`,
 ];
 
@@ -152,7 +127,7 @@ export default {
 
     if (typeof ctx.waitUntil === "function") {
       // room 模式下 D1 只剩控制面数据，别再对旧表跑全表 DELETE
-      ctx.waitUntil(sweep(env, { dataPlane: !roomEnabled(env) }).catch(() => {}));
+      ctx.waitUntil(sweep(env).catch(() => {}));
     }
 
     if (!(res instanceof Response)) {
@@ -249,9 +224,18 @@ async function route(request, url, env, ctx) {
 // 引擎由「Worker 有没有绑定 ROOM」决定，与具体网络无关：绑了就全部走 room，
 // 没绑就走 legacy（D1 数据面）。两条路都保留，回退就是部署一份不带绑定的版本。
 
-/** 是否走 room 引擎。 */
+/** 是否走 room 引擎。退役 legacy 后这是唯一的引擎，缺少绑定就是部署错误。 */
 function roomEnabled(env) {
   return Boolean(env?.ROOM);
+}
+
+/** 没绑 DO 时的统一响应：给运维看得懂的一句话，而不是内部错误码。 */
+function roomUnavailable() {
+  return err(
+    503,
+    "room_unavailable",
+    "这个 Worker 没有绑定 Durable Object（ROOM）。用 qp2p-deploy up 重新部署",
+  );
 }
 
 /** 取某个网络的 DO 句柄。 */
@@ -281,7 +265,13 @@ async function forwardToRoom(request, env, url, path) {
   if (!auth.ok) return auth.response;
 
   const stub = roomStub(env, auth.network);
-  if (!stub) return err(501, "room_unavailable", "没有绑定 Durable Object");
+  if (!stub) {
+    return err(
+      503,
+      "room_unavailable",
+      "这个 Worker 没有绑定 Durable Object（ROOM）。用 qp2p-deploy up 重新部署",
+    );
+  }
 
   const headers = new Headers(request.headers);
   for (const key of [...headers.keys()]) {
@@ -381,7 +371,11 @@ async function wsEntry(request, env, url) {
   }
   if (!roomEnabled(env)) {
     // 501 是给客户端的降级信号：退回轮询，不要反复重试握手
-    return err(501, "ws_unsupported", "这个部署没有绑定 Durable Object，请使用 /v1/events 轮询");
+    return err(
+      503,
+      "room_unavailable",
+      "这个 Worker 没有绑定 Durable Object（ROOM）。用 qp2p-deploy up 重新部署",
+    );
   }
   if (limited(request, WS_HANDSHAKE_MAX, "ws|")) {
     return err(429, "rate_limited", `握手每 IP 每分钟最多 ${WS_HANDSHAKE_MAX} 次`);
@@ -391,7 +385,13 @@ async function wsEntry(request, env, url) {
   if (!auth.ok) return auth.response;
 
   const stub = roomStub(env, auth.network);
-  if (!stub) return err(501, "ws_unsupported", "没有绑定 Durable Object");
+  if (!stub) {
+    return err(
+      503,
+      "room_unavailable",
+      "这个 Worker 没有绑定 Durable Object（ROOM）。用 qp2p-deploy up 重新部署",
+    );
+  }
 
   const target = new URL(request.url);
   target.pathname = "/i/ws";
@@ -472,34 +472,33 @@ async function health(request, env) {
     version: VERSION,
     storage,
     has_admin_secret: Boolean(env.ADMIN_SECRET),
-    engine: roomEnabled(env) ? "room" : "legacy",
+    engine: "room",
     room_bound: roomEnabled(env),
-    // 只有绑了 DO 的部署才有 WebSocket；legacy 报空，客户端据此直接走轮询
+    // 没绑 DO 等于部署不完整，能力和数据面都不可用
     features: roomEnabled(env) ? ["ws"] : [],
     colo: request.cf?.colo ?? "local",
     server_ms: Date.now(),
     limits: LIMITS,
   };
 
-  if (storage === "d1") {
-    // 计数走 60 秒缓存：COUNT(*) 每次都是一次 D1 读，没必要连查就重算
-    const now = Date.now();
-    if (!healthCache.at || now - healthCache.at > 60_000) {
-      try {
-        const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes").first();
-        healthCache = { at: now, nodes: Number(row?.n ?? 0) };
-      } catch {
-        healthCache = { at: now, nodes: null };
-      }
+  // 节点数只在控制面里统计：节点本身在 DO 里，这里数的是网络数量级的指标，
+  // 不值得为 health 逐个网络去问 DO（那是 N 次唤醒）。
+  const now = Date.now();
+  if (!healthCache.at || now - healthCache.at > 60_000) {
+    try {
+      const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM networks").first();
+      healthCache = { at: now, nodes: Number(row?.n ?? 0) };
+    } catch {
+      healthCache = { at: now, nodes: null };
     }
-    out.nodes = healthCache.nodes;
-    if (healthCache.nodes === null) {
-      out.ok = false;
-      out.error = "schema_not_ready";
-    }
-  } else {
-    out.nodes = memoryNodes();
-    out.warning = "未绑定 D1：状态只存在当前 isolate，多地域节点可能互相看不见";
+  }
+  out.networks = healthCache.nodes;
+  if (healthCache.nodes === null) {
+    out.ok = false;
+    out.error = "schema_not_ready";
+  }
+  if (!roomEnabled(env)) {
+    out.warning = "没有绑定 Durable Object（ROOM），数据面不可用";
   }
 
   return json(out);
@@ -656,17 +655,14 @@ async function deleteNetwork(request, env, networkId) {
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
-  let removed = 0;
-  if (roomEnabled(env)) {
-    // 数据面在 DO：先让 DO 清掉，再顺手清一遍 D1（旧表里可能有升级前的残留）
-    const res = await roomAdminApi(env, net, "/i/purge", { method: "POST", body: {} });
-    const data = res ? await res.json().catch(() => null) : null;
-    if (!data?.ok) return err(502, "room_bad_response", "DO 清理失败，网络没有删除");
-    removed = data.removed ?? 0;
-    await purgeNetwork(env, networkId);
-  } else {
-    removed = await purgeNetwork(env, networkId);
-  }
+  // 先让 DO 把节点/事件/预留清掉，再删控制面那一行：反过来的话，
+  // 中途失败会留下一个"没有登记记录但 DO 还在跑"的孤儿网络。
+  const res = await roomAdminApi(env, net, "/i/purge", { method: "POST", body: {} });
+  if (!res) return roomUnavailable();
+  const data = await res.json().catch(() => null);
+  if (!data?.ok) return err(502, "room_bad_response", "DO 清理失败，网络没有删除");
+  const removed = data.removed ?? 0;
+  await deleteNetworkRow(env, networkId);
   await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`, await adminActor(request, env));
   console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
 
@@ -680,6 +676,7 @@ async function updateNetwork(request, env, networkId) {
 
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
+  if (!roomStub(env, net)) return roomUnavailable();
 
   const body = await readJson(request);
   if (body === null) return err(400, "invalid_json");
@@ -710,56 +707,13 @@ async function updateNetwork(request, env, networkId) {
 
   await putNetwork(env, net);
 
-  // room 引擎：节点数据在 DO 里，重分配只能由 DO 做
-  if (roomEnabled(env)) {
-    const res = await roomAdminApi(env, net, "/i/net-updated", {
-      method: "POST",
-      body: { net: JSON.parse(netContext(net)), reassign: body.cidr !== undefined },
-    });
-    const data = res ? await res.json().catch(() => null) : null;
-    const reassigned = data?.reassigned ?? 0;
-    await audit(
-      env,
-      "network.update",
-      networkId,
-      `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`,
-      await adminActor(request, env),
-    );
-    return json({
-      ok: true,
-      changed: true,
-      network: { id: net.network_id, name: net.name, cidr: net.cidr },
-      reassigned,
-    });
-  }
-
-  // 网段变了：不在新网段里的节点重新分配，否则它们会顶着一个 ping 不通的地址
-  let reassigned = 0;
-  if (body.cidr !== undefined) {
-    const nodes = await listNodes(env, networkId);
-    for (const node of nodes) {
-      if (ipInCidr(net.cidr, node.virtual_ip)) continue;
-      const oldIp = node.virtual_ip;
-      const fresh = await assignIp(net, node.node_id, nodes, []);
-      await deleteReservation(env, networkId, oldIp);
-      node.virtual_ip = fresh;
-      await putNode(env, node);
-      await putReservation(env, {
-        network_id: networkId,
-        ip: fresh,
-        node_id: node.node_id,
-        kind: "auto",
-        note: "网段变更后重新分配",
-        created_at: Date.now(),
-      });
-      reassigned += 1;
-    }
-    // 落在新网段外的预留已经不可能生效，一并清掉（管理员随时可以重新预留）
-    for (const r of await listReservations(env, networkId)) {
-      if (!ipInCidr(net.cidr, r.ip)) await deleteReservation(env, networkId, r.ip);
-    }
-  }
-
+  // 节点在 DO 里：改名/改网段都要推过去，改网段时由 DO 负责重新分配地址
+  const res = await roomAdminApi(env, net, "/i/net-updated", {
+    method: "POST",
+    body: { net: JSON.parse(netContext(net)), reassign: body.cidr !== undefined },
+  });
+  const data = res ? await res.json().catch(() => null) : null;
+  const reassigned = data?.reassigned ?? 0;
   await audit(
     env,
     "network.update",
@@ -775,7 +729,6 @@ async function updateNetwork(request, env, networkId) {
   });
 }
 
-/** 管理面看节点：带在线状态、预留信息，按虚拟 IP 排序。 */
 async function listNetworkNodes(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
@@ -783,30 +736,9 @@ async function listNetworkNodes(request, env, networkId) {
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
-  // room 引擎：数据面在 DO，Worker 只保留鉴权
-  if (roomEnabled(env)) {
-    const res = await roomAdminApi(env, net, "/i/admin/nodes");
-    if (res) return res;
-  }
-
-  const now = Date.now();
-  const nodes = await listNodes(env, networkId);
-  const reservations = await listReservations(env, networkId);
-  const rows = nodes
-    .map((n) => ({
-      ...publicNode(n, now),
-      node_id: n.node_id,
-      advertised: safeParseArray(n.advertise),
-      reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
-    }))
-    .sort((a, b) => ipv4ToInt(a.virtual_ip) - ipv4ToInt(b.virtual_ip));
-
-  return json({
-    ok: true,
-    network: { id: net.network_id, name: net.name, cidr: net.cidr },
-    nodes: rows,
-    reservations,
-  });
+  const res = await roomAdminApi(env, net, "/i/admin/nodes");
+  if (!res) return roomUnavailable();
+  return res;
 }
 
 /** 踢一个节点下线：删记录 + 清它的事件，定向预留保留。 */
@@ -814,32 +746,23 @@ async function kickNode(request, env, networkId, nodeId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  if (roomEnabled(env)) {
-    const net = await getNetwork(env, networkId);
-    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-    const res = await roomAdminApi(env, net, "/i/admin/kick", {
-      method: "POST",
-      body: { node_ids: [nodeId] },
-    });
-    const data = res ? await res.json().catch(() => null) : null;
-    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
-    if (!data.ok) return json(data, res.status);
-    if (!data.removed) return err(404, "node_not_found", `没有节点 ${nodeId}`);
-    const hit = data.kicked[0];
-    await audit(env, "node.kick", `${networkId}/${nodeId}`, hit.name, await adminActor(request, env));
-    console.warn(`[room] 管理员踢下线 ${hit.name} (${nodeId})`);
-    return json({ ok: true, node: { node_id: hit.node_id, name: hit.name } });
-  }
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
-  const node = await getNode(env, networkId, nodeId);
-  if (!node) return err(404, "node_not_found", `没有节点 ${nodeId}`);
+  const res = await roomAdminApi(env, net, "/i/admin/kick", {
+    method: "POST",
+    body: { node_ids: [nodeId] },
+  });
+  if (!res) return roomUnavailable();
+  const data = await res.json().catch(() => null);
+  if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+  if (!data.ok) return json(data, res.status);
+  if (!data.removed) return err(404, "node_not_found", `没有节点 ${nodeId}`);
 
-  await deleteNode(env, networkId, nodeId);
-  await dropNodeEvents(env, networkId, nodeId);
-  await audit(env, "node.kick", `${networkId}/${nodeId}`, node.name, await adminActor(request, env));
-  console.warn(`[signal] 管理员踢下线 ${node.name} (${nodeId})`);
-
-  return json({ ok: true, node: { node_id: nodeId, name: node.name } });
+  const hit = data.kicked[0];
+  await audit(env, "node.kick", `${networkId}/${nodeId}`, hit.name, await adminActor(request, env));
+  console.warn(`[room] 管理员踢下线 ${hit.name} (${nodeId})`);
+  return json({ ok: true, node: { node_id: hit.node_id, name: hit.name } });
 }
 
 /** 批量踢下线：一次请求清掉多个节点，排查时比一个个点省事。 */
@@ -847,43 +770,28 @@ async function kickNodes(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  if (roomEnabled(env)) {
-    const net = await getNetwork(env, networkId);
-    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-    const body = (await readJson(request)) ?? {};
-    const res = await roomAdminApi(env, net, "/i/admin/kick", {
-      method: "POST",
-      body: { node_ids: body.node_ids },
-    });
-    const data = res ? await res.json().catch(() => null) : null;
-    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
-    if (!data.ok) return json(data, res.status);
-    await audit(env, "node.kick_batch", networkId, `清理 ${data.removed} 个节点`, await adminActor(request, env));
-    console.warn(`[room] 管理员批量踢下线 ${data.removed} 个节点（${networkId}）`);
-    return json({ ok: true, removed: data.removed });
-  }
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const body = (await readJson(request)) ?? {};
-  const ids = Array.isArray(body.node_ids) ? body.node_ids.map((x) => String(x).toLowerCase()) : [];
-  if (ids.length === 0 || ids.length > MAX_NODES) {
-    return err(400, "invalid_node_ids", `node_ids 必须是 1~${MAX_NODES} 个 node_id 的数组`);
-  }
-  if (ids.some((id) => !/^[0-9a-f]{32}$/.test(id))) {
-    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
-  }
+  const res = await roomAdminApi(env, net, "/i/admin/kick", {
+    method: "POST",
+    body: { node_ids: body.node_ids },
+  });
+  if (!res) return roomUnavailable();
+  const data = await res.json().catch(() => null);
+  if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+  if (!data.ok) return json(data, res.status);
 
-  let removed = 0;
-  for (const id of ids) {
-    const node = await getNode(env, networkId, id);
-    if (!node) continue;
-    await deleteNode(env, networkId, id);
-    await dropNodeEvents(env, networkId, id);
-    removed += 1;
-  }
-  const actor = await adminActor(request, env);
-  await audit(env, "node.kick_batch", networkId, `清理 ${removed} 个节点`, actor);
-  console.warn(`[signal] 管理员批量踢下线 ${removed} 个节点（${networkId}）`);
-  return json({ ok: true, removed });
+  await audit(
+    env,
+    "node.kick_batch",
+    networkId,
+    `清理 ${data.removed} 个节点`,
+    await adminActor(request, env),
+  );
+  console.warn(`[room] 管理员批量踢下线 ${data.removed} 个节点（${networkId}）`);
+  return json({ ok: true, removed: data.removed });
 }
 
 /** 管理员手动预留一个 IP（可以给还没上线的节点预占）。 */
@@ -893,88 +801,40 @@ async function reserveIp(request, env, networkId) {
 
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-
-  if (roomEnabled(env)) {
-    const body = await readJson(request);
-    if (body === null) return err(400, "invalid_json");
-    const res = await roomAdminApi(env, net, "/i/admin/reserve", { method: "POST", body });
-    const data = res ? await res.json().catch(() => null) : null;
-    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
-    if (!data.ok) return json(data, res.status);
-    await audit(
-      env,
-      "reservation.put",
-      `${networkId}/${data.reservation.ip}`,
-      data.reservation.node_id || "(未绑定节点)",
-      await adminActor(request, env),
-    );
-    return json(data);
-  }
+  if (!roomStub(env, net)) return roomUnavailable();
 
   const body = await readJson(request);
   if (body === null) return err(400, "invalid_json");
 
-  const ip = String(body.ip ?? "").trim();
-  const nodeId = String(body.node_id ?? "").trim().toLowerCase();
-  if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(ip) || ip.split(".").some((p) => Number(p) > 255)) {
-    return err(400, "invalid_virtual_ip", `IP 格式不对：${ip}`);
-  }
-  if (nodeId && !/^[0-9a-f]{32}$/.test(nodeId)) {
-    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
-  }
-  if (!ipInCidr(net.cidr, ip)) {
-    return err(400, "virtual_ip_not_in_network", `${ip} 不在网段 ${net.cidr} 里`);
-  }
+  const res = await roomAdminApi(env, net, "/i/admin/reserve", { method: "POST", body });
+  if (!res) return roomUnavailable();
+  const data = await res.json().catch(() => null);
+  if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+  if (!data.ok) return json(data, res.status);
 
-  const others = await listNodes(env, networkId);
-  const holder = others.find((n) => n.virtual_ip === ip && n.node_id !== nodeId);
-  if (holder) {
-    return err(409, "virtual_ip_taken", `${ip} 当前被「${holder.name}」占用，先踢下线再预留`);
-  }
-
-  // 一个节点只保留一条预留：给它新地址就把旧的删掉，免得 join 时二选一
-  if (nodeId) {
-    for (const old of await listReservations(env, networkId)) {
-      if (old.node_id === nodeId && old.ip !== ip) {
-        await deleteReservation(env, networkId, old.ip);
-      }
-    }
-  }
-
-  await putReservation(env, {
-    network_id: networkId,
-    ip,
-    node_id: nodeId,
-    kind: "user",
-    note: String(body.note ?? "").slice(0, 100),
-    created_at: Date.now(),
-  });
   await audit(
     env,
     "reservation.put",
-    `${networkId}/${ip}`,
-    nodeId || "(未绑定节点)",
+    `${networkId}/${data.reservation.ip}`,
+    data.reservation.node_id || "(未绑定节点)",
     await adminActor(request, env),
   );
-  return json({ ok: true, reservation: { ip, node_id: nodeId } });
+  return json(data);
 }
 
 async function releaseIp(request, env, networkId, ip) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  if (roomEnabled(env)) {
-    const net = await getNetwork(env, networkId);
-    if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-    const res = await roomAdminApi(env, net, "/i/admin/release", { method: "POST", body: { ip } });
-    const data = res ? await res.json().catch(() => null) : null;
-    if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
-    if (!data.ok) return json(data, res.status);
-    await audit(env, "reservation.delete", `${networkId}/${ip}`, "", await adminActor(request, env));
-    return json({ ok: true, released: ip });
-  }
+  const net = await getNetwork(env, networkId);
+  if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
-  await deleteReservation(env, networkId, ip);
+  const res = await roomAdminApi(env, net, "/i/admin/release", { method: "POST", body: { ip } });
+  if (!res) return roomUnavailable();
+  const data = await res.json().catch(() => null);
+  if (!data) return err(502, "room_bad_response", "DO 没有返回可用结果");
+  if (!data.ok) return json(data, res.status);
+
   await audit(env, "reservation.delete", `${networkId}/${ip}`, "", await adminActor(request, env));
   return json({ ok: true, released: ip });
 }
@@ -982,13 +842,13 @@ async function releaseIp(request, env, networkId, ip) {
 async function listReservationsAdmin(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
+
   const net = await getNetwork(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-  if (roomEnabled(env)) {
-    const res = await roomAdminApi(env, net, "/i/admin/reservations");
-    if (res) return res;
-  }
-  return json({ ok: true, reservations: await listReservations(env, networkId) });
+
+  const res = await roomAdminApi(env, net, "/i/admin/reservations");
+  if (!res) return roomUnavailable();
+  return res;
 }
 
 async function auditLog(request, env, url) {
@@ -999,107 +859,42 @@ async function auditLog(request, env, url) {
 }
 
 async function allNetworks(env) {
-  if ((await ready(env)) === "memory") return [...memory.networks.values()];
   const { results } = await env.DB.prepare("SELECT * FROM networks").all();
   return results ?? [];
 }
 
+/** 每网络节点数 / 在线数 / 预留数：一次问全部 DO，管理页列表用。 */
+async function statsByNetwork(env) {
+  return roomStatsAll(env, await allNetworks(env));
+}
+
 async function nodeCounts(env) {
-  if (roomEnabled(env)) {
-    const stats = await roomStatsAll(env, await allNetworks(env));
-    const out = {};
-    for (const [id, s] of stats) out[id] = s.nodes ?? 0;
-    return out;
-  }
-  if ((await ready(env)) === "memory") {
-    const out = {};
-    for (const node of memory.nodes.values()) {
-      out[node.network_id] = (out[node.network_id] ?? 0) + 1;
-    }
-    return out;
-  }
-  const { results } = await env.DB.prepare(
-    "SELECT network_id, COUNT(*) AS n FROM nodes GROUP BY network_id",
-  ).all();
   const out = {};
-  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  for (const [id, s] of await statsByNetwork(env)) out[id] = s.nodes ?? 0;
   return out;
 }
 
-/** 每网络在线节点数（管理页用，一次查询拿全）。 */
 async function onlineCounts(env) {
-  if (roomEnabled(env)) {
-    const stats = await roomStatsAll(env, await allNetworks(env));
-    const out = {};
-    for (const [id, s] of stats) out[id] = s.online ?? 0;
-    return out;
-  }
-  const now = Date.now();
-  if ((await ready(env)) === "memory") {
-    const out = {};
-    for (const node of memory.nodes.values()) {
-      if (now - node.last_seen <= OFFLINE_MS) {
-        out[node.network_id] = (out[node.network_id] ?? 0) + 1;
-      }
-    }
-    return out;
-  }
-  const { results } = await env.DB.prepare(
-    "SELECT network_id, COUNT(*) AS n FROM nodes WHERE last_seen >= ? GROUP BY network_id",
-  )
-    .bind(now - OFFLINE_MS)
-    .all();
   const out = {};
-  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  for (const [id, s] of await statsByNetwork(env)) out[id] = s.online ?? 0;
   return out;
 }
 
 async function reservationCounts(env) {
-  if (roomEnabled(env)) {
-    const stats = await roomStatsAll(env, await allNetworks(env));
-    const out = {};
-    for (const [id, s] of stats) out[id] = s.reservations ?? 0;
-    return out;
-  }
-  if ((await ready(env)) === "memory") {
-    const out = {};
-    for (const r of memory.reservations.values()) {
-      out[r.network_id] = (out[r.network_id] ?? 0) + 1;
-    }
-    return out;
-  }
-  const { results } = await env.DB.prepare(
-    "SELECT network_id, COUNT(*) AS n FROM reservations GROUP BY network_id",
-  ).all();
   const out = {};
-  for (const row of results ?? []) out[row.network_id] = Number(row.n ?? 0);
+  for (const [id, s] of await statsByNetwork(env)) out[id] = s.reservations ?? 0;
   return out;
 }
 
-/** 删掉一个网络及其节点、事件、nonce，返回清理掉的节点数。 */
-async function purgeNetwork(env, networkId) {
-  if ((await ready(env)) === "memory") {
-    const before = [...memory.nodes.values()].filter((n) => n.network_id === networkId).length;
-    for (const [k, node] of [...memory.nodes.entries()]) {
-      if (node.network_id === networkId) memory.nodes.delete(k);
-    }
-    memory.events = memory.events.filter((e) => e.network_id !== networkId);
-    for (const [k, r] of [...memory.reservations.entries()]) {
-      if (r.network_id === networkId) memory.reservations.delete(k);
-    }
-    memory.networks.delete(networkId);
-    return before;
-  }
-
-  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM nodes WHERE network_id = ?")
-    .bind(networkId)
-    .first();
-  await env.DB.prepare("DELETE FROM nodes WHERE network_id = ?").bind(networkId).run();
-  await env.DB.prepare("DELETE FROM events WHERE network_id = ?").bind(networkId).run();
-  await env.DB.prepare("DELETE FROM reservations WHERE network_id = ?").bind(networkId).run();
+/**
+ * 删掉网络的控制面记录。
+ *
+ * 数据面（节点、事件、预留）在 DO 里，由 `/i/purge` 清；D1 这边只剩这一行。
+ * 升级前遗留的旧表（nodes/events/nonces）不再读写，留着不影响任何行为。
+ */
+async function deleteNetworkRow(env, networkId) {
   await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
   invalidateNetwork(env, networkId);
-  return Number(count?.n ?? 0);
 }
 
 async function checkAdmin(request, env) {
@@ -1170,21 +965,18 @@ async function pbkdf2HexInner(password, saltHex, iterations) {
 }
 
 async function getAdminUser(env, username) {
-  if ((await ready(env)) === "memory") return memory.admins.get(username) ?? null;
+  await ready(env);
   return env.DB.prepare("SELECT * FROM admin_users WHERE username = ?").bind(username).first();
 }
 
 async function listAdminUsers(env) {
-  if ((await ready(env)) === "memory") return [...memory.admins.values()];
+  await ready(env);
   const { results } = await env.DB.prepare("SELECT username FROM admin_users").all();
   return results ?? [];
 }
 
 async function putAdminUser(env, user) {
-  if ((await ready(env)) === "memory") {
-    memory.admins.set(user.username, { ...user });
-    return;
-  }
+  await ready(env);
   await env.DB.prepare(
     `INSERT INTO admin_users (username, salt, hash, iterations, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?)
@@ -1326,15 +1118,12 @@ function lockSecondsFor(fails) {
 }
 
 async function getAttempt(env, key) {
-  if ((await ready(env)) === "memory") return memory.attempts.get(key) ?? null;
+  await ready(env);
   return env.DB.prepare("SELECT * FROM login_attempts WHERE key = ?").bind(key).first();
 }
 
 async function putAttempt(env, row) {
-  if ((await ready(env)) === "memory") {
-    memory.attempts.set(row.key, { ...row });
-    return;
-  }
+  await ready(env);
   await env.DB.prepare(
     `INSERT INTO login_attempts (key, fails, first_at, last_at, locked_until)
      VALUES (?, ?, ?, ?, ?)
@@ -1349,10 +1138,7 @@ async function putAttempt(env, row) {
 }
 
 async function clearAttempt(env, key) {
-  if ((await ready(env)) === "memory") {
-    memory.attempts.delete(key);
-    return;
-  }
+  await ready(env);
   await env.DB.prepare("DELETE FROM login_attempts WHERE key = ?").bind(key).run();
 }
 
@@ -1550,345 +1336,20 @@ function randomSecret() {
 // ---------------------------------------------------------------------------
 
 async function joinOrRegister(request, env, url, needCandidates) {
-  if (roomEnabled(env)) {
-    return forwardToRoom(request, env, url, needCandidates ? "/i/register" : "/i/join");
-  }
-
-  const auth = await authenticate(request, env, url);
-  if (!auth.ok) return auth.response;
-
-  const body = await readJson(request);
-  if (body === null) return err(400, "invalid_json");
-
-  const nodeId = String(body.node_id ?? "").toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(nodeId)) {
-    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
-  }
-
-  const pubkey = String(body.pubkey ?? "").toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(pubkey)) {
-    return err(400, "invalid_pubkey", "pubkey 必须是 64 位十六进制（32 字节 Ed25519 公钥）");
-  }
-  const derived = (await sha256Hex(hexToBytes(pubkey))).slice(0, 32);
-  if (derived !== nodeId) {
-    return err(403, "node_id_mismatch", "node_id 必须等于 sha256(pubkey)[..32]");
-  }
-
-  const candidates = parseCandidates(body.candidates);
-  if (candidates === null) {
-    return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
-  }
-  if (needCandidates && candidates.length === 0) {
-    return err(400, "missing_candidates", "register 至少需要一个候选地址");
-  }
-
-  const network = auth.network;
-  const now = Date.now();
-
-  // 签名覆盖整个请求体：改 candidates / tls_fp / name 任何一项都会让签名失效
-  const bad = await verifySignedRequest({
-    env,
-    op: needCandidates ? "register" : "join",
-    networkId: network.network_id,
-    body,
-    pubkey,
-    now,
-    // register / join 是幂等的：重放同一份签名报文只会写入同样的内容。
-    // 不占 nonce 能省掉每次 2 行写入（nonces 表 + 它的主键索引）。
-    // 破坏性操作（leave）和有副作用的操作（connect 成功路径）仍然防重放。
-    trackReplay: false,
-  });
-  if (bad) return err(403, "bad_signature", bad);
-
-  // 一次读出全部成员：既判断是否已注册、网络是否满员，也用来算地址和返回成员列表。
-  // 原来 getNode + 两次 listNodes（新节点是三次）+ 提交后再读一次，是 register 最大的开销。
-  let others = await listNodes(env, network.network_id);
-  const existing = others.find((n) => n.node_id === nodeId) ?? null;
-  if (!existing && others.length >= MAX_NODES) {
-    // 满了先淘汰最久没心跳的离线节点，否则僵尸节点会把网络永久占死
-    const victim = others
-      .filter((n) => now - n.last_seen > OFFLINE_MS)
-      .sort((a, b) => a.last_seen - b.last_seen)[0];
-    if (!victim) {
-      return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);
-    }
-    await deleteNode(env, network.network_id, victim.node_id);
-    console.warn(`[signal] 淘汰僵尸节点 ${victim.node_id}`);
-    others = others.filter((n) => n.node_id !== victim.node_id);
-  }
-
-  const reservations = await listReservations(env, network.network_id);
-
-  // 用户可以在加入时自己指定虚拟地址（家庭里想固定 IP 的典型需求）。
-  // 只校验、不自动改：撞车就报错，别让人以为生效了其实是别的地址。
-  const requested = body.virtual_ip === undefined || body.virtual_ip === null
-    ? null
-    : String(body.virtual_ip).trim();
-  if (requested !== null) {
-    const bad = validateVirtualIp(network, requested, nodeId, others, reservations);
-    if (bad) return bad;
-  }
-
-  // 地址优先级：这次指定 > 已有记录 > 自己的预留 > 自动分配。
-  // 预留让"用户手填的地址"在节点离线清理之后依然归它——否则重连就换地址了。
-  let virtualIp = requested ?? existing?.virtual_ip ?? null;
-  if (!virtualIp) {
-    const mine = reservations.find((r) => r.node_id === nodeId);
-    const stolen = mine && others.some((n) => n.node_id !== nodeId && n.virtual_ip === mine.ip);
-    if (mine && !stolen) virtualIp = mine.ip;
-  }
-  // 管理员改过网段的话，旧地址可能已经不在网段里：重新分配，别给个 ping 不通的地址
-  if (!virtualIp || !ipInCidr(network.cidr, virtualIp)) {
-    virtualIp = await assignIp(network, nodeId, others, reservations);
-  }
-
-  // 记录预留：用户手填的永久保留，自动分配的跟着节点走（节点清理时一起删）
-  const oldRes = reservations.find((r) => r.node_id === nodeId && r.ip !== virtualIp);
-  if (oldRes) await deleteReservation(env, network.network_id, oldRes.ip);
-  // 已经有一模一样的预留就不再写：原来每次定时 register 都会无意义地覆盖一遍
-  if (!reservations.some((r) => r.ip === virtualIp && r.node_id === nodeId)) {
-    await putReservation(env, {
-      network_id: network.network_id,
-      ip: virtualIp,
-      node_id: nodeId,
-      kind: requested !== null ? "user" : "auto",
-      note: reservations.find((r) => r.ip === virtualIp)?.note ?? "",
-      created_at: Date.now(),
-    });
-  }
-
-  const record = {
-    network_id: network.network_id,
-    node_id: nodeId,
-    name: String(body.name ?? existing?.name ?? nodeId.slice(0, 8)).slice(0, 48),
-    pubkey,
-    tls_fp: String(body.tls_fp ?? existing?.tls_fp ?? "").slice(0, 128),
-    virtual_ip: virtualIp,
-    nat_type: String(body.nat_type ?? existing?.nat_type ?? "unknown").slice(0, 16),
-    advertise: JSON.stringify(
-      Array.isArray(body.advertise) ? body.advertise.slice(0, 8).map(String) : JSON.parse(existing?.advertise ?? "[]"),
-    ),
-    candidates: JSON.stringify(candidates.length > 0 ? candidates : JSON.parse(existing?.candidates ?? "[]")),
-    last_seen: now,
-    // 首次上线时间只写一次：上线时长、是否频繁重启都靠它
-    first_seen: Number(existing?.first_seen ?? 0) || now,
-  };
-
-  await putNode(env, record);
-
-  // 对端靠这条广播感知"它上线了 / 换地址了"，不用再盲目重试 /connect，也不用等下一次 register。
-  // 只在状态真的变了才发：新节点、离线后回来、候选地址变了。
-  const wasOnline = existing !== null && now - existing.last_seen <= OFFLINE_MS;
-  const moved = existing !== null && existing.candidates !== record.candidates;
-  if ((!wasOnline || moved) && safeParseArray(record.candidates).length > 0) {
-    await pushEvent(env, network.network_id, BROADCAST, "peer_online", publicNode(record, now));
-  }
-
-  const peers = others.filter((n) => n.node_id !== nodeId).map((n) => publicNode(n, now));
-
-  return json({
-    ok: true,
-    network: { id: network.network_id, name: network.name, cidr: network.cidr },
-    node: { node_id: nodeId, virtual_ip: virtualIp, name: record.name },
-    peers,
-    durable: Boolean(env.DB),
-    server_ms: now,
-  });
+  return forwardToRoom(request, env, url, needCandidates ? "/i/register" : "/i/join");
 }
 
 async function connect(request, env, url) {
-  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/connect");
-
-  const auth = await authenticate(request, env, url);
-  if (!auth.ok) return auth.response;
-
-  const body = await readJson(request);
-  if (body === null) return err(400, "invalid_json");
-
-  const from = String(body.from ?? "").toLowerCase();
-  const target = String(body.target ?? "").toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(from) || !/^[0-9a-f]{32}$/.test(target)) {
-    return err(400, "invalid_node_id", "from 与 target 都必须是 32 位十六进制 node_id");
-  }
-  if (from === target) return err(400, "self_connect", "不能连自己");
-
-  const now = Date.now();
-  const self = await getNode(env, auth.network.network_id, from);
-  if (!self) return err(404, "unknown_node", "发起方尚未注册");
-
-  const bad = await verifySignedRequest({
-    env,
-    op: "connect",
-    networkId: auth.network.network_id,
-    body,
-    pubkey: self.pubkey,
-    now,
-    // 先只验签；nonce 等对端校验都通过、真要写 punch_request 之前再占。
-    // 对端离线 / 不存在 / 过期这几条失败路径本来就没有副作用，重放无害，
-    // 却占了一行 nonce 写入——对端关机时客户端每分钟都会撞上这条路径。
-    trackReplay: false,
-  });
-  if (bad) return err(403, "bad_signature", bad);
-
-  const peer = await getNode(env, auth.network.network_id, target);
-  if (!peer) return err(404, "target_not_found", "对端不在这个网络里");
-  if (now - peer.last_seen > OFFLINE_MS) return err(410, "target_offline", "对端心跳已超时");
-
-  // 对端可能刚从 WiFi 切到 4G：它的新端口还没上报，拿旧地址打是白费
-  const targetAge = now - peer.last_seen;
-  const staleMs = Number(env.STALE_MS ?? STALE_MS);
-  if (targetAge > staleMs) {
-    return err(
-      409,
-      "target_stale",
-      `对端 ${Math.round(targetAge / 1000)} 秒没有刷新地址，可能刚换网；稍后重试`,
-    );
-  }
-
-  const peerCandidates = JSON.parse(peer.candidates || "[]");
-  if (peerCandidates.length === 0) {
-    return err(409, "target_no_candidates", "对端还没有上报候选地址");
-  }
-
-  // 到这里才有副作用（写一条 punch_request），重放会让对端被重复打扰：此时占 nonce
-  const nonce = String(body.nonce ?? "").toLowerCase();
-  if (!(await consumeNonce(env, `${auth.network.network_id}:${nonce}`, now))) {
-    return err(403, "bad_signature", "nonce 已用过（疑似重放）");
-  }
-
-  const t = now + 500;
-  await pushEvent(env, auth.network.network_id, target, "punch_request", {
-    from,
-    // 组网时被叫方要靠这个地址决定"这个包该发给谁"，
-    // 只给候选地址的话，被叫方拿到连接也不知道对端的虚拟 IP
-    from_name: self.name,
-    virtual_ip: self.virtual_ip,
-    candidates: JSON.parse(self.candidates || "[]"),
-    t,
-    server_ms: now,
-  });
-
-  return json({
-    ok: true,
-    t,
-    target_last_seen: peer.last_seen,
-    target_candidates: peerCandidates,
-    target_virtual_ip: peer.virtual_ip,
-    target_tls_fp: peer.tls_fp,
-    server_ms: now,
-  });
+  return forwardToRoom(request, env, url, "/i/connect");
 }
 
 async function events(request, env, url) {
-  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/events");
-
-  const auth = await authenticate(request, env, url);
-  if (!auth.ok) return auth.response;
-
-  const nodeId = (url.searchParams.get("node_id") ?? "").toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(nodeId)) {
-    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
-  }
-  const since = Math.max(0, Number(url.searchParams.get("since") ?? 0) || 0);
-
-  const now = Date.now();
-  const node = await getNode(env, auth.network.network_id, nodeId);
-  if (!node) return err(404, "unknown_node", "先 register 再拉事件");
-
-  // GET 没有请求体：把参与签名的三个查询参数拼成同样的结构再算摘要。
-  // 轮询本身幂等，不做 nonce 消费，否则每次心跳都要多写一行。
-  const signedBody = {
-    node_id: nodeId,
-    since,
-    // ts/since 一律按数字进摘要：查询串里是字符串，不归一化就会和客户端算出的摘要对不上
-    ts: Number(url.searchParams.get("ts")),
-    nonce: url.searchParams.get("nonce"),
-  };
-  const bad = await verifySignedRequest({
-    env,
-    op: "events",
-    networkId: auth.network.network_id,
-    body: { ...signedBody, sig: url.searchParams.get("sig") },
-    pubkey: node.pubkey,
-    now,
-    trackReplay: false,
-  });
-  if (bad) return err(403, "bad_signature", bad);
-
-  // 轮询即心跳，但按 HEARTBEAT_MS 节流，避免把 D1 写额度烧在心跳上
-  const wasOffline = now - node.last_seen > OFFLINE_MS;
-  if (now - node.last_seen >= HEARTBEAT_MS) {
-    await touchNode(env, auth.network.network_id, nodeId, now);
-  }
-
-  // 首次拉取（since=0）只给最近 30 秒的事件：更早的 punch_request 已经没有意义，
-  // 交给客户端处理不如在这里就挡掉
-  const minCreatedAt = since === 0 ? now - 30_000 : 0;
-  const rows = await pullEvents(env, auth.network.network_id, nodeId, since, MAX_EVENTS, minCreatedAt);
-  const cursor = rows.length > 0 ? rows[rows.length - 1].id : since;
-
-  // 睡眠 / 断网后回来、没换地址也没重新注册的节点：对端早就把它标成离线了，
-  // 只有这里知道它回来了，补发一条上线广播（否则对端要等到下一次定时 register 才会重试）
-  if (wasOffline && safeParseArray(node.candidates).length > 0) {
-    await pushEvent(
-      env,
-      auth.network.network_id,
-      BROADCAST,
-      "peer_online",
-      publicNode({ ...node, last_seen: now }, now),
-    );
-  }
-
-  return json({
-    ok: true,
-    cursor,
-    events: rows.map((r) => ({
-      seq: r.id,
-      type: r.type,
-      ...safeParse(r.payload),
-    })),
-    server_ms: now,
-  });
+  return forwardToRoom(request, env, url, "/i/events");
 }
 
 async function leave(request, env, url) {
-  if (roomEnabled(env)) return forwardToRoom(request, env, url, "/i/leave");
-
-  const auth = await authenticate(request, env, url);
-  if (!auth.ok) return auth.response;
-
-  const body = await readJson(request);
-  if (body === null) return err(400, "invalid_json");
-
-  const nodeId = String(body.node_id ?? "").toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(nodeId)) {
-    return err(400, "invalid_node_id", "node_id 必须是 32 位十六进制");
-  }
-
-  // 只能下线自己：要求 pubkey 与 node_id 匹配，且用这把私钥签了这次请求
-  const pubkey = String(body.pubkey ?? "").toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(pubkey) || (await sha256Hex(hexToBytes(pubkey))).slice(0, 32) !== nodeId) {
-    return err(403, "node_id_mismatch", "leave 需要提供与 node_id 对应的 pubkey");
-  }
-
-  const bad = await verifySignedRequest({
-    env,
-    op: "leave",
-    networkId: auth.network.network_id,
-    body,
-    pubkey,
-    now: Date.now(),
-    trackReplay: true,
-  });
-  if (bad) return err(403, "bad_signature", bad);
-
-  await deleteNode(env, auth.network.network_id, nodeId);
-  return json({ ok: true });
+  return forwardToRoom(request, env, url, "/i/leave");
 }
-
-// ---------------------------------------------------------------------------
-// 鉴权：令牌是 ADMIN_SECRET 的 HMAC，服务端无需存密钥
-// ---------------------------------------------------------------------------
 
 async function authenticate(request, env, url) {
   const header = request.headers.get("authorization") ?? "";
@@ -1964,21 +1425,15 @@ async function legacyTokenFor(networkId, adminSecret) {
 // 存储：D1 优先，未绑定时退回 isolate 内存
 // ---------------------------------------------------------------------------
 
-const memory = {
-  networks: new Map(),
-  nodes: new Map(),
-  events: [],
-  nonces: new Map(),
-  reservations: new Map(),
-  admins: new Map(),
-  attempts: new Map(),
-  audit: [],
-  seq: 0,
-};
-const migrated = new WeakSet(); // 每个 D1 绑定只建一次表
+/**
+ * 建表（幂等）。只针对控制面：networks / 审计 / 管理员 / 登录失败 / 预留备份。
+ * 数据面（节点、事件、nonce）在 Durable Object 自己的 SQLite 里。
+ */
+/** 建过表的 DB 对象（每个 isolate 各记一份，避免每次请求都跑 DDL）。 */
+const migrated = new WeakSet();
 
 async function ready(env) {
-  if (!env.DB) return "memory";
+  if (!env.DB) throw new Error("Worker 没有绑定 D1（DB）。控制面必须要有 D1");
   if (!migrated.has(env.DB)) {
     for (const sql of DDL_STATEMENTS) {
       try {
@@ -2010,8 +1465,7 @@ function invalidateNetwork(env, id) {
 }
 
 async function getNetwork(env, id) {
-  if ((await ready(env)) === "memory") return memory.networks.get(id) ?? null;
-
+  await ready(env);
   let box = netCache.get(env.DB);
   if (!box) {
     box = new Map();
@@ -2027,11 +1481,8 @@ async function getNetwork(env, id) {
 }
 
 async function putNetwork(env, net) {
+  await ready(env);
   invalidateNetwork(env, net.network_id);
-  if ((await ready(env)) === "memory") {
-    memory.networks.set(net.network_id, net);
-    return;
-  }
   await env.DB.prepare(
     "INSERT OR REPLACE INTO networks (network_id, name, cidr, created_at, join_hash) VALUES (?, ?, ?, ?, ?)",
   )
@@ -2039,137 +1490,6 @@ async function putNetwork(env, net) {
     .run();
 }
 
-async function getNode(env, networkId, nodeId) {
-  if ((await ready(env)) === "memory") return memory.nodes.get(key(networkId, nodeId)) ?? null;
-  return env.DB.prepare("SELECT * FROM nodes WHERE network_id = ? AND node_id = ?")
-    .bind(networkId, nodeId)
-    .first();
-}
-
-async function putNode(env, node) {
-  if ((await ready(env)) === "memory") {
-    memory.nodes.set(key(node.network_id, node.node_id), { ...node });
-    return;
-  }
-  await env.DB.prepare(
-    `INSERT INTO nodes (network_id, node_id, name, pubkey, tls_fp, virtual_ip, nat_type, advertise, candidates, last_seen, first_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(network_id, node_id) DO UPDATE SET
-       name = excluded.name,
-       pubkey = excluded.pubkey,
-       tls_fp = excluded.tls_fp,
-       virtual_ip = excluded.virtual_ip,
-       nat_type = excluded.nat_type,
-       advertise = excluded.advertise,
-       candidates = excluded.candidates,
-       last_seen = excluded.last_seen`,
-  )
-    .bind(
-      node.network_id,
-      node.node_id,
-      node.name,
-      node.pubkey,
-      node.tls_fp,
-      node.virtual_ip,
-      node.nat_type,
-      node.advertise,
-      node.candidates,
-      node.last_seen,
-      node.first_seen ?? node.last_seen,
-    )
-    .run();
-}
-
-async function touchNode(env, networkId, nodeId, ts) {
-  if ((await ready(env)) === "memory") {
-    const node = memory.nodes.get(key(networkId, nodeId));
-    if (node) node.last_seen = ts;
-    return;
-  }
-  await env.DB.prepare("UPDATE nodes SET last_seen = ? WHERE network_id = ? AND node_id = ?")
-    .bind(ts, networkId, nodeId)
-    .run();
-}
-
-async function deleteNode(env, networkId, nodeId) {
-  if ((await ready(env)) === "memory") {
-    memory.nodes.delete(key(networkId, nodeId));
-  } else {
-    await env.DB.prepare("DELETE FROM nodes WHERE network_id = ? AND node_id = ?")
-      .bind(networkId, nodeId)
-      .run();
-  }
-  // 节点没了，自动预留跟着走；用户手填的留着，重装后还能拿回原地址
-  await dropAutoReservations(env, networkId, nodeId);
-}
-
-async function listNodes(env, networkId) {
-  if ((await ready(env)) === "memory") {
-    return [...memory.nodes.values()].filter((n) => n.network_id === networkId);
-  }
-  const { results } = await env.DB.prepare("SELECT * FROM nodes WHERE network_id = ?")
-    .bind(networkId)
-    .all();
-  return results ?? [];
-}
-
-// --- IP 预留 ---------------------------------------------------------------
-
-async function listReservations(env, networkId) {
-  if ((await ready(env)) === "memory") {
-    return [...memory.reservations.values()].filter((r) => r.network_id === networkId);
-  }
-  const { results } = await env.DB.prepare("SELECT * FROM reservations WHERE network_id = ?")
-    .bind(networkId)
-    .all();
-  return results ?? [];
-}
-
-async function putReservation(env, r) {
-  if ((await ready(env)) === "memory") {
-    memory.reservations.set(key(r.network_id, r.ip), { ...r });
-    return;
-  }
-  await env.DB.prepare(
-    `INSERT INTO reservations (network_id, ip, node_id, kind, note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(network_id, ip) DO UPDATE SET
-       node_id = excluded.node_id,
-       kind = excluded.kind,
-       note = excluded.note`,
-  )
-    .bind(r.network_id, r.ip, r.node_id, r.kind, r.note ?? "", r.created_at)
-    .run();
-}
-
-async function deleteReservation(env, networkId, ip) {
-  if ((await ready(env)) === "memory") {
-    memory.reservations.delete(key(networkId, ip));
-    return;
-  }
-  await env.DB.prepare("DELETE FROM reservations WHERE network_id = ? AND ip = ?")
-    .bind(networkId, ip)
-    .run();
-}
-
-/** 节点没了：自动预留一起删，用户指定的保留（换台机器重装还能拿回原地址）。 */
-async function dropAutoReservations(env, networkId, nodeId) {
-  if ((await ready(env)) === "memory") {
-    for (const [k, r] of [...memory.reservations.entries()]) {
-      if (r.network_id === networkId && r.node_id === nodeId && r.kind !== "user") {
-        memory.reservations.delete(k);
-      }
-    }
-    return;
-  }
-  await env.DB.prepare(
-    "DELETE FROM reservations WHERE network_id = ? AND node_id = ? AND kind != 'user'",
-  )
-    .bind(networkId, nodeId)
-    .run();
-}
-
-// --- 管理审计 --------------------------------------------------------------
 
 async function audit(env, action, target, detail = "", actor = "") {
   const row = {
@@ -2179,11 +1499,6 @@ async function audit(env, action, target, detail = "", actor = "") {
     detail: String(detail).slice(0, 400),
     actor: String(actor).slice(0, 40),
   };
-  if ((await ready(env)) === "memory") {
-    memory.audit.push(row);
-    if (memory.audit.length > 500) memory.audit.shift();
-    return;
-  }
   await env.DB.prepare(
     "INSERT INTO admin_actions (at, action, target, detail, actor) VALUES (?, ?, ?, ?, ?)",
   )
@@ -2192,9 +1507,7 @@ async function audit(env, action, target, detail = "", actor = "") {
 }
 
 async function listAudit(env, limit = 100) {
-  if ((await ready(env)) === "memory") {
-    return memory.audit.slice(-limit).reverse();
-  }
+  await ready(env);
   const { results } = await env.DB.prepare(
     "SELECT at, action, target, detail, actor FROM admin_actions ORDER BY id DESC LIMIT ?",
   )
@@ -2203,80 +1516,7 @@ async function listAudit(env, limit = 100) {
   return results ?? [];
 }
 
-async function pushEvent(env, networkId, nodeId, type, payload) {
-  const now = Date.now();
-  if ((await ready(env)) === "memory") {
-    memory.seq += 1;
-    memory.events.push({
-      id: memory.seq,
-      network_id: networkId,
-      node_id: nodeId,
-      type,
-      payload: JSON.stringify(payload),
-      created_at: now,
-    });
-    return;
-  }
-  await env.DB.prepare(
-    "INSERT INTO events (network_id, node_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-  )
-    .bind(networkId, nodeId, type, JSON.stringify(payload), now)
-    .run();
-}
 
-/** 节点被踢掉时清掉发给它的事件，否则它会一直读到过期的 punch_request。 */
-async function dropNodeEvents(env, networkId, nodeId) {
-  if ((await ready(env)) === "memory") {
-    memory.events = memory.events.filter(
-      (e) => !(e.network_id === networkId && e.node_id === nodeId),
-    );
-    return;
-  }
-  await env.DB.prepare("DELETE FROM events WHERE network_id = ? AND node_id = ?")
-    .bind(networkId, nodeId)
-    .run();
-}
-
-async function pullEvents(env, networkId, nodeId, since, limit, minCreatedAt = 0) {
-  if ((await ready(env)) === "memory") {
-    return memory.events
-      .filter(
-        (e) =>
-          e.network_id === networkId &&
-          (e.node_id === nodeId || e.node_id === BROADCAST) &&
-          e.id > since &&
-          e.created_at >= minCreatedAt,
-      )
-      .slice(0, limit);
-  }
-  const { results } = await env.DB.prepare(
-    `SELECT id, type, payload FROM events
-      WHERE network_id = ? AND node_id IN (?, '*') AND id > ? AND created_at >= ?
-      ORDER BY id LIMIT ?`,
-  )
-    .bind(networkId, nodeId, since, minCreatedAt, limit)
-    .all();
-  return results ?? [];
-}
-
-function memoryNodes() {
-  return memory.nodes.size;
-}
-
-function key(networkId, nodeId) {
-  return `${networkId}/${nodeId}`;
-}
-
-// ---------------------------------------------------------------------------
-// 地址分配：与客户端 derive_virtual_ip 完全一致
-// ---------------------------------------------------------------------------
-
-/**
- * 校验用户指定的虚拟地址。
- *
- * 服务端是唯一权威：客户端算出来的地址可能有冲突，这里必须拒绝而不是"帮它改"。
- * 返回错误响应，或 null 表示可用。
- */
 function validateVirtualIp(network, text, nodeId, others, reservations = []) {
   if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(text)) {
     return err(400, "invalid_virtual_ip", `虚拟地址必须是 a.b.c.d 形式：${text}`);
@@ -2365,9 +1605,7 @@ async function pickCidr(env, networkId) {
 }
 
 async function usedCidrs(env) {
-  if ((await ready(env)) === "memory") {
-    return new Set([...memory.networks.values()].map((n) => n.cidr));
-  }
+  await ready(env);
   const { results } = await env.DB.prepare("SELECT cidr FROM networks").all();
   return new Set((results ?? []).map((r) => r.cidr));
 }
@@ -2483,7 +1721,6 @@ function hex(bytes) {
 
 const SIGN_PREFIX = "qp2p1";
 const TS_WINDOW_MS = 120_000;
-const NONCE_TTL_MS = 300_000;
 
 /**
  * 规范 JSON：键按 Unicode 码点升序、无空白、非 ASCII 转义成 \\uXXXX。
@@ -2566,49 +1803,7 @@ function signingMessage(op, networkId, ts, nonce, digest) {
   return [SIGN_PREFIX, op, networkId, ts, nonce, digest].join("|");
 }
 
-/**
- * 校验一次签名请求。返回错误说明，或 null 表示通过。
- * `trackReplay` 为 true 时消费 nonce，重复提交会被拒。
- */
-async function verifySignedRequest({ env, op, networkId, body, pubkey, now, trackReplay }) {
-  const stamp = Number(body?.ts);
-  if (!Number.isFinite(stamp)) return "缺少 ts（毫秒时间戳）";
-  if (Math.abs(now - stamp) > TS_WINDOW_MS) return "ts 超出 ±120 秒窗口";
 
-  const nonce = String(body?.nonce ?? "").toLowerCase();
-  if (!/^[0-9a-f]{16,64}$/.test(nonce)) return "nonce 必须是 16~64 位十六进制";
-
-  let digest;
-  try {
-    digest = await bodyDigest(body);
-  } catch (e) {
-    // 请求体里有浮点 / 超出安全范围的整数：是客户端的问题，不能变成 500
-    return `请求体无法规范化：${e instanceof Error ? e.message : String(e)}`;
-  }
-  const message = signingMessage(op, networkId, stamp, nonce, digest);
-  const mismatch = await verifySignature(pubkey, message, body?.sig);
-  if (mismatch) return mismatch;
-
-  if (trackReplay && !(await consumeNonce(env, `${networkId}:${nonce}`, now))) {
-    return "nonce 已用过（疑似重放）";
-  }
-  return null;
-}
-
-async function consumeNonce(env, key, now) {
-  if ((await ready(env)) === "memory") {
-    const seen = memory.nonces.get(key);
-    if (seen && now - seen < NONCE_TTL_MS) return false;
-    memory.nonces.set(key, now);
-    return true;
-  }
-  const { meta } = await env.DB.prepare(
-    "INSERT INTO nonces (nonce, created_at) VALUES (?, ?) ON CONFLICT(nonce) DO NOTHING",
-  )
-    .bind(key, now)
-    .run();
-  return (meta?.changes ?? 0) > 0;
-}
 
 async function verifySignature(pubkey, message, sig) {
   const text = String(sig ?? "").toLowerCase();
@@ -2726,56 +1921,21 @@ let healthCache = { at: 0, nodes: null };
  * reservations/nonces 都已经搬进 DO，再对 D1 那几张表跑 4 条全表 DELETE 纯属浪费
  * 额度（每个 isolate 每 5 分钟一次）。
  */
-async function sweep(env, { dataPlane = true } = {}) {
+/**
+ * 控制面清理：登录失败记录与过期审计。
+ *
+ * 数据面（节点、事件、nonce、自动预留）在 DO 里，由 DO 自己的惰性 sweep 管。
+ * 升级前留下的旧表不再读写，也不再清理——它们的 TTL 早已过，留着不占写入额度。
+ */
+async function sweep(env) {
   const now = Date.now();
   if (now - sweeper.last < SWEEP_INTERVAL_MS) return 0;
   sweeper.last = now;
 
-  const staleCutoff = now - EVENT_TTL_MS;
-  const nodeCutoff = now - NODE_TTL_MS;
-
-  if (!env.DB) {
-    if (!dataPlane) return 0;
-    memory.events = memory.events.filter((e) => e.created_at >= staleCutoff);
-    for (const [key, node] of memory.nodes) {
-      if (node.last_seen < nodeCutoff) memory.nodes.delete(key);
-    }
-    // 节点没了，自动预留跟着清；用户手填的（kind=user）一直留着
-    for (const [k, r] of [...memory.reservations.entries()]) {
-      if (r.kind === "user") continue;
-      const owner = memory.nodes.get(key(r.network_id, r.node_id));
-      if (!owner) memory.reservations.delete(k);
-    }
-    for (const [key, at] of memory.nonces) {
-      if (at < now - NONCE_TTL_MS) memory.nonces.delete(key);
-    }
-    return 0;
-  }
-
-  let changes = 0;
-  if (dataPlane) {
-    const { meta } = await env.DB.prepare("DELETE FROM events WHERE created_at < ?")
-      .bind(staleCutoff)
-      .run();
-    changes = meta?.changes ?? 0;
-    await env.DB.prepare("DELETE FROM nodes WHERE last_seen < ?").bind(nodeCutoff).run();
-    await env.DB.prepare(
-      `DELETE FROM reservations
-        WHERE kind != 'user'
-          AND NOT EXISTS (
-            SELECT 1 FROM nodes n
-             WHERE n.network_id = reservations.network_id AND n.node_id = reservations.node_id
-          )`,
-    ).run();
-    await env.DB.prepare("DELETE FROM nonces WHERE created_at < ?")
-      .bind(now - NONCE_TTL_MS)
-      .run();
-  }
-  // 控制面：管理页登录失败记录，与引擎无关，一直要清
   await env.DB.prepare("DELETE FROM login_attempts WHERE last_at < ?")
     .bind(now - 24 * 60 * 60_000)
     .run();
-  return changes;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------

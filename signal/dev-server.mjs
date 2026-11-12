@@ -5,16 +5,22 @@
  *   ADMIN_SECRET=dev node signal/dev-server.mjs 9000
  *
  * 之后就可以用 curl 或 `node signal/smoke.mjs --remote http://127.0.0.1:8787` 打它。
- * 存储用 Node 内置 SQLite 冒充 D1，重启即清空。
+ * 存储：D1 与 Durable Object 都用 Node 内置 SQLite 冒充，重启即清空。
+ * 注意：WebSocket 升级在这条 Node HTTP 链路上不可用（要用 wrangler dev 验），
+ * 这里只适合验 HTTP 接口与管理面。
  */
 
 import { createServer } from "node:http";
 
 import worker from "./worker.js";
 import { fakeD1 } from "./fake-d1.mjs";
+import { fakeRoomBinding } from "./fake-room.mjs";
 
 const port = Number(process.argv[2] ?? 8787);
+// 数据面在 Durable Object 里：本地用 SQLite 替身顶替 ROOM，
+// 这样 dev-server 跑的是和线上同一套代码路径（legacy 引擎已退役）。
 const env = { ADMIN_SECRET: process.env.ADMIN_SECRET ?? "dev", DB: fakeD1() };
+env.ROOM = fakeRoomBinding(env);
 const ctx = { waitUntil: () => {} };
 
 if (!process.env.ADMIN_SECRET) {
