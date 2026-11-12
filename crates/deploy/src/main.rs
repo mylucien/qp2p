@@ -358,15 +358,14 @@ async fn cmd_up(args: &Args) -> Result<()> {
 
 async fn cmd_status(args: &Args) -> Result<()> {
     let st = state::load()?;
+    let worker = if st.worker.is_empty() {
+        args.worker.clone()
+    } else {
+        st.worker.clone()
+    };
+
     println!("状态文件 : {}", state::path_display());
-    println!(
-        "Worker   : {}",
-        if st.worker.is_empty() {
-            &args.worker
-        } else {
-            &st.worker
-        }
-    );
+    println!("Worker   : {worker}");
     println!(
         "账号     : {}",
         if st.account_id.is_empty() {
@@ -375,23 +374,49 @@ async fn cmd_status(args: &Args) -> Result<()> {
             &st.account_id
         }
     );
+
+    // 本地没有记录是常态（手工上传过、换了机器、或者别人部署的），
+    // 这时别急着说"从未部署"——去线上问一句脚本在不在、子域是什么。
+    let mut subdomain = st.subdomain.clone();
+    let mut remote: Option<bool> = None;
+    if st.migration_tag.is_empty() || subdomain.is_empty() {
+        if let Ok(cf) = client_from_env() {
+            remote = cf.script_exists(&worker).await.ok();
+            if subdomain.is_empty() {
+                if let Ok(s) = cf.subdomain().await {
+                    subdomain = s;
+                }
+            }
+        }
+    }
+
     println!(
         "上次标签 : {}",
-        if st.migration_tag.is_empty() {
-            "<从未成功部署>"
+        if !st.migration_tag.is_empty() {
+            st.migration_tag.clone()
         } else {
-            &st.migration_tag
+            match remote {
+                Some(true) => "<本地无记录，线上已存在>".to_string(),
+                Some(false) => "<线上不存在>".to_string(),
+                None => "<本地无记录>".to_string(),
+            }
         }
     );
 
-    let url = workers_dev_url(&args.worker, &st.subdomain);
+    let url = workers_dev_url(&worker, &subdomain);
     if url.is_empty() {
-        println!("线上     : 没有记录子域，跳过探测");
+        println!("线上     : 查不到子域，跳过探测（可指定 --worker 或跑一次 init/up）");
         return Ok(());
     }
     match verify::health(&url, None).await {
         Ok(report) => println!("线上     : {}（{url}）", report.describe()),
-        Err(e) => println!("线上     : 探测失败 —— {e:#}"),
+        Err(e) => {
+            println!("线上     : 探测失败 —— {e:#}");
+            // 绑了自定义域名的部署，workers.dev 这条路本来就不通，别让人以为挂了
+            println!(
+                "           绑了自定义域名的话这是正常的，改用你自己的域名访问 /v1/health 验证"
+            );
+        }
     }
     Ok(())
 }
