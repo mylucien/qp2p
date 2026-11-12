@@ -894,6 +894,9 @@ async function reservationCounts(env) {
  */
 async function deleteNetworkRow(env, networkId) {
   await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
+  // 预留备份也要一起删：否则同名网络重建时（例如测试里反复用 "home"）会把上一条
+  // 网络的手填 IP 当成"历史预留"恢复出来，表现为"这个地址已被另一个节点预留"。
+  await env.DB.prepare("DELETE FROM reservations WHERE network_id = ?").bind(networkId).run();
   invalidateNetwork(env, networkId);
 }
 

@@ -296,6 +296,27 @@ async function run() {
   check("踢人后对端收到 peer_offline", offlines(aliceSock).length === 1, aliceSock.recv);
 
   // ---------------------------------------------------------------- ⑥ sweep 节流
+  console.log("\n⑤b 删网要把 D1 里的预留备份一起清掉");
+  await call(env, "POST", `/v1/admin/networks/${net.id}/reservations`, {
+    admin: ADMIN,
+    body: { ip: "10.99.0.250" },
+  }).catch(() => null);
+  room.putReservation({ ip: "10.99.0.250", node_id: "", kind: "user", note: "", created_at: Date.now() });
+  await room.backupReservation({ ip: "10.99.0.250", node_id: "", kind: "user", note: "", created_at: Date.now() }, "put");
+  await sleep(300);
+  const backupBefore = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM reservations WHERE network_id = ?",
+  ).bind(net.id).first();
+  const del2 = await call(env, "DELETE", `/v1/admin/networks/${net.id}`, {
+    admin: ADMIN,
+    body: { confirm: net.id },
+  });
+  const backupAfter = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM reservations WHERE network_id = ?",
+  ).bind(net.id).first();
+  check("删网前备份表里有行", Number(backupBefore?.n ?? 0) > 0, backupBefore);
+  check("删网后备份表清空", del2.status === 200 && Number(backupAfter?.n ?? 0) === 0, backupAfter);
+
   console.log("\n⑥ sweep 的 5 分钟节流在休眠唤醒后仍然有效");
   room.sweep();
   check("last_sweep 已写进 meta", !!room.getMeta("last_sweep"), room.getMeta("last_sweep"));
