@@ -136,6 +136,13 @@ class Qp2pVpnService : VpnService() {
             }
         }
 
+        // 「启动连接」可能在 App 重新打开时重复拉起服务；已有会话就别开第二条隧道
+        if (intent?.action == ACTION_CONNECT &&
+            (phase == Phase.CONNECTED || phase == Phase.CONNECTING)
+        ) {
+            return START_STICKY
+        }
+
         val config = intent?.getStringExtra(EXTRA_CONFIG)
         if (config.isNullOrBlank()) {
             setState(Phase.ERROR, "缺少配置", "回到 App 里重新点一次连接")
@@ -143,7 +150,7 @@ class Qp2pVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
-        // 省电档位在启动时定下来：改档位要重连才生效，界面会提示
+        // 直连保持档位在启动时定下来：改档位要重连才生效，界面会提示
         runCatching {
             val json = JSONObject(config)
             keepOnline = json.optBoolean("keep_online", false)

@@ -18,19 +18,24 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import org.json.JSONObject
 import kotlin.math.roundToInt
 
 /**
- * 一页式界面：上面看状态，中间填配置，下面选省电策略。
+ * 一页式界面：状态卡 + 告警条 + 一张连接信息卡片 + 两个按钮。
+ *
+ * 「启动连接」开关和「连接」按钮是两件事：开关打开则每次打开 App 自动入网；
+ * 开关没打开时，打开 App 需要手动点「连接」。文案刻意不叫「自动连接」，避免混淆。
  *
  * 刻意不引入 AndroidX —— 少一个依赖就少一处 CI 上可能挂的地方。
  * 所有提示都做在页面里（状态卡 + 内联告警条），**不用 Toast、不用对话框**：
@@ -59,7 +64,8 @@ class MainActivity : Activity() {
     private lateinit var bannerBody: TextView
 
     private lateinit var keepSwitch: Switch
-    private lateinit var idleGroup: RadioGroup
+    private lateinit var autoSwitch: Switch
+    private lateinit var idleSpinner: Spinner
     private lateinit var idleLabel: TextView
     private lateinit var powerHint: TextView
 
@@ -80,6 +86,9 @@ class MainActivity : Activity() {
 
     /** 加载配置时不要触发"已保存"提示 */
     private var loading = false
+
+    /** Spinner 设 adapter 时会回调一次 onItemSelected，那次不是用户操作 */
+    private var spinnerSettling = true
 
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -122,12 +131,34 @@ class MainActivity : Activity() {
             syncPowerUi()
             flash(if (Qp2pVpnService.connected) "已保存，重连后生效" else "已保存")
         }
-        idleGroup.setOnCheckedChangeListener { _, checkedId ->
-            if (loading || checkedId == View.NO_ID) return@setOnCheckedChangeListener
-            prefs.edit().putInt("idle_minutes", minutesOf(checkedId)).apply()
-            flash(if (Qp2pVpnService.connected) "已保存，重连后生效" else "已保存")
+        autoSwitch.setOnCheckedChangeListener { _, checked ->
+            if (loading) return@setOnCheckedChangeListener
+            prefs.edit().putBoolean("auto_connect", checked).apply()
+            flash(if (checked) "已保存，下次打开 App 直接入网" else "已保存")
+        }
+        idleSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?, view: View?, position: Int, id: Long
+            ) {
+                if (loading || spinnerSettling) return
+                prefs.edit().putInt("idle_minutes", idleMinutes()).apply()
+                flash(if (Qp2pVpnService.connected) "已保存，重连后生效" else "已保存")
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
         powerHint.setOnClickListener { openBatterySettings() }
+        // adapter 初始化那次回调排在前面，等它过去再允许用户操作触发保存
+        ui.post { spinnerSettling = false }
+
+        // 「启动连接」只在冷启动生效：旋转屏幕、VPN 授权回来都不重复触发。
+        // 已连上时不重复发起；Service 侧也做了幂等，防止 App 进程重建再次拉起隧道。
+        if (savedInstanceState == null &&
+            prefs.getBoolean("auto_connect", false) &&
+            !Qp2pVpnService.connected
+        ) {
+            ui.post { ensurePermissionThenConnect() }
+        }
 
         // 状态由 Service 在后台更新，这里定时捞一次，省掉跨进程广播的复杂度
         ui.post(object : Runnable {
@@ -168,21 +199,13 @@ class MainActivity : Activity() {
                 textSize = 24f
                 setTextColor(INK)
                 setTypeface(typeface, Typeface.BOLD)
-            }
-        )
-        root.addView(
-            TextView(this).apply {
-                text = "点对点组网 · 只接管虚拟网段"
-                textSize = 13f
-                setTextColor(MUTED)
-                setPadding(0, dp(2), 0, dp(14))
+                setPadding(0, 0, 0, dp(14))
             }
         )
 
         root.addView(buildStatusCard())
         root.addView(buildBanner())
-        root.addView(buildFormCard(), cardParams(top = 14))
-        root.addView(buildPowerCard(), cardParams(top = 12))
+        root.addView(buildFormCard(), cardParams(top = 2))
         root.addView(
             buildButtons(),
             LinearLayout.LayoutParams(
@@ -190,29 +213,6 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(14) },
         )
-
-        // 说明贴底：内容不满一屏时也不会在下方留一大块空白
-        val footer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.BOTTOM
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
-            setPadding(0, dp(16), 0, 0)
-        }
-        footer.addView(
-            TextView(this).apply {
-                text = "只接管虚拟网段（10.x），公网照旧走系统网络，不做全局代理。\n" +
-                    "需要先在有公网的机器上用 qp2p create 建好网络。\n" +
-                    "信令地址、令牌、省电策略的改动都在下一次连接时生效。"
-                textSize = 12f
-                setTextColor(MUTED)
-                setLineSpacing(dp(3).toFloat(), 1f)
-            }
-        )
-        root.addView(footer)
         return scroll
     }
 
@@ -326,114 +326,138 @@ class MainActivity : Activity() {
             text = ""
             setTextColor(MUTED)
             textSize = 12f
-            setPadding(dp(2), dp(6), 0, 0)
+            setPadding(dp(2), dp(6), 0, dp(2))
         }
         card.addView(subnetHint)
-        return card
-    }
 
-    private fun buildPowerCard(): LinearLayout {
-        val card = card()
-        card.addView(sectionTitle("省电"))
+        card.addView(
+            View(this).apply {
+                setBackgroundColor(BORDER)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+                ).apply {
+                    topMargin = dp(10)
+                    bottomMargin = dp(14)
+                }
+            }
+        )
 
-        val row = LinearLayout(this).apply {
+        keepSwitch = tintedSwitch()
+        card.addView(switchRow("保持在线", keepSwitch))
+
+        val idleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(12) }
         }
-        val left = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        idleLabel = TextView(this).apply {
+            text = "直连保持"
+            textSize = 15f
+            setTextColor(INK)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        left.addView(
-            TextView(this).apply {
-                text = "保持在线"
-                textSize = 15f
-                setTextColor(INK)
-            }
-        )
-        left.addView(
-            TextView(this).apply {
-                text = "锁屏后也不断开长连接，消息随时能到；会多耗一点电"
-                textSize = 12f
-                setTextColor(MUTED)
-                setPadding(0, dp(3), dp(8), 0)
-                setLineSpacing(dp(2).toFloat(), 1f)
-            }
-        )
-        keepSwitch = Switch(this).apply {
-            thumbTintList = ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(GREEN, Color.parseColor("#C7CBD1")),
-            )
-            trackTintList = ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(Color.parseColor("#BBF7D0"), Color.parseColor("#E5E7EB")),
-            )
+        idleSpinner = Spinner(this).apply {
+            background = roundRect(Color.parseColor("#FBFCFD"), 10, 1, BORDER)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
         }
-        row.addView(left)
-        row.addView(keepSwitch)
-        card.addView(row)
-
-        idleLabel = label("空闲多久断开直连", top = 16)
-        card.addView(idleLabel)
-
-        idleGroup = RadioGroup(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        listOf(10, 30, 60).forEach { minutes ->
-            val rb = RadioButton(this).apply {
-                id = View.generateViewId()
-                text = "$minutes 分钟"
-                textSize = 14f
-                tag = minutes
-                setTextColor(INK)
-                buttonTintList = ColorStateList(
-                    arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                    intArrayOf(GREEN, Color.parseColor("#9CA3AF")),
-                )
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val labels = IDLE_MINUTES.map { "$it 分钟" }
+        val adapter = object : ArrayAdapter<String>(
+            this@MainActivity, android.R.layout.simple_spinner_item, labels
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val v = super.getView(position, convertView, parent) as TextView
+                v.text = "${labels[position]}  ▾"
+                v.setTextColor(INK)
+                v.textSize = 15f
+                return v
             }
-            idleGroup.addView(rb)
         }
-        card.addView(idleGroup)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        idleSpinner.adapter = adapter
+        idleRow.addView(idleLabel)
+        idleRow.addView(idleSpinner)
+        card.addView(idleRow)
 
+        autoSwitch = tintedSwitch()
+        card.addView(switchRow("启动连接", autoSwitch))
+
+        // 只有选了「保持在线」且系统确实限制后台时才出现，平时不占版面
         powerHint = TextView(this).apply {
-            text = ""
+            text = "系统仍可能限制后台：点这里打开电池优化设置，把 qp2p 设为不限制"
             textSize = 12f
             setTextColor(BLUE)
-            setPadding(0, dp(10), 0, 0)
             visibility = View.GONE
         }
         card.addView(powerHint)
         return card
     }
 
-    private fun buildButtons(): LinearLayout {
+    private fun tintedSwitch(): Switch = Switch(this).apply {
+        thumbTintList = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(GREEN, Color.parseColor("#C7CBD1")),
+        )
+        trackTintList = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(Color.parseColor("#BBF7D0"), Color.parseColor("#E5E7EB")),
+        )
+    }
+
+    private fun switchRow(text: String, sw: Switch): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(12) }
         }
-        connectButton = Button(this).apply {
-            text = "自动连接"
-            textSize = 16f
-            isAllCaps = false
-            background = roundRect(BLUE, 12)
-            setTextColor(Color.WHITE)
-            stateListAnimator = null
+        row.addView(
+            TextView(this).apply {
+                this.text = text
+                textSize = 15f
+                setTextColor(INK)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+        )
+        row.addView(sw)
+        return row
+    }
+
+    private fun buildButtons(): LinearLayout {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
         saveButton = Button(this).apply {
-            text = "保存"
+            text = "保存配置"
             textSize = 16f
             isAllCaps = false
             background = roundRect(Color.WHITE, 12, 1, BORDER)
             setTextColor(INK)
             stateListAnimator = null
         }
-        row.addView(
-            connectButton,
-            LinearLayout.LayoutParams(0, dp(52), 2f).apply { rightMargin = dp(10) },
+        connectButton = Button(this).apply {
+            text = "连接"
+            textSize = 16f
+            isAllCaps = false
+            background = roundRect(BLUE, 12)
+            setTextColor(Color.WHITE)
+            stateListAnimator = null
+        }
+        col.addView(
+            saveButton,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)),
         )
-        row.addView(saveButton, LinearLayout.LayoutParams(0, dp(52), 1f))
-        return row
+        col.addView(
+            connectButton,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply {
+                topMargin = dp(10)
+            },
+        )
+        return col
     }
 
     private fun card() = LinearLayout(this).apply {
@@ -560,8 +584,9 @@ class MainActivity : Activity() {
             else -> Qp2pVpnService.detail
         }
 
-        // 已连接用白底绿框的"断开连接"，绿色始终是"在线"的意思
-        connectButton.text = if (phase == Qp2pVpnService.Phase.CONNECTED) "断开连接" else "自动连接"
+        // 已连接时切成白底绿框的「断开连接」；平时一律叫「连接」。
+        // 文案不叫「自动连接」——那是上面「启动连接」开关的功能，两者不能混。
+        connectButton.text = if (phase == Qp2pVpnService.Phase.CONNECTED) "断开连接" else "连接"
         if (phase == Qp2pVpnService.Phase.CONNECTED) {
             connectButton.background = roundRect(Color.WHITE, 12, 1, GREEN)
             connectButton.setTextColor(GREEN)
@@ -691,24 +716,18 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // 省电
+    // 连接行为
     // ------------------------------------------------------------------
 
     private fun syncPowerUi() {
-        if (!::idleGroup.isInitialized) return
+        if (!::idleSpinner.isInitialized) return
         val keep = keepSwitch.isChecked
-        idleGroup.alpha = if (keep) 0.4f else 1f
-        for (i in 0 until idleGroup.childCount) {
-            idleGroup.getChildAt(i).isEnabled = !keep
-        }
-        idleLabel.setTextColor(if (keep) HINT else SUBTLE)
-
-        if (keep && !isIgnoringBatteryOptimizations()) {
-            powerHint.text = "系统仍可能限制后台：点这里打开电池优化设置，把 qp2p 设为不限制"
-            powerHint.visibility = View.VISIBLE
-        } else {
-            powerHint.visibility = View.GONE
-        }
+        idleSpinner.isEnabled = !keep
+        idleSpinner.alpha = if (keep) 0.4f else 1f
+        idleLabel.setTextColor(if (keep) HINT else INK)
+        // 电池优化提示只在选了「保持在线」且系统确实限制后台时才出现
+        powerHint.visibility =
+            if (keep && !isIgnoringBatteryOptimizations()) View.VISIBLE else View.GONE
     }
 
     private fun isIgnoringBatteryOptimizations(): Boolean = try {
@@ -727,21 +746,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun minutesOf(id: Int): Int {
-        for (i in 0 until idleGroup.childCount) {
-            val child = idleGroup.getChildAt(i)
-            if (child.id == id) return child.tag as Int
-        }
-        return 10
-    }
+    private fun idleMinutes(): Int =
+        IDLE_MINUTES.getOrElse(idleSpinner.selectedItemPosition) { IDLE_MINUTES[0] }
 
-    private fun minutesToId(minutes: Int): Int {
-        for (i in 0 until idleGroup.childCount) {
-            val child = idleGroup.getChildAt(i)
-            if (child.tag as Int == minutes) return child.id
-        }
-        return idleGroup.getChildAt(0).id
-    }
+    private fun idlePosition(minutes: Int): Int =
+        IDLE_MINUTES.indexOf(minutes).coerceAtLeast(0)
 
     // ------------------------------------------------------------------
     // 配置
@@ -766,7 +775,8 @@ class MainActivity : Activity() {
         nameInput.setText(prefs.getString("name", ""))
         ipInput.setText(prefs.getString("virtual_ip", ""))
         keepSwitch.isChecked = prefs.getBoolean("keep_online", false)
-        idleGroup.check(minutesToId(prefs.getInt("idle_minutes", 10)))
+        autoSwitch.isChecked = prefs.getBoolean("auto_connect", false)
+        idleSpinner.setSelection(idlePosition(prefs.getInt("idle_minutes", 10)))
         loading = false
         syncPowerUi()
     }
@@ -778,7 +788,8 @@ class MainActivity : Activity() {
             .putString("name", nameInput.text.toString().trim())
             .putString("virtual_ip", ipInput.text.toString().trim())
             .putBoolean("keep_online", keepSwitch.isChecked)
-            .putInt("idle_minutes", minutesOf(idleGroup.checkedRadioButtonId))
+            .putBoolean("auto_connect", autoSwitch.isChecked)
+            .putInt("idle_minutes", idleMinutes())
             .apply()
     }
 
@@ -795,7 +806,7 @@ class MainActivity : Activity() {
         json.put("bind", "0.0.0.0:0")
         val keep = keepSwitch.isChecked
         json.put("keep_online", keep)
-        json.put("idle_secs", if (keep) 0 else minutesOf(idleGroup.checkedRadioButtonId) * 60)
+        json.put("idle_secs", if (keep) 0 else idleMinutes() * 60)
         return json.toString()
     }
 
@@ -961,6 +972,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQUEST_VPN = 1001
+        val IDLE_MINUTES = listOf(10, 30, 60)
 
         val BG = Color.parseColor("#F4F6F8")
         val INK = Color.parseColor("#1F2329")
