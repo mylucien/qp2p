@@ -914,6 +914,33 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   check("审计记录踢下线", actions.includes("node.kick"), actions);
   check("审计记录预留", actions.includes("reservation.put"), actions);
 
+  // 审计分页：服务端筛选 + 总数 + 页码钳制，旧 limit 参数保持兼容
+  const auditP1 = await call("GET", "/v1/admin/audit?page=1&page_size=3", { admin: secret });
+  const auditP2 = await call("GET", "/v1/admin/audit?page=2&page_size=3", { admin: secret });
+  check(
+    "审计分页返回总数与页数",
+    auditP1.status === 200 && typeof auditP1.body.total === "number" &&
+      auditP1.body.pages >= 1 && auditP1.body.page === 1,
+    auditP1.body,
+  );
+  check("审计每页不超过 3 条", (auditP1.body.actions ?? []).length <= 3, auditP1.body.actions?.length);
+  const auditKey = (a) => `${a.at}|${a.action}|${a.target}|${a.detail}`;
+  const p1Keys = (auditP1.body.actions ?? []).map(auditKey);
+  const p2Keys = (auditP2.body.actions ?? []).map(auditKey);
+  check("审计两页不重叠", p1Keys.every((k) => !p2Keys.includes(k)), p2Keys);
+  const auditKind = await call("GET", "/v1/admin/audit?page=1&page_size=20&kind=login.", { admin: secret });
+  check(
+    "审计按类别筛选",
+    (auditKind.body.actions ?? []).every((a) => String(a.action).startsWith("login.")),
+    auditKind.body.actions,
+  );
+  const auditQ = await call("GET", "/v1/admin/audit?page=1&page_size=20&q=admin", { admin: secret });
+  check("审计搜索不越页", (auditQ.body.actions ?? []).length <= 20, auditQ.body.actions?.length);
+  const auditFar = await call("GET", "/v1/admin/audit?page=9999&page_size=3", { admin: secret });
+  check("审计越界页码钳到最后一页", auditFar.body.page === auditFar.body.pages, auditFar.body);
+  const auditLegacy = await call("GET", "/v1/admin/audit?limit=50", { admin: secret });
+  check("审计旧 limit 参数仍可用", Array.isArray(auditLegacy.body.actions), auditLegacy.body);
+
   const status1 = await call("GET", "/v1/admin/status");
   check("管理状态可查", status1.status === 200, status1.body);
 

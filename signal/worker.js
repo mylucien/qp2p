@@ -851,11 +851,30 @@ async function listReservationsAdmin(request, env, networkId) {
   return res;
 }
 
+/** 管理台只认这几种动作前缀，避免把任意 LIKE 通配符带进 SQL。 */
+const AUDIT_KINDS = ["network.", "node.", "reservation.", "login.", "admin."];
+
+function auditInt(value, fallback, min, max) {
+  const n = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 async function auditLog(request, env, url) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
-  const limit = Number(url.searchParams.get("limit") ?? 100) || 100;
-  return json({ ok: true, actions: await listAudit(env, limit) });
+  const p = url.searchParams;
+  // 旧调用（?limit=50）保持原样：只回最近 N 条，不带分页字段
+  const paging = p.has("page") || p.has("page_size") || p.has("kind") || p.has("q");
+  if (!paging) {
+    const limit = Number(p.get("limit") ?? 100) || 100;
+    return json({ ok: true, actions: await listAudit(env, limit) });
+  }
+  const pageSize = auditInt(p.get("page_size") ?? p.get("limit"), 20, 1, 100);
+  const page = auditInt(p.get("page"), 1, 1, 100_000);
+  const kind = AUDIT_KINDS.includes(p.get("kind")) ? p.get("kind") : "";
+  const q = (p.get("q") ?? "").trim().slice(0, 100);
+  return json(await listAuditPage(env, { page, pageSize, kind, q }));
 }
 
 async function allNetworks(env) {
@@ -1539,6 +1558,50 @@ async function listAudit(env, limit = 100) {
   return results ?? [];
 }
 
+/**
+ * 审计分页：筛选和搜索都下推到 D1，管理台不用把全部历史拉到浏览器。
+ * 用 instr(lower(...)) 而不是 LIKE 做搜索，用户输入里的 % / _ 不会被当成通配符。
+ */
+async function listAuditPage(env, { page, pageSize, kind, q }) {
+  await ready(env);
+  const where = [];
+  const args = [];
+  if (kind) {
+    where.push("action LIKE ?");
+    args.push(`${kind}%`);
+  }
+  if (q) {
+    where.push(
+      "(instr(lower(action), lower(?)) > 0 OR instr(lower(target), lower(?)) > 0" +
+        " OR instr(lower(detail), lower(?)) > 0 OR instr(lower(actor), lower(?)) > 0)",
+    );
+    args.push(q, q, q, q);
+  }
+  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM admin_actions ${clause}`)
+    .bind(...args)
+    .first();
+  const total = Number(row?.n ?? 0);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  // 筛选后页数可能变小，把越界的页码钳回最后一页
+  const safePage = Math.min(page, pages);
+  const { results } = await env.DB.prepare(
+    `SELECT at, action, target, detail, actor FROM admin_actions ${clause}` +
+      " ORDER BY id DESC LIMIT ? OFFSET ?",
+  )
+    .bind(...args, pageSize, (safePage - 1) * pageSize)
+    .all();
+  return {
+    ok: true,
+    actions: results ?? [],
+    total,
+    page: safePage,
+    page_size: pageSize,
+    pages,
+  };
+}
+
 
 function validateVirtualIp(network, text, nodeId, others, reservations = []) {
   if (!/^(\d{1,3})(\.\d{1,3}){3}$/.test(text)) {
@@ -2114,6 +2177,14 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:10px;
         </div>
       </div>
       <div class="scroll"><table><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody id="audit"></tbody></table></div>
+      <div class="row" style="justify-content:space-between;align-items:center;margin-top:10px">
+        <span class="muted" id="auditInfo">共 0 条</span>
+        <div class="row" style="gap:10px">
+          <button class="sm" id="auditPrev">上一页</button>
+          <span class="muted" id="auditPage">第 1 / 1 页</span>
+          <button class="sm" id="auditNext">下一页</button>
+        </div>
+      </div>
     </section>
   </div>
 </main>
@@ -2193,20 +2264,25 @@ function load(){
   });
   loadAudit();
 }
-function loadAudit(){
-  var kind = $('auditKind').value, q = $('auditSearch').value.trim().toLowerCase();
-  api('/v1/admin/audit?limit=200').then(function(j){
-    var rows = (j.actions||[]).filter(function(a){
-      if (kind && String(a.action).indexOf(kind) !== 0) return false;
-      if (q) {
-        var hay = (a.action+' '+a.target+' '+a.detail+' '+(a.actor||'')).toLowerCase();
-        if (hay.indexOf(q) < 0) return false;
-      }
-      return true;
-    });
+var auditCur = 1, auditPages = 1, auditTotal = 0, auditTimer = 0;
+function loadAudit(page){
+  if (typeof page === 'number') auditCur = page;
+  var kind = $('auditKind').value, q = $('auditSearch').value.trim();
+  var path = '/v1/admin/audit?page='+auditCur+'&page_size=20'+
+    '&kind='+encodeURIComponent(kind)+'&q='+encodeURIComponent(q);
+  api(path).then(function(j){
+    var rows = j.actions || [];
+    auditTotal = j.total || 0;
+    auditPages = Math.max(1, j.pages || 1);
+    auditCur = j.page || auditCur;
     renderAudit(rows);
+    $('auditInfo').textContent = '共 '+auditTotal+' 条' + (rows.length ? '，本页 '+rows.length+' 条' : '');
+    $('auditPage').textContent = '第 '+auditCur+' / '+auditPages+' 页';
+    $('auditPrev').disabled = auditCur <= 1;
+    $('auditNext').disabled = auditCur >= auditPages;
   }).catch(function(){});
 }
+function resetAudit(){ auditCur = 1; loadAudit(); }
 
 function renderNets(list){
   nets = list;
@@ -2435,8 +2511,13 @@ $('exportResv').onclick = function(){
   });
   download('qp2p-reservations.csv', rows);
 };
-$('auditKind').onchange = loadAudit;
-$('auditSearch').oninput = loadAudit;
+$('auditKind').onchange = resetAudit;
+$('auditSearch').oninput = function(){
+  clearTimeout(auditTimer);
+  auditTimer = setTimeout(resetAudit, 250);
+};
+$('auditPrev').onclick = function(){ if (auditCur > 1) loadAudit(auditCur - 1); };
+$('auditNext').onclick = function(){ if (auditCur < auditPages) loadAudit(auditCur + 1); };
 
 // 打开页面：先问服务端是否已初始化账号
 api('/v1/admin/status').then(function(j){
