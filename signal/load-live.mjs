@@ -207,6 +207,11 @@ async function main() {
     wsFail,
   });
 
+  // 先按真实客户端的行为发一次 ping：在线判定看的是自动应答时间戳，
+  // 刚握完手还没 ping 的节点只能靠 joinedAt 的 75 秒宽限，铺开建连时会过期。
+  for (const c of conns) c.ws.send("ping");
+  await sleep(2_000);
+
   console.log("\n4. 管理面看到的在线数");
   const list = await api("GET", `/v1/admin/networks/${netId}/nodes`, { admin: ADMIN });
   const rows = list.body.nodes ?? [];
