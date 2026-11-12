@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.8.0";
+const VERSION = "2.8.1";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
