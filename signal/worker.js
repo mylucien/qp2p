@@ -575,7 +575,7 @@ async function rotateJoinKey(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const body = (await readJson(request)) ?? {};
@@ -652,7 +652,7 @@ async function deleteNetwork(request, env, networkId) {
     );
   }
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   // 先让 DO 把节点/事件/预留清掉，再删控制面那一行：反过来的话，
@@ -674,7 +674,7 @@ async function updateNetwork(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
   if (!roomStub(env, net)) return roomUnavailable();
 
@@ -733,7 +733,7 @@ async function listNetworkNodes(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const res = await roomAdminApi(env, net, "/i/admin/nodes");
@@ -746,7 +746,7 @@ async function kickNode(request, env, networkId, nodeId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const res = await roomAdminApi(env, net, "/i/admin/kick", {
@@ -770,7 +770,7 @@ async function kickNodes(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const body = (await readJson(request)) ?? {};
@@ -799,7 +799,7 @@ async function reserveIp(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
   if (!roomStub(env, net)) return roomUnavailable();
 
@@ -826,7 +826,7 @@ async function releaseIp(request, env, networkId, ip) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const res = await roomAdminApi(env, net, "/i/admin/release", { method: "POST", body: { ip } });
@@ -843,7 +843,7 @@ async function listReservationsAdmin(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
-  const net = await getNetwork(env, networkId);
+  const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
 
   const res = await roomAdminApi(env, net, "/i/admin/reservations");
@@ -1475,6 +1475,26 @@ async function getNetwork(env, id) {
   if (hit && Date.now() - hit.at < NET_CACHE_TTL_MS) return { ...hit.net };
 
   const net = await env.DB.prepare("SELECT * FROM networks WHERE network_id = ?").bind(id).first();
+  if (net) box.set(id, { at: Date.now(), net: { ...net } });
+  else box.delete(id);
+  return net;
+}
+
+/**
+ * 管理面专用：绕过缓存直接读 D1。
+ *
+ * 缓存是为了压热路径（每个请求、每次握手都要校验令牌）的读次数，代价是最多滞后
+ * 15 秒，而且**跨 isolate 各存各的**。管理动作（删网、改名、换密钥）之后要立刻看到
+ * 结果，所以这些地方必须读主库；读到之后顺手把缓存更新成最新值。
+ */
+async function getNetworkFresh(env, id) {
+  await ready(env);
+  const net = await env.DB.prepare("SELECT * FROM networks WHERE network_id = ?").bind(id).first();
+  let box = netCache.get(env.DB);
+  if (!box) {
+    box = new Map();
+    netCache.set(env.DB, box);
+  }
   if (net) box.set(id, { at: Date.now(), net: { ...net } });
   else box.delete(id);
   return net;
