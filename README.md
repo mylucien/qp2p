@@ -36,7 +36,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 ## 下载与安装
 
-当前最新版：[v0.1.6](https://github.com/mylucien/qp2p/releases/tag/v0.1.6)。
+当前最新版：[v0.1.7](https://github.com/mylucien/qp2p/releases/tag/v0.1.7)。
 每个 Release 有 10 个附件：5 个客户端、4 个服务端部署器、1 个 `SHA256SUMS.txt`。
 
 **客户端**（照着下表选一个）：
