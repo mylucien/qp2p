@@ -93,14 +93,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.4-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.4-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.4-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.4-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 8+ | `qp2p-0.1.4-android.apk` | VpnService，debug 签名 |
+| Windows 10/11 x64 | `qp2p-0.1.6-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.6-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.6-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.6-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 8+ | `qp2p-0.1.6-android.apk` | VpnService，debug 签名 |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
-`qp2p-deploy-0.1.4-<平台>`，同样有 `SHA256SUMS.txt` 校验。
+`qp2p-deploy-0.1.6-<平台>`，同样有 `SHA256SUMS.txt` 校验。
 
 下载后先校验：
 
@@ -111,8 +111,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.4-linux-x86_64-static
-sudo mv qp2p-0.1.4-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.6-linux-x86_64-static
+sudo mv qp2p-0.1.6-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -204,7 +204,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.4 · 网络 home
+qp2p 0.1.6 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
@@ -430,7 +430,7 @@ curl -H "x-admin-secret: $ADMIN" https://你的-worker/v1/admin/networks/home/no
 1. 安装 APK（需允许「安装未知来源」）
 2. 打开 App，填信令地址、加入令牌、本机名称（留空用 node_id 前 8 位）
 3. 点「连接」，第一次会弹系统 VPN 授权，同意
-4. 通知栏出现 qp2p 即在线
+4. 通知栏出现 qp2p 即在线（Android 13+ 要先允许通知；不给权限不影响连接）
 
 - **只接管虚拟网段**（如 `10.78.0.0/16`），手机上网照旧走运营商，不做全局代理
 - 令牌就是电脑上 `qp2p create` / `qp2p token` 打出的那串
