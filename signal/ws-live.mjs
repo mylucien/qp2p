@@ -92,8 +92,7 @@ async function api(method, path, { token, body, admin, headers = {} } = {}) {
 }
 
 /** 连一条 socket，等 hello。 */
-async function connect(token, node, netId, caps = []) {
-  const since = 0;
+async function connect(token, node, netId, caps = [], since = 0) {
   const ts = Date.now();
   const n = nonce();
   const capsStr = [...caps].sort().join(",");
@@ -179,6 +178,7 @@ async function main() {
     return api("POST", "/v1/join", { token, body });
   }
 
+  const joinedAt = Date.now();
   const aJ = await join(alice, "alice");
   check("alice join", aJ.status === 200, aJ.body);
   const bJ = await join(bob, "bob");
@@ -244,7 +244,54 @@ async function main() {
   b.ws.close(1000, "done");
   await sleep(1_500);
 
-  console.log("\n6. 清理");
+  // ---- 回归：评审报告里的三处缺陷 ----
+  console.log("\n6. 回归：长连接节点 2 分钟后仍可撮合");
+  const closes = [];
+  a.ws.addEventListener("close", (ev) => closes.push({ who: "alice", code: ev.code }));
+  b.ws.addEventListener("close", (ev) => closes.push({ who: "bob", code: ev.code }));
+
+  // 真实客户端每 25 秒发一次 ping；这里照做，等"注册已过去 130 秒"
+  while (Date.now() - joinedAt < 130_000) {
+    a.ws.send("ping");
+    b.ws.send("ping");
+    await sleep(25_000);
+  }
+  const stale = await nodeStatus(netId, bob.nodeId);
+  check("bob 仍然在线（via=ws）", stale?.online === true && stale?.via === "ws", stale);
+
+  b.inbox.length = 0;
+  a.ws.send(JSON.stringify({ t: "connect", req: 901, target: bob.nodeId }));
+  const t3 = Date.now();
+  while (Date.now() - t3 < 8_000 && !a.inbox.some((m) => m.req === 901)) await sleep(150);
+  const late = a.inbox.find((m) => m.req === 901);
+  check(
+    "注册过去 130 秒后仍能撮合（原来报 target_stale）",
+    late?.t === "connect_ok",
+    late,
+  );
+
+  console.log("\n7. 回归：换密钥把旧连接踢下线");
+  const rot = await api("POST", `/v1/admin/networks/${netId}/rotate`, { admin: ADMIN, body: {} });
+  check("rotate 返回新令牌", rot.status === 200 && !!rot.body.token, rot.status);
+  await sleep(2_000);
+  check(
+    "两条旧连接都以 4401 关闭",
+    closes.length >= 2 && closes.every((c) => c.code === 4401),
+    closes,
+  );
+
+  console.log("\n8. 回归：旧游标不再饿死客户端");
+  const since = 999_999;
+  const b2 = await connect(rot.body.token, bob, netId, [], since);
+  check("带旧游标的握手仍然成功", b2.hello?.t === "hello", b2.hello);
+  check("hello 的 cursor 已经把旧游标压回真实范围", b2.hello?.cursor < since, b2.hello?.cursor);
+  await sleep(1_500);
+  const replayed = b2.inbox.filter((m) => m.t === "event");
+  check("并且补发了真实事件（不是空列表）", replayed.length > 0, b2.inbox.map((m) => m.t));
+  b2.ws.close(1000, "done");
+  await sleep(500);
+
+  console.log("\n9. 清理");
   const del = await api("DELETE", `/v1/admin/networks/${netId}`, { admin: ADMIN, body: { confirm: netId } });
   check("删除测试网络", del.status === 200 && del.body.ok === true, del.body);
 
