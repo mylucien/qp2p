@@ -29,11 +29,35 @@ fn default_mtu() -> u16 {
     1280
 }
 
+/// 空闲多久断开直连（秒）。10 分钟是移动端的默认值：够用来等一条长 TCP 的间隙，
+/// 又不至于让射频一直醒着。
+fn default_idle_secs() -> u64 {
+    600
+}
+
 fn default_stun() -> Vec<String> {
     vec![
         "stun.cloudflare.com:3478".to_string(),
         "stun.l.google.com:19302".to_string(),
     ]
+}
+
+/// 按界面选择算休眠档位：保持在线 = 永不断链；否则 0 当作默认 10 分钟。
+fn idle_timeout(keep_online: bool, idle_secs: u64) -> Option<Duration> {
+    if keep_online {
+        return None;
+    }
+    let secs = if idle_secs == 0 {
+        default_idle_secs()
+    } else {
+        idle_secs
+    };
+    // 兜底封住上限：超过 24 小时等于"忘记断链"，不如直接当成保持在线
+    if secs >= 86_400 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
 }
 
 /// Kotlin 传进来的启动参数。
@@ -56,6 +80,14 @@ pub struct StartConfig {
     /// 用户手填的虚拟地址；留空/非法则由服务端分配
     #[serde(default)]
     pub virtual_ip: Option<String>,
+    /// 保持在线：不因空闲断开直连，也不因休眠断开长连接。
+    ///
+    /// 关掉时才会按 `idle_secs` 休眠——两者是互斥的，勾上就以"一直在线"为准。
+    #[serde(default)]
+    pub keep_online: bool,
+    /// 空闲多少秒断开直连（`keep_online` 为 false 时生效）。
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
 }
 
 /// `prepare` 返回给 Kotlin 的信息，用来构建 VpnService。
@@ -80,6 +112,8 @@ struct Prepared {
     virtual_ip: Ipv4Addr,
     peers: Vec<PeerInfo>,
     mtu: u16,
+    /// 直连空闲多久断开；`None` = 保持在线，从不断链
+    idle: Option<Duration>,
 }
 
 static PREPARED: OnceLock<Mutex<Option<Prepared>>> = OnceLock::new();
@@ -163,6 +197,9 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
         config.stun.clone()
     };
     let mtu = if config.mtu < 576 { 1280 } else { config.mtu };
+    // 保持在线时不设超时：会话里 `idle_timeout = None` 既不会断开直连，
+    // 也不会进入休眠，长连接自然一直挂着。关掉时才按选定的档位休眠。
+    let idle = idle_timeout(config.keep_online, config.idle_secs);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -234,6 +271,7 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
         virtual_ip,
         peers: reply.peers.clone(),
         mtu,
+        idle,
     };
     let info = PreparedInfo::from_prepared(&prepared, &cidr);
 
@@ -264,7 +302,16 @@ pub fn start(fd: i32) -> Result<()> {
         virtual_ip,
         peers,
         mtu,
+        idle,
     } = prepared;
+
+    log(&format!(
+        "省电策略：{}",
+        match idle {
+            None => "保持在线（不断链）".to_string(),
+            Some(d) => format!("空闲 {} 秒断链", d.as_secs()),
+        }
+    ));
 
     let stop = stop_flag();
     stop.store(false, Ordering::SeqCst);
@@ -294,8 +341,8 @@ pub fn start(fd: i32) -> Result<()> {
                 name,
                 net,
                 wanted_ip: Some(virtual_ip),
-                // 手机按流量计费：空闲 10 分钟就断链，有流量时自动重连
-                idle_timeout: Some(Duration::from_secs(600)),
+                // 手机按流量计费：空闲断链的档位由界面决定，保持在线时是 None
+                idle_timeout: idle,
                 peers,
                 // 手机按流量计费：长连接能省 80% 的信令请求，休眠满 60 秒会自动断开。
                 // 先按 auto，连不上（旧服务端）会自己退回轮询。
@@ -452,5 +499,24 @@ mod tests {
         assert_eq!(cfg.mtu, 1400);
         assert_eq!(cfg.name, "phone");
         assert_eq!(cfg.stun, vec!["s:3478".to_string()]);
+    }
+
+    #[test]
+    fn power_saving_defaults_to_ten_minutes() {
+        let cfg: StartConfig =
+            serde_json::from_str(r#"{"worker":"https://w.dev","token":"t"}"#).unwrap();
+        assert!(!cfg.keep_online, "默认不保持在线");
+        assert_eq!(cfg.idle_secs, 600);
+        assert_eq!(idle_timeout(cfg.keep_online, cfg.idle_secs), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn keep_online_never_sleeps() {
+        assert_eq!(idle_timeout(true, 600), None);
+        // 24 小时以上当成保持在线，避免"设了超时却永远不断"的误解
+        assert_eq!(idle_timeout(false, 86_400), None);
+        // 0 是界面没选过的值，回落到默认 10 分钟
+        assert_eq!(idle_timeout(false, 0), Some(Duration::from_secs(600)));
+        assert_eq!(idle_timeout(false, 1800), Some(Duration::from_secs(1800)));
     }
 }
