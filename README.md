@@ -51,13 +51,94 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 下载后先 `sha256sum -c SHA256SUMS.txt` 校验。
 
-**`qp2p-deploy-<版本>-<平台>` 不是客户端**，是自建信令服务用的一次性部署工具：把 Worker
+**`qp2p-deploy-<版本>-<平台>` 不是客户端**，是自建信令服务用的部署工具：把 Worker
 上传到你的 Cloudflare 账号（建 D1、绑定 Durable Object、生成 `ADMIN_SECRET`、跑冒烟），
-以后升级用 `qp2p-deploy up`。用别人架好的地址、只填令牌就连的话，**一个都不用下**；
-自建时按你操作的机器选一个平台即可，跑一次就完事，Worker 之后在云端运行。
-手工在 Dashboard 粘贴源码已经不适用（缺 DO 绑定，业务接口会返回 503）。
+以后升级用 `qp2p-deploy up`。按你操作的机器选一个平台即可。
+用别人架好的地址、只填令牌就连的话，**一个都不用下**。
 
-详细步骤（部署信令、建网、加入、排障）见 [USAGE.md](USAGE.md)。
+## 部署信令服务（自建才需要）
+
+只有一种方式：用 `qp2p-deploy`。在 Cloudflare Dashboard 直接粘贴 `worker.js` 会缺
+Durable Object 绑定，业务接口全部返回 503 —— 那不是一种可用的部署方式，别那样做。
+
+### 1. 准备
+
+- Cloudflare 账号；API Token 需要 `Workers Scripts:Edit` + `D1:Edit` 两个权限
+- 账号 ID（控制台右侧栏）
+- 自己的域名（建议）：国内访问 `*.workers.dev` 常不通，给 Worker 绑一条自定义路由更稳
+
+### 2. 下载并校验
+
+从 [v0.1.7](https://github.com/mylucien/qp2p/releases/tag/v0.1.7) 下
+`qp2p-deploy-0.1.7-<平台>`，四个平台分别是 `windows-x86_64.exe`、`linux-x86_64`、
+`linux-x86_64-static`、`linux-aarch64-static`（路由器/老系统选 static）。
+和 `SHA256SUMS.txt` 放一起：
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing   # 只下了单个文件时加 --ignore-missing
+chmod +x qp2p-deploy-0.1.7-linux-x86_64-static
+```
+
+下面用 Linux 静态版举例，换成你下载的文件名即可。
+
+### 3. 首次部署
+
+```bash
+export CLOUDFLARE_API_TOKEN=...      # Windows PowerShell：$env:CLOUDFLARE_API_TOKEN="..."
+export CLOUDFLARE_ACCOUNT_ID=...
+
+./qp2p-deploy-0.1.7-linux-x86_64-static init --dry-run   # 先看要上传什么（密钥已脱敏）
+./qp2p-deploy-0.1.7-linux-x86_64-static init             # 真正部署
+```
+
+验收：依次打印「① 校验令牌 → ② 准备 D1 → ③ 上传 Worker → ④ 启用 workers.dev → ⑤ 冒烟」，
+最后给出 `地址`、`管理页`、迁移标签和 **只显示一次的 `ADMIN_SECRET`**。把密钥存好，
+丢了只能用 `rotate-admin` 重设。默认 Worker 名和 D1 名都是 `qp2p`，可用 `--worker` / `--db` 改。
+
+用自己的域名：在控制台给这个 Worker 加一条路由（例如 `p2p.example.com/*`），
+之后客户端一律填这个域名。
+
+### 4. 验收部署
+
+```bash
+qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+```
+
+期望看到 `✓ Worker 可达`，且 `引擎 room（支持 WebSocket 长连接）`、`存储 D1`、
+`管理密钥 已配置` 三项都在，版本 2.8.x。再核对两条：
+
+```bash
+curl https://p2p.example.com/v1/health     # 匿名只回 {"ok":true}
+```
+
+`https://p2p.example.com/admin` 能打开管理页；根路径 `/` 返回 404，不提供接口清单。
+
+### 5. 以后升级
+
+```bash
+./qp2p-deploy-0.1.7-linux-x86_64-static status   # 先看当前迁移标签与线上状态
+./qp2p-deploy-0.1.7-linux-x86_64-static up       # 升级，密钥与 D1/DO 数据都保留
+```
+
+验收：输出 `✓ 已升级到标签 ...`，再跑一次 `qp2p init --admin` 确认 `引擎 room`、
+`管理密钥 已配置` 没变；节点不用重新 `join`。
+
+| 命令 | 用途 |
+|---|---|
+| `init` | 首次部署：建 D1 → 上传 → 启用子域 → 冒烟 |
+| `up` | 升级代码、按迁移链补步骤 |
+| `status` | 看本地记录 + 探一次线上 |
+| `rotate-admin` | 重设 `ADMIN_SECRET` |
+| `destroy` | 删 Worker，**Durable Object 数据一起销毁，不可恢复** |
+
+注意：
+
+- 状态文件在 `~/.qp2p/deploy.json`（可用 `QP2P_DEPLOY_STATE` 改）。换机器或删了它，
+  `up` 认不出当前迁移标签，要用 `--tag <标签>` 显式指定，别猜。
+- 部署器用 `include_str!` 把 `signal/worker.js` 编进了可执行文件：**正式版部署器内嵌的是
+  发版当时的 Worker 源码**，之后改了 Worker 不会自动生效，要用新发布的部署器 `up` 一次。
+
+建网、加入、日常命令与排障见 [USAGE.md](USAGE.md)。
 
 ## 架构
 
