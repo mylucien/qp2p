@@ -48,8 +48,19 @@ jobs:
           fi
           # 先以普通用户编译，再 sudo 跑测试二进制：
           # sudo 会丢掉 RUSTUP_TOOLCHAIN，直接 sudo cargo 会报"没有默认工具链"
-          cargo test -p qp2p-core --test tun_linux --no-run
-          BIN=$(ls -t target/debug/deps/tun_linux-* | grep -v '\.d$' | head -1)
+          #
+          # 二进制路径从 cargo 的 JSON 输出里取，不要猜目录：`--no-run` 的产物不一定
+          # 落在 target/debug/deps/（曾经落到 target/debug/build/<crate>/<hash>/out/，
+          # 于是 BIN 为空，变成 `sudo ''` → "sudo: '': command not found"）。
+          BIN=$(cargo test -p qp2p-core --test tun_linux --no-run --message-format=json \
+                | jq -r 'select(.reason == "compiler-artifact"
+                                and .target.name == "tun_linux"
+                                and .executable != null) | .executable' \
+                | tail -1)
+          if [ -z "$BIN" ]; then
+            echo "找不到 tun_linux 的测试二进制，cargo 没有产出可执行文件" >&2
+            exit 1
+          fi
           echo "跑 $BIN"
           sudo "$BIN" --ignored --nocapture
 
