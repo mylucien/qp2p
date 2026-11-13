@@ -66,7 +66,7 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 ```
 ✓ Worker 可达
-  版本    : 2.8.1
+  版本    : 2.8.2
   引擎    : room（支持 WebSocket 长连接）
   存储    : D1（多地域一致）
   管理密钥: 已配置
@@ -413,6 +413,18 @@ curl -X PATCH -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 curl -H "x-admin-secret: $ADMIN" https://你的-worker/v1/admin/networks/home/nodes
 ```
 
+**换掉加入密钥之后**
+
+```bash
+curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
+     -d '{}' https://你的-worker/v1/admin/networks/home/rotate
+```
+
+返回里除了只显示一次的新 `token`，还有 `kicked`：`true` 表示数据面已确认断开所有旧连接（4401）。
+`kicked: false` 表示新密钥在服务端已经生效、但没能通知到数据面（例如 DO 短暂不可用）——
+**新令牌照样能用**，旧连接会在下次重连时被拒绝（`403 stale_net_rev`）；想立刻断干净就再执行一次 rotate。
+旧令牌在别的边缘节点最多还能"认得"15 秒，但拿着它握手会被数据面按版本号拒绝，拿不到连接。
+
 ---
 
 ## 10. 组网原理
@@ -523,6 +535,7 @@ curl -H "x-admin-secret: $ADMIN" https://你的-worker/v1/admin/networks/home/no
 | `暂时连不上 xxx` | 对端没在 `qp2p up`，或对端 NAT 太严；双方都开 up 后自动重试 |
 | ping 不通但显示「直连已建立」 | 处在降级模式（没建成虚拟网卡），按上一条处理 |
 | 提示「加入令牌已失效」 | 管理员换过密钥；`qp2p join <新令牌>` 后重新 `qp2p up` |
+| 接口返回 `stale_net_rev` | 令牌已经被 `rotate` 换过、或网络被删掉；用新令牌重新 join。这是安全拒绝，不是故障 |
 | 时间相关的签名错误 | 本机时钟偏差超过 2 分钟，校准后重试 |
 
 ### 排查顺序

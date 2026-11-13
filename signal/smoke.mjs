@@ -143,13 +143,18 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     }
   };
 
-  const call = async (method, path, { token, admin, body, query } = {}) => {
+  /**
+   * `impl` 用来指定"哪个 isolate"：本地用 `import("./worker.js?x=1")` 拿到另一个
+   * 模块实例，各自持有独立的网络行缓存，DO 与 D1 仍然共用——这正是多 isolate 的模型。
+   */
+  const call = async (method, path, { token, admin, body, query, impl, upgrade } = {}) => {
     const url = new URL(`${base}${path}`);
     for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
     // 本地跑时用伪造的 cf-connecting-ip 隔离限流桶；打真机时不能带——
     // Cloudflare 边缘会把它当成伪造请求直接 403。
     const headers = { "content-type": "application/json" };
     if (!remote) headers["cf-connecting-ip"] = clientIp;
+    if (upgrade) headers.upgrade = "websocket";
     if (token) headers.authorization = `Bearer ${token}`;
     if (admin) headers["x-admin-secret"] = admin;
     const request = new Request(url, {
@@ -157,7 +162,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    const res = remote ? await fetch(request) : await worker.fetch(request, env, ctx);
+    const res = remote ? await fetch(request) : await (impl ?? worker).fetch(request, env, ctx);
     const text = await res.text();
     let parsed = null;
     try {
@@ -282,6 +287,20 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   const before = await probe(rotOld);
   check("轮换前令牌可用", before.body.error === "unknown_node", before.body);
 
+  /**
+   * 第二个 isolate：独立的网络行缓存（15 秒），D1 与 DO 仍与主 isolate 共用。
+   * 远端模式只有一个 Worker，造不出第二个 isolate，这几条只在本机跑。
+   */
+  const workerB = remote ? null : (await import("./worker.js?isolate=stale")).default;
+  if (workerB) {
+    const warm = await call("GET", "/v1/events", {
+      token: rotOld,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+    });
+    check("另一个 isolate 先缓存了旧网络行", warm.body.error === "unknown_node", warm.body);
+  }
+
   const rotated = await call("POST", "/v1/admin/networks/rotate-test/rotate", {
     admin: secret,
     body: { join_key: "rotate-preset-key-0002" },
@@ -291,10 +310,150 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     rotated.status === 200 && rotated.body.token !== rotOld,
     rotated.body,
   );
+  check("轮换成功时标明已断开旧连接", rotated.body.kicked === true, rotated.body);
   const afterOld = await probe(rotOld);
   const afterNew = await probe(rotated.body.token);
   check("旧令牌立刻失效", afterOld.body.error === "wrong_secret", afterOld.body);
   check("新令牌可用", afterNew.body.error === "unknown_node", afterNew.body);
+
+  if (workerB) {
+    // 要点：这个 isolate 的缓存里还是旧 join_hash，它自己"验得过"旧令牌。
+    // 拦住它的是 DO 手里的 rev（换密钥时前进），不是缓存新鲜度。
+    const staleEvents = await call("GET", "/v1/events", {
+      token: rotOld,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+    });
+    check(
+      "换密钥后旧缓存 isolate 的请求被拒",
+      staleEvents.status === 403 && staleEvents.body.error === "stale_net_rev",
+      staleEvents.body,
+    );
+
+    // 最初复现的就是这条：旧令牌在旧缓存 isolate 里握手拿到 101，之后再也不被踢
+    const staleWs = await call("GET", `/v1/ws?node_id=${"0".repeat(32)}&since=0`, {
+      token: rotOld,
+      impl: workerB,
+      upgrade: true,
+    });
+    check(
+      "换密钥后旧缓存 isolate 的握手被拒（不是 101）",
+      staleWs.status === 403 && staleWs.body.error === "stale_net_rev",
+      staleWs.body,
+    );
+  }
+
+  if (workerB) {
+    // 改名不 bump rev：别的 isolate 缓存里的旧名字不能被判成"令牌失效"，
+    // 否则改一次名字等于把全网在每个 isolate 的缓存过期前都踢掉。
+    const renNet = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: "rename-test", join_key: "rename-preset-key-0001" },
+    });
+    const renWarm = await call("GET", "/v1/events", {
+      token: renNet.body.token,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+    });
+    check("改名测试：旧 isolate 已缓存", renWarm.body.error === "unknown_node", renWarm.body);
+    const renamed = await call("PATCH", "/v1/admin/networks/rename-test", {
+      admin: secret,
+      body: { name: "rename-test-2" },
+    });
+    check("改名成功", renamed.status === 200 && renamed.body.changed === true, renamed.body);
+    const renAfter = await call("GET", "/v1/events", {
+      token: renNet.body.token,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+    });
+    check("改名后旧缓存 isolate 不被误判为过期", renAfter.body.error === "unknown_node", renAfter.body);
+  }
+
+  if (workerB) {
+    // 删网后另一个 isolate 的缓存还能往里写数据（孤儿网络）：墓碑必须拦住
+    const orphanId = "orphan-test";
+    const orphan = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: orphanId, join_key: "orphan-preset-key-0001" },
+    });
+    const orphanToken = orphan.body.token;
+    const orphanWarm = await call("GET", "/v1/events", {
+      token: orphanToken,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+    });
+    check("删网前旧 isolate 已缓存网络行", orphanWarm.body.error === "unknown_node", orphanWarm.body);
+
+    const orphanDel = await call("DELETE", `/v1/admin/networks/${orphanId}`, {
+      admin: secret,
+      body: { confirm: orphanId },
+    });
+    check("删网成功", orphanDel.status === 200, orphanDel.body);
+
+    const ghost = await identity();
+    const ghostJoin = await call("POST", "/v1/join", {
+      token: orphanToken,
+      impl: workerB,
+      body: await signed(ghost, "join", orphanId, {
+        node_id: ghost.nodeId,
+        pubkey: ghost.pubkey,
+        name: "orphan",
+      }),
+    });
+    check(
+      "删网后旧缓存 isolate 不能再 join",
+      ghostJoin.status === 403 && ghostJoin.body.error === "stale_net_rev",
+      ghostJoin.body,
+    );
+
+    // 重建同名网络要拿得到新 rev，不能被自己上一次的墓碑永久拒绝
+    const rebuilt = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: orphanId, join_key: "orphan-preset-key-0002" },
+    });
+    check("删网后可以用同名重建", rebuilt.status === 200, rebuilt.body);
+    const rebuiltProbe = await probe(rebuilt.body.token);
+    check("重建后的新令牌可用", rebuiltProbe.body.error === "unknown_node", rebuiltProbe.body);
+  }
+
+  if (!remote) {
+    // 换密钥的原子性：D1 已经改了、通知 DO 失败，绝不能把新令牌留在 500 里
+    const downId = "rotate-down";
+    const downNet = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: downId, join_key: "rotate-down-key-0001" },
+    });
+    const realRoom = env.ROOM;
+    env.ROOM = {
+      idFromName: (n) => ({ name: String(n) }),
+      get: () => ({
+        fetch: async () => {
+          throw new Error("DO down (simulated)");
+        },
+      }),
+    };
+    let downRes;
+    try {
+      downRes = await call("POST", `/v1/admin/networks/${downId}/rotate`, {
+        admin: secret,
+        body: { join_key: "rotate-down-key-0002" },
+      });
+    } finally {
+      env.ROOM = realRoom;
+    }
+    check(
+      "DO 故障时换密钥仍返回新令牌",
+      downRes.status === 200 && typeof downRes.body.token === "string" && downNet.body.token !== downRes.body.token,
+      downRes.body,
+    );
+    check(
+      "DO 故障时标明 kicked=false 并说明原因",
+      downRes.body.kicked === false && Boolean(downRes.body.warning),
+      downRes.body,
+    );
+    const downAfter = await probe(downRes.body.token);
+    check("DO 恢复后新令牌可用", downAfter.body.error === "unknown_node", downAfter.body);
+  }
 
   // 兼容 2.0：那时没有 join_hash，令牌由 ADMIN_SECRET 派生，服务端仍要认
   const ghostMac = createHmac("sha256", secret).update("token:ghost").digest("hex").slice(0, 40);

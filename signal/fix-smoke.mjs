@@ -351,29 +351,41 @@ async function run() {
   check("唤醒后没有白跑一轮 GC", afterCnt === beforeCnt, { beforeCnt, afterCnt });
 
   // ---------------------------------------------------------------- ⑦ loadNet
-  console.log("\n⑦ 改名 / 改网段会更新 DO 里的上下文");
+  console.log("\n⑦ loadNet：rev 前进才更新，更旧的上下文被拒");
   const beforeNet = room.net();
-  room.loadNet(
+  const ctxOf = (patch) =>
     new Request("https://room/i/stats", {
-      headers: {
-        "x-qp2p-net": JSON.stringify({ v: 1, id: net.id, name: "renamed", cidr: "10.99.0.0/16" }),
-      },
-    }),
-  );
-  const afterNet = room.net();
+      headers: { "x-qp2p-net": JSON.stringify({ v: 1, id: net.id, ...patch }) },
+    });
+
+  // 同一个 rev 的改名不覆盖 DO：管理员改名的正规路径是 /i/net-updated，
+  // 而别的 isolate 的旧缓存可能还带着改名前的名字，不能让它把新名字改回去。
+  room.loadNet(ctxOf({ name: "renamed", cidr: "10.99.0.0/16", rev: beforeNet.rev }));
   check(
-    "名称与网段都跟着变了",
-    afterNet.name === "renamed" && afterNet.cidr === "10.99.0.0/16",
-    { beforeNet, afterNet },
+    "同 rev 的上下文不改写 DO",
+    room.net().name === beforeNet.name && room.net().cidr === beforeNet.cidr,
+    { beforeNet, now: room.net() },
   );
+
+  // rev 前进才接受
+  room.loadNet(ctxOf({ name: "renamed", cidr: "10.99.0.0/16", rev: beforeNet.rev + 1 }));
+  check(
+    "rev 前进后名称与网段都跟着变了",
+    room.net().name === "renamed" && room.net().cidr === "10.99.0.0/16",
+    room.net(),
+  );
+
+  // 更旧的 rev（换密钥前的旧缓存）必须被拒
+  room.loadNet(ctxOf({ name: "stale", cidr: "10.98.0.0/16", rev: beforeNet.rev }));
+  check(
+    "旧 rev 被拒且不改写 DO",
+    room.stale === true && room.net().name === "renamed",
+    { stale: room.stale, net: room.net() },
+  );
+
   // 还原，后面还要用原网段
-  room.loadNet(
-    new Request("https://room/i/stats", {
-      headers: {
-        "x-qp2p-net": JSON.stringify({ v: 1, id: net.id, name: beforeNet.name, cidr: net.cidr }),
-      },
-    }),
-  );
+  room.loadNet(ctxOf({ name: beforeNet.name, cidr: net.cidr, rev: beforeNet.rev + 2 }));
+  check("还原网络上下文", room.net().name === beforeNet.name && room.net().cidr === net.cidr, room.net());
 
   // ---------------------------------------------------------------- ⑧ 503 语义
   console.log("\n⑧ DO 不可用统一返回 503 room_unavailable");

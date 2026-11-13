@@ -9,6 +9,7 @@ Durable Object + WebSocket 混合架构 · 定稿 v1.1 · 2026-11-11 · 基线�
 **修订记录**
 
 - **v0.2**（2026-11-09）：①不做在线数据迁移，升级一律由用户重新部署，因此删除了 `setNetworkEngine`、`importState`、逐网络 engine 字段与原 F6 的迁移流程；②新增 Android 端「保存配置」「自动连接」两个按钮（§7.3）；③更正降级语义：只有 WebSocket 不可用（代理拦截、握手失败）才退回轮询，DO 额度耗尽时轮询同样不可用。
+- **v1.4**（2026-11-13，安全与一致性修复）：①`networks` 新增单调 `rev`（全局计数器 `net_rev`），`netContext` 一路带到 DO，`loadNet` 拒绝比见过的最大值更旧的上下文（403 `stale_net_rev`）——修复「换密钥后旧令牌在另一个 isolate 的 15 秒旧缓存里仍能握手成功、且此后不再被踢」；②删网时 DO 记 `{id, rev}` 墓碑，拒绝已删除网络的后续请求——修复「陈旧缓存往已删网络里 join，留下 D1 查不到的孤儿节点」；③`rotateJoinKey` 的 DO 通知失败不再整体失败，返回 200 + 新令牌 + `kicked:false`（原来密钥已改、新令牌丢在 500 里）；④改名/改网段不前进 rev，否则每个 isolate 的缓存过期前全网都会被误判过期；⑤客户端：WS 握手后把 `ws_feed` 的游标同步成服务端钳制后的值，`select!` 的读帧分支排到 pong 超时之前（休眠唤醒不再白白重连）；⑥正文回退方案里的 `--no-room` 全部改为「Cloudflare 部署历史回滚」。
 - **v1.3**（2026-11-12，B10 退役 legacy）：Worker 里那套 D1 数据面（内存后端 + nodes/events/nonces + 四个业务端点的 legacy 分支 + 管理面的 D1 分支）全部删除，数据面只剩 Durable Object；没绑 `ROOM` 的部署返回 503 并提示重新部署；`qp2p-deploy --no-room` 一并移除，紧急回退改用 Cloudflare 的部署历史（Workers 原生保留每次上传的版本）。
 - **v1.2**（2026-11-12，缺陷修复）：①`matchmake` 的地址新鲜度按传输分开——长连接节点以「socket 活着」为准，轮询节点仍比 `last_seen` 与 `STALE_MS`（原来一律比 `last_seen`，WS 节点两分钟后就再也撮合不到）；②游标钳制：`since` 大于当前最大 seq 时按 0 处理（HTTP events、WS 握手、resume 三处），替代此前未实现的 epoch 校验；③`rotateJoinKey` 补上 `closeAll(4401)`；④同 node 换连接（4000）不再广播 `peer_offline`；⑤HTTP leave / WS leave / 踢人都立刻广播 `peer_offline`，HTTP leave 同时关闭 socket；⑥`sweep` 的 `last_sweep` 从 meta 读回；⑦`loadNet` 比对整个上下文；⑧DO 不可用统一 503 `room_unavailable`；另补 `getNetworkCached`（15 秒）与 room 模式下跳过 D1 数据面清理。
 - **v1.1**（2026-11-11，评审后）：①`sweep` 触发点补 WebSocket 消息入口——B4 之后它是唯一的 GC 来源（§6.3）；②新增「连接代次」规则，解决自己重连时被 4000 误停的问题（§5.2、§7.1）；③V14 确认通过，写入 Free 计划额度（§2）；④V9 的机器验证前移到 P1，并明确它同时决定 §11 的 ping 折算是否成立（§2、§15）；⑤§11 补「多网络放大」与「混合期最坏情况」两个场景；⑥`region_hint` 降级为调试参数（§16）；⑦P6 验收补「固定 IP 预留核对」（B2 未提前的代价），回退场景补数据可见性说明（§8.4、§15）。
@@ -195,7 +196,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | `invalidateNetwork(id)` | 新增 | 管理变更后清缓存（同 isolate 即时，其他 isolate 最多滞后 15 秒） | — | 管理面写路径调用 |
 | `roomEnabled(env)` | 新增 | 绑定了 `ROOM`（DO）则全部网络走 room，否则走 legacy；与网络无关 | → 布尔 | 纯函数 |
 | `roomStub(env, network)` | 新增 | `ROOM.get(ROOM.idFromName(network_id))`；`region_hint` 作为 locationHint（仅 DO 首次创建时生效，**待验证 V13**） | → DO stub | `env.ROOM` |
-| `netContext(network)` | 新增 | 构造 `x-qp2p-net`：版本 v、id、name、cidr；**不含 join\_hash** | → JSON 字符串 | — |
+| `netContext(network)` | 新增 | 构造 `x-qp2p-net`：版本 v、id、name、cidr、**rev**（该行在 D1 里的版本号）；**不含 join\_hash** | → JSON 字符串 | — |
 | `forwardToRoom(request, env, network, path)` | 新增 | 剥离客户端的 `x-qp2p-*`，附上 net 头，转发到 `/i/*`，透传 body 与查询串，原样返回 DO 响应 | → Response | `roomStub`、`netContext` |
 | `wsEntry(request, env, url)` | 新增 | 校验 Upgrade（否则 426）；握手限流；`authenticate`；未绑定 DO 时返回 501（客户端退回轮询）；转发 `/i/ws` | → 101 或错误 | `forwardToRoom` |
 | `joinOrRegister` / `connect` / `events` / `leave` | 现有·改造 | 函数开头判 `roomEnabled`：是 → `forwardToRoom`；否 → 原 legacy 逻辑（**保留，不删除**） | — | 现有 D1 逻辑 |
@@ -207,9 +208,9 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | 函数 | 状态 | 职责与交付 |
 | --- | --- | --- |
 | `createNetwork` | 改 | 新增参数 `region_hint`；绑定了 DO 时调用 `/i/init` 写 meta.net，DO 按 region\_hint 创建 |
-| `rotateJoinKey` | 改 | 更新 join\_hash 后调用 `/i/net-updated`（rotated），DO 以 4401 关闭全部 socket，持旧令牌的节点必须重新加入 |
+| `rotateJoinKey` | 改 | 先写 D1（join\_hash + rev 前进），再调 `/i/net-updated`，DO 以 4401 关闭全部 socket。**通知失败不得整体失败**：此时新令牌只在这个响应里出现，必须返回 200 + `kicked:false` 把令牌交出去，旧令牌在服务端已作废 |
 | `updateNetwork` | 改 | 更新名称/网段，`invalidateNetwork` + `/i/net-updated`；网段变化沿用现有语义：下次 register 才重新分配地址 |
-| `deleteNetwork` / `purgeNetwork` | 改 | D1 清理后调用 `/i/purge`：以 4410 关闭 socket 并清空 SQLite |
+| `deleteNetwork` / `purgeNetwork` | 改 | **先**调 `/i/purge`（4410 关闭 socket、清空 SQLite、写 `{id, rev}` 墓碑），**再**删 D1 行；反过来会留下"DO 还在跑但控制面查不到"的孤儿网络 |
 | `listNetworkNodes` / `kickNode` / `kickNodes` / `reserveIp` / `releaseIp` / `listReservationsAdmin` | 改 | 按 `roomEnabled` 分派到 legacy 实现或 `/i/admin/*`；返回字段保持一致，仅新增 `via`（ws 或 poll） |
 | `nodeCounts` / `onlineCounts` / `reservationCounts` | 改 | 绑定了 DO 时并发（上限 8）调用 `/i/stats`；失败置 0 并标记 `stale: true`，不拖垮列表接口 |
 | `sweep(env)` | 现有 | 未绑定 DO 时清理 legacy 数据面表；绑定 DO 后由 DO 自行清理 |
@@ -225,7 +226,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | `constructor(state, env)` | 注册自动应答（ping→pong）；`blockConcurrencyWhile` 内执行 `initSchema` 并读 meta | 就绪对象；**不得有任何定时器**；不落盘 wakes（原型每次唤醒写一行，生产版取消，仅内存保留 bootAt 供诊断） |
 | `initSchema()` | 幂等建表；读 `schema_version`，按序执行内部迁移 | DO 类名冻结为 `NetworkRoom`，结构演进靠内部迁移，避免走类迁移 |
 | `fetch(request)` | 按 §5.4 分发；统一错误体 `{ok:false, error, detail}`；未知路径 404 | 先调 `loadNet` |
-| `loadNet(request)` | 读取并校验 `x-qp2p-net`；与 meta.net 不同则写入；缺失时回退 meta.net（WebSocket 唤醒后处理消息需要） | → 网络上下文 |
+| `loadNet(request)` | 读取并校验 `x-qp2p-net`；命中 delete 墓碑或 `rev` 小于见过的最大值 → 标记 stale，`fetch` 直接返回 403 `stale_net_rev`；rev 更大时才覆盖 meta.net（同 rev 的旧缓存不能把新名字/新网段改回去）；缺失时回退 meta.net（WebSocket 唤醒后处理消息需要） | → 网络上下文 |
 
 **B. 鉴权与防重放**
 
@@ -437,7 +438,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 3. 上传 v3 并带 `ROOM` 绑定；此后所有请求落到 DO，没有逐网络切换。
 4. 节点下一次请求（轮询不超过 60 秒）或 register（不超过 30 分钟）后恢复；具备 WS 能力的客户端握手前先 register。
 5. 固定 IP 预留需要管理员重设（B2 之后自动恢复）；其余无需操作。
-6. 回退：`deploy up --no-room`，Worker 退回 legacy。
+6. 回退：用 Cloudflare 的部署历史把 Worker 回滚到上一个版本（legacy 数据面已在 v1.3 删除，`--no-room` 不再是选项）。
 
 ### F7 发布升级
 
@@ -452,13 +453,13 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | 签名消息格式与 `canonicalJson` | legacy Worker、NetworkRoom、Rust 客户端、测试 | **冻结**，只追加 op（新增 `ws`）；跨语言互验用例必须保留 |
 | 事件类型与字段 | `emit`、HTTP events、WS event、`handle_event` | 只增不删；新类型必须能被旧客户端安全忽略 |
 | 在线判定阈值（OFFLINE\_MS、STALE\_MS、WS\_GRACE、PING\_EVERY） | `liveness`、`matchmake`、客户端 keepalive、idle\_secs 展示 | 集中在 `LIMITS`，经 hello 与 health 下发；WS\_GRACE 至少为 PING\_EVERY 的 3 倍 |
-| `x-qp2p-net` 网络上下文 | Worker `netContext`、DO `loadNet` | 带版本字段 v；DO 遇到未知 v 直接拒绝并返回 503 |
+| `x-qp2p-net` 网络上下文 | Worker `netContext`、DO `loadNet` | 带版本字段 v 与单调 `rev`；DO 遇到未知 v 直接拒绝并返回 503，遇到 `rev` 比见过的最大值小则 403 `stale_net_rev` |
 | DO SQLite 结构 | NetworkRoom、`importState` | `schema_version` 内部迁移；类名冻结，避免类迁移 |
 | 迁移标签链 | 部署器、线上 Worker | 只追加；部署器读线上标签，不匹配即拒绝 |
 | cursor 与 seq | DO、HTTP events、WS、Rust session | 每网络单调；服务端数据重置时通过 epoch 通知客户端重新 register |
 | 管理面响应字段 | `/admin` 页面、管理 API | 只增不删，新字段给默认值 |
-| 额度与 503 | DO、Worker、客户端断路器 | 约定 `room_unavailable` 为退避信号（轮询同样受影响）；紧急回退用 `deploy up --no-room` |
-| D1 `networks` 缓存 | `getNetworkCached`、管理面 | 最多滞后 15 秒；kick 与 rotate 直达 DO，不依赖缓存 |
+| 额度与 503 | DO、Worker、客户端断路器 | 约定 `room_unavailable` 为退避信号（轮询同样受影响）；紧急回退用 Cloudflare 部署历史回滚 Worker |
+| D1 `networks` 缓存 | `getNetworkCached`、管理面 | 最多滞后 15 秒。**握手校验用的就是这张表**，所以"rotate 直达 DO"兜不住这一环（旧缓存里旧 join_hash 仍然验得过旧令牌）；兜底靠网络行的单调 `rev`：换密钥 / 删网时前进，DO 记住见过的最大值并拒绝更旧的上下文（见 §6.1、§6.3） |
 
 **实现顺序（依赖方向）**：协议冻结与测试替身 → NetworkRoom 的 HTTP 适配（可被旧客户端验证）→ WS 端点 → Rust 重构 `handle_event` → `WsLink` 与 `TransportMode` → 部署器。每一步都能独立上线、独立回滚。
 
@@ -529,12 +530,12 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- | --- |
 | P0 补测 | V12（keep\_bindings 后 TOKEN 仍有效）；V14 已确认通过（Free 计划额度见 §2） | V12 通过；V9 的两条机器验证作为回归断言写进集成测试 | — |
 | P1 骨架 | NetworkRoom 骨架 + SQL 接口验证 + 适配层；未绑定 DO 时行为零变化 | smoke.mjs 全绿；线上 legacy 全程无回归 | 重新部署旧版本 |
-| P2 room 引擎（HTTP） | join、register、connect、events、leave 全部走 DO，仍为轮询；用全新的测试 Worker 部署（绑定 DO） | 旧客户端零改动联通；D1 读写明显下降 | 部署不带 `ROOM` 绑定的版本（`--no-room`） |
+| P2 room 引擎（HTTP） | join、register、connect、events、leave 全部走 DO，仍为轮询；用全新的测试 Worker 部署（绑定 DO） | 旧客户端零改动联通；D1 读写明显下降 | 用 Cloudflare 部署历史回滚到上一版 Worker |
 | P3 WS 端点 | `/v1/ws`、hello、event、connect、resume；`ws-load.mjs` | 100 节点稳定 30 分钟；V11 的 24 小时用量符合 §11 | 关闭 features.ws |
 | P4 Rust WsLink | 重构 `handle_event`、`WsLink`、`TransportMode`、断路器 | 断线、活跃态部署、额度耗尽、旧 Worker 四类演练通过 | `signal_transport=poll` |
 | P4a Android | 「保存配置」与「自动连接」两个按钮；saveSettings 与 quickConnect 拆分；分阶段连接状态与失败原因（§7.3） | 保存不触发连接；良好网络下一键连接 5 秒内进入已连接；令牌无效、网络不通、服务端不可用给出不同提示 | 回退上一版 APK |
 | P5 部署器 | `deploy init、up、status` | 全新账号 5 分钟内完成 init；迁移链逐步升级；冒烟通过 | 手工粘贴 legacy 流程仍可用 |
-| P6 发布 | 自用 Worker 重新部署（`deploy up`），观察 7 天；其余用户按发布说明重新部署，不做在线迁移 | 各网络日志无异常；用量在预期内；**手填的固定 IP 预留已在管理页核对并重设**（B2 未做的代价，见 R8） | `deploy up --no-room` |
+| P6 发布 | 自用 Worker 重新部署（`deploy up`），观察 7 天；其余用户按发布说明重新部署，不做在线迁移 | 各网络日志无异常；用量在预期内；**手填的固定 IP 预留已在管理页核对并重设**（B2 未做的代价，见 R8） | 用 Cloudflare 部署历史回滚到上一版 Worker |
 | P7 优化 | 见 §17 | 逐项验收 | 逐项回退 |
 | P8 ✅ | 退役 legacy 数据面 | 已删除全部 legacy 代码（见 v1.3）；D1 只留控制面与预留备份 | 回退走 Cloudflare 部署历史 |
 
@@ -544,7 +545,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- | --- |
 | R1 | V9 失败：自动应答时间戳不可用或不刷新（V9 已由用户确认通过，降为回归检测） | 在线判定失准 | 改发 JSON ping（每次唤醒，成本约 20 倍）；或仅依赖 close 事件与短 TTL；重估配额 |
 | R2 | DO 位置远，RTT 约 200 ms | 体验 | `region_hint`，V13 对比 |
-| R3 | 额度耗尽 | 新连接与地址刷新暂停，已建立的隧道不受影响 | 告警线提前发现；客户端 503 退避重试；紧急回退 `deploy up --no-room`（退回 legacy，节点重新 register） |
+| R3 | 额度耗尽 | 新连接与地址刷新暂停，已建立的隧道不受影响 | 告警线提前发现；客户端 503 退避重试；紧急回退用 Cloudflare 部署历史回滚 Worker（节点重新 register） |
 | R4 | 休眠失效（混入定时器或出站连接） | 一天烧光时长额度 | 休眠回归检测写进发布流程 |
 | R5 | 客户端重构风险（抽取 `handle_event`） | 回归 | 先纯重构，靠现有测试兜底 |
 | R6 | Rust 二进制体积与依赖 | 分发 | 提前测量，必要时 feature 门控 |

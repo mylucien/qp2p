@@ -310,14 +310,10 @@ impl WsLink {
             // 从设计的 10 秒拖到最多 25 秒（补发一条 ping 之后的下一拍才发现）。
             let deadline = self.ping_sent.map(|t| t + self.pong_timeout);
             tokio::select! {
+                // biased 是"按顺序轮询、先就绪先赢"。读帧必须排在超时之前：
+                // 手机休眠唤醒时 pong 可能已经躺在 socket 缓冲区里，而 deadline
+                // 早过了；先判超时会把一条健康的连接当成半开白白重连一次。
                 biased;
-
-                _ = sleep_until_opt(deadline) => {
-                    return WsItem::Down(format!(
-                        "{} 秒没收到 pong，连接可能已经半开",
-                        self.pong_timeout.as_secs()
-                    ));
-                }
 
                 frame = self.rx.next() => {
                     match frame {
@@ -360,8 +356,15 @@ impl WsLink {
                     }
                 }
 
+                _ = sleep_until_opt(deadline) => {
+                    return WsItem::Down(format!(
+                        "{} 秒没收到 pong，连接可能已经半开",
+                        self.pong_timeout.as_secs()
+                    ));
+                }
+
                 _ = self.ticker.tick() => {
-                    // 上一条 ping 还在等 pong：不重复发，超时由上面的 deadline 分支管
+                    // 上一条 ping 还在等 pong：不重复发，超时由 deadline 分支管
                     if self.ping_sent.is_some() {
                         continue;
                     }

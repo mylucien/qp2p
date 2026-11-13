@@ -197,6 +197,11 @@ async fn ws_feed(
         match WsLink::open(&client, &identity, since, &[]).await {
             Ok(mut link) => {
                 let opened = Instant::now();
+                // 握手时服务端会把游标钳到它当前的最大 seq（数据被重建、换引擎时
+                // 它会比本地小）。这个钳制值必须同步回来：下面的 since 只增不减，
+                // 一直停在旧的大值的话，服务端就再也不会补发断线期间的事件，
+                // 只会在每次重连时把这些事件当"已处理"跳过。
+                since = link.cursor();
                 let _ = tx.try_send(WsFeed::Online);
                 loop {
                     match link.next().await {
