@@ -93,14 +93,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.7-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.7-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.7-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.7-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 8+ | `qp2p-0.1.7-android.apk` | VpnService，debug 签名 |
+| Windows 10/11 x64 | `qp2p-0.1.8-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.8-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.8-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.8-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 8+ | `qp2p-0.1.8-android.apk` | VpnService，debug 签名 |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
-`qp2p-deploy-0.1.7-<平台>`，同样有 `SHA256SUMS.txt` 校验。
+`qp2p-deploy-0.1.8-<平台>`，同样有 `SHA256SUMS.txt` 校验。
 
 下载后先校验：
 
@@ -111,8 +111,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.7-linux-x86_64-static
-sudo mv qp2p-0.1.7-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.8-linux-x86_64-static
+sudo mv qp2p-0.1.8-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -204,7 +204,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.7 · 网络 home
+qp2p 0.1.8 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
