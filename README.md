@@ -13,7 +13,7 @@
 - 信令走 WebSocket 长连接，事件即时推送；连不上自动退回轮询，服务端恢复后自动切回
 - 「直连保持」可选 10 / 30 / 60 分钟，或开「保持在线」不断；「启动连接」开关打开后打开 App 自动入网；桌面端默认不断
 - 信令面是单文件 Worker + 每网络一个 Durable Object（SQLite）。免费额度下单网络最多 256 节点，
-  百台量级的常开设备仍在额度内（估算见 [v3 设计文档](docs/signal-v3-design.md) §11）
+  百台量级的常开设备仍在额度内
 
 ## 快速开始
 
@@ -51,35 +51,22 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 下载后先 `sha256sum -c SHA256SUMS.txt` 校验。
 
-**`qp2p-deploy-<版本>-<平台>` 不是客户端**，是自建信令服务用的部署工具：把 Worker
+**`qp2p-deploy` 不是客户端**，是一键部署工具：把 Worker
 上传到你的 Cloudflare 账号（建 D1、绑定 Durable Object、生成 `ADMIN_SECRET`、跑冒烟），
 以后升级用 `qp2p-deploy up`。按你操作的机器选一个平台即可。
-用别人架好的地址、只填令牌就连的话，**一个都不用下**。
 
-## 部署信令服务（自建才需要）
-
-只有一种方式：用 `qp2p-deploy`。在 Cloudflare Dashboard 直接粘贴 `worker.js` 会缺
-Durable Object 绑定，业务接口全部返回 503 —— 那不是一种可用的部署方式，别那样做。
+## 部署信令服务
 
 ### 1. 准备
 
 - Cloudflare 账号；API Token 需要 `Workers Scripts:Edit` + `D1:Edit` 两个权限
 - 账号 ID（控制台右侧栏）
-- 自己的域名（建议）：国内访问 `*.workers.dev` 常不通，给 Worker 绑一条自定义路由更稳
+- 自己的域名（建议）
 
 ### 2. 下载并校验
 
 从 [v0.1.7](https://github.com/mylucien/qp2p/releases/tag/v0.1.7) 下
-`qp2p-deploy-0.1.7-<平台>`，四个平台分别是 `windows-x86_64.exe`、`linux-x86_64`、
-`linux-x86_64-static`、`linux-aarch64-static`（路由器/老系统选 static）。
-和 `SHA256SUMS.txt` 放一起：
-
-```bash
-sha256sum -c SHA256SUMS.txt --ignore-missing   # 只下了单个文件时加 --ignore-missing
-chmod +x qp2p-deploy-0.1.7-linux-x86_64-static
-```
-
-下面用 Linux 静态版举例，换成你下载的文件名即可。
+`qp2p-deploy`，下面用 Linux 静态版举例，换成你下载的文件名即可。
 
 ### 3. 首次部署
 
@@ -155,8 +142,6 @@ signal/         单文件 Worker + D1（控制面）+ 每网络一个 Durable Ob
 - **身份**：Ed25519，`node_id` 由公钥派生，虚拟地址由身份派生；重启不变
 - **认证**：每条直连建立后双方交换签名，签名绑定这条 TLS 会话，复放/反射/冒充都会失败
 
-设计取舍与协议细节见 [DESIGN.md](DESIGN.md)，当前信令架构见
-[signal-v3-design.md](docs/signal-v3-design.md)。
 
 ## 命令
 
@@ -173,12 +158,3 @@ signal/         单文件 Worker + D1（控制面）+ 每网络一个 Durable Ob
 | Linux | `/dev/net/tun` | root 或 `CAP_NET_ADMIN` |
 | Windows 10/11 | WinTun（已内嵌） | 管理员，exe 清单会自动提权 |
 | Android 8+ | VpnService | 无需 root；Android 13+ 不给通知权限不影响连接 |
-
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [USAGE.md](USAGE.md) | 部署、安装、建网、加入、上线、日常命令、配置、管理页、排障、安全模型 |
-| [DESIGN.md](DESIGN.md) | 架构、协议、设计决策 |
-| [signal-v3-design.md](docs/signal-v3-design.md) | 当前信令架构：Durable Object、WebSocket、配额与容量模型 |
-| [signal/README.md](signal/README.md) | 信令服务源码、接口与本地测试脚本 |
