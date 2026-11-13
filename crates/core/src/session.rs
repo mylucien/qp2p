@@ -1494,13 +1494,21 @@ fn dialable(addr: &SocketAddr) -> bool {
 }
 
 /// 令牌被作废（网络删除 / 换过准入密码）导致的错误。
+///
+/// `stale_net_rev` / `network_deleted` 是数据面（DO）判定的同一件事的另一面：
+/// 前者是"你带来的网络版本比数据面见过的旧"（换过密钥），后者是"网络已删除"。
+/// 两条都不该重试——拿着同一个令牌再轮询一万次也没用。
 pub fn token_rejected(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::signal::client::SignalError>()
         .map(|e| {
             matches!(
                 e.code.as_str(),
-                "wrong_secret" | "invalid_token" | "network_not_found"
+                "wrong_secret"
+                    | "invalid_token"
+                    | "network_not_found"
+                    | "stale_net_rev"
+                    | "network_deleted"
             )
         })
         .unwrap_or(false)

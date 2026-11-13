@@ -9,6 +9,7 @@ Durable Object + WebSocket 混合架构 · 定稿 v1.1 · 2026-11-11 · 基线�
 **修订记录**
 
 - **v0.2**（2026-11-09）：①不做在线数据迁移，升级一律由用户重新部署，因此删除了 `setNetworkEngine`、`importState`、逐网络 engine 字段与原 F6 的迁移流程；②新增 Android 端「保存配置」「自动连接」两个按钮（§7.3）；③更正降级语义：只有 WebSocket 不可用（代理拦截、握手失败）才退回轮询，DO 额度耗尽时轮询同样不可用。
+- **v1.5**（2026-11-13，配置同步回归）：①`networks` 新增 `cfg_rev`（计数器 `net_rev` 的 `cfg` 序列），改名/改网段时前进，`netContext` 带到 DO，`loadNet` **只用它决定要不要覆盖名字与网段**，不参与鉴权——修复「通知 DO 失败后 DO 永久停在旧网段，新节点被分到旧网段地址」；②`updateNetwork` 在没有字段变更时也重推一次上下文（幂等重推），DO 通知失败降级为 200 + `synced:false` + 提示（原来 500，且重试被 `changes.length === 0` 直接短路）；③`/i/purge` 移到 stale 判定之前（幂等），否则删网中途失败后第二次删除会被自己写的墓碑拦掉，"再删一次收尾"根本不成立；④墓碑命中返回 403 `network_deleted`（原来笼统报 `stale_net_rev`「上下文已过期」，误导排查方向）；⑤`deleteNetworkRow` 失败重试一次，仍失败返回 500 `delete_record_failed` 并说明后果与收尾方式；⑥`authenticate` 在 join\_hash 不匹配时回读一次主库——消掉"换密钥后新令牌在未刷新 isolate 里被判 `wrong_secret`、客户端当致命错误停止"的反向 15 秒窗口；客户端把 `stale_net_rev` / `network_deleted` 一并归入"令牌已失效"。
 - **v1.4**（2026-11-13，安全与一致性修复）：①`networks` 新增单调 `rev`（全局计数器 `net_rev`），`netContext` 一路带到 DO，`loadNet` 拒绝比见过的最大值更旧的上下文（403 `stale_net_rev`）——修复「换密钥后旧令牌在另一个 isolate 的 15 秒旧缓存里仍能握手成功、且此后不再被踢」；②删网时 DO 记 `{id, rev}` 墓碑，拒绝已删除网络的后续请求——修复「陈旧缓存往已删网络里 join，留下 D1 查不到的孤儿节点」；③`rotateJoinKey` 的 DO 通知失败不再整体失败，返回 200 + 新令牌 + `kicked:false`（原来密钥已改、新令牌丢在 500 里）；④改名/改网段不前进 rev，否则每个 isolate 的缓存过期前全网都会被误判过期；⑤客户端：WS 握手后把 `ws_feed` 的游标同步成服务端钳制后的值，`select!` 的读帧分支排到 pong 超时之前（休眠唤醒不再白白重连）；⑥正文回退方案里的 `--no-room` 全部改为「Cloudflare 部署历史回滚」。
 - **v1.3**（2026-11-12，B10 退役 legacy）：Worker 里那套 D1 数据面（内存后端 + nodes/events/nonces + 四个业务端点的 legacy 分支 + 管理面的 D1 分支）全部删除，数据面只剩 Durable Object；没绑 `ROOM` 的部署返回 503 并提示重新部署；`qp2p-deploy --no-room` 一并移除，紧急回退改用 Cloudflare 的部署历史（Workers 原生保留每次上传的版本）。
 - **v1.2**（2026-11-12，缺陷修复）：①`matchmake` 的地址新鲜度按传输分开——长连接节点以「socket 活着」为准，轮询节点仍比 `last_seen` 与 `STALE_MS`（原来一律比 `last_seen`，WS 节点两分钟后就再也撮合不到）；②游标钳制：`since` 大于当前最大 seq 时按 0 处理（HTTP events、WS 握手、resume 三处），替代此前未实现的 epoch 校验；③`rotateJoinKey` 补上 `closeAll(4401)`；④同 node 换连接（4000）不再广播 `peer_offline`；⑤HTTP leave / WS leave / 踢人都立刻广播 `peer_offline`，HTTP leave 同时关闭 socket；⑥`sweep` 的 `last_sweep` 从 meta 读回；⑦`loadNet` 比对整个上下文；⑧DO 不可用统一 503 `room_unavailable`；另补 `getNetworkCached`（15 秒）与 room 模式下跳过 D1 数据面清理。
@@ -191,12 +192,12 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- | --- | --- |
 | `fetch(request, env, ctx)` | 现有·小改 | 总入口：限流 → CORS → 体积限制 → `route`；捕获 DO 异常（含额度耗尽）并转成 503 `room_unavailable` | Request → Response | `limited`、`route` |
 | `route(request, url, env, ctx)` | 现有·扩展 | 路径分发；新增 `/v1/ws`；业务端点先判 `roomEnabled` | → Response | 全部处理函数 |
-| `authenticate(request, env, url)` | 现有·小改 | 解析令牌、校验 join\_hash（兼容旧令牌）、返回 network | → `{ok, network}` 或错误响应 | `getNetworkCached`（已实现） |
+| `authenticate(request, env, url)` | 现有·小改 | 解析令牌、校验 join\_hash（兼容旧令牌）、返回 network。**哈希对不上时回读一次主库再判 `wrong_secret`**：换密钥后的 15 秒内本 isolate 的缓存还是旧哈希，新令牌会被误拒，而客户端把 403 当致命错误 | → `{ok, network}` 或错误响应 | `getNetworkCached`（已实现） |
 | `getNetworkCached(env, id)` | 新增 | isolate 内 Map，TTL 15 秒；未命中读 D1 | 网络 id → network 或 null | D1 `networks` |
 | `invalidateNetwork(id)` | 新增 | 管理变更后清缓存（同 isolate 即时，其他 isolate 最多滞后 15 秒） | — | 管理面写路径调用 |
 | `roomEnabled(env)` | 新增 | 绑定了 `ROOM`（DO）则全部网络走 room，否则走 legacy；与网络无关 | → 布尔 | 纯函数 |
 | `roomStub(env, network)` | 新增 | `ROOM.get(ROOM.idFromName(network_id))`；`region_hint` 作为 locationHint（仅 DO 首次创建时生效，**待验证 V13**） | → DO stub | `env.ROOM` |
-| `netContext(network)` | 新增 | 构造 `x-qp2p-net`：版本 v、id、name、cidr、**rev**（该行在 D1 里的版本号）；**不含 join\_hash** | → JSON 字符串 | — |
+| `netContext(network)` | 新增 | 构造 `x-qp2p-net`：版本 v、id、name、cidr、**rev**（安全版本号）、**cfg_rev**（配置版本号）；**不含 join\_hash** | → JSON 字符串 | — |
 | `forwardToRoom(request, env, network, path)` | 新增 | 剥离客户端的 `x-qp2p-*`，附上 net 头，转发到 `/i/*`，透传 body 与查询串，原样返回 DO 响应 | → Response | `roomStub`、`netContext` |
 | `wsEntry(request, env, url)` | 新增 | 校验 Upgrade（否则 426）；握手限流；`authenticate`；未绑定 DO 时返回 501（客户端退回轮询）；转发 `/i/ws` | → 101 或错误 | `forwardToRoom` |
 | `joinOrRegister` / `connect` / `events` / `leave` | 现有·改造 | 函数开头判 `roomEnabled`：是 → `forwardToRoom`；否 → 原 legacy 逻辑（**保留，不删除**） | — | 现有 D1 逻辑 |
@@ -209,8 +210,8 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- |
 | `createNetwork` | 改 | 新增参数 `region_hint`；绑定了 DO 时调用 `/i/init` 写 meta.net，DO 按 region\_hint 创建 |
 | `rotateJoinKey` | 改 | 先写 D1（join\_hash + rev 前进），再调 `/i/net-updated`，DO 以 4401 关闭全部 socket。**通知失败不得整体失败**：此时新令牌只在这个响应里出现，必须返回 200 + `kicked:false` 把令牌交出去，旧令牌在服务端已作废 |
-| `updateNetwork` | 改 | 更新名称/网段，`invalidateNetwork` + `/i/net-updated`；网段变化沿用现有语义：下次 register 才重新分配地址 |
-| `deleteNetwork` / `purgeNetwork` | 改 | **先**调 `/i/purge`（4410 关闭 socket、清空 SQLite、写 `{id, rev}` 墓碑），**再**删 D1 行；反过来会留下"DO 还在跑但控制面查不到"的孤儿网络 |
+| `updateNetwork` | 改 | 更新名称/网段：写 D1 时**前进 `cfg_rev`、不动 `rev`**（动 rev 等于踢全网 15 秒），再调 `/i/net-updated`（网段变化时由 DO 重新分配地址）。**没有字段变更也重推一次**（幂等重推，让上一次通知失败能被管理员重试收尾）；通知失败降级为 200 + `synced:false` + warning，不用 500 —— D1 已改，500 只会让人以为没生效 |
+| `deleteNetwork` / `purgeNetwork` | 改 | **先**调 `/i/purge`（4410 关闭 socket、清空 SQLite、写 `{id, rev}` 墓碑），**再**删 D1 行（失败重试一次，仍失败返回 500 `delete_record_failed` 并说明"网络已不可用、再删一次收尾"）；反过来会留下"DO 还在跑但控制面查不到"的孤儿网络。中途失败时留下的中间态由幂等 purge + `network_deleted` 报错兜住 |
 | `listNetworkNodes` / `kickNode` / `kickNodes` / `reserveIp` / `releaseIp` / `listReservationsAdmin` | 改 | 按 `roomEnabled` 分派到 legacy 实现或 `/i/admin/*`；返回字段保持一致，仅新增 `via`（ws 或 poll） |
 | `nodeCounts` / `onlineCounts` / `reservationCounts` | 改 | 绑定了 DO 时并发（上限 8）调用 `/i/stats`；失败置 0 并标记 `stale: true`，不拖垮列表接口 |
 | `sweep(env)` | 现有 | 未绑定 DO 时清理 legacy 数据面表；绑定 DO 后由 DO 自行清理 |
@@ -225,8 +226,8 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | --- | --- | --- |
 | `constructor(state, env)` | 注册自动应答（ping→pong）；`blockConcurrencyWhile` 内执行 `initSchema` 并读 meta | 就绪对象；**不得有任何定时器**；不落盘 wakes（原型每次唤醒写一行，生产版取消，仅内存保留 bootAt 供诊断） |
 | `initSchema()` | 幂等建表；读 `schema_version`，按序执行内部迁移 | DO 类名冻结为 `NetworkRoom`，结构演进靠内部迁移，避免走类迁移 |
-| `fetch(request)` | 按 §5.4 分发；统一错误体 `{ok:false, error, detail}`；未知路径 404 | 先调 `loadNet` |
-| `loadNet(request)` | 读取并校验 `x-qp2p-net`；命中 delete 墓碑或 `rev` 小于见过的最大值 → 标记 stale，`fetch` 直接返回 403 `stale_net_rev`；rev 更大时才覆盖 meta.net（同 rev 的旧缓存不能把新名字/新网段改回去）；缺失时回退 meta.net（WebSocket 唤醒后处理消息需要） | → 网络上下文 |
+| `fetch(request)` | 按 §5.4 分发；统一错误体 `{ok:false, error, detail}`；未知路径 404 | 先调 `loadNet`；`/i/purge` 放在 stale 判定之前（必须幂等，否则中途失败的删除再也重试不进来） |
+| `loadNet(request)` | 读取并校验 `x-qp2p-net`。**安全**：命中 delete 墓碑 → 403 `network_deleted`；`rev` 小于见过的最大值 → 403 `stale_net_rev`。**配置同步**：名字/网段只在 `cfg_rev` 更大（或换了网络 id / 首次拿到上下文）时覆盖，`cfg_rev` 只决定"要不要应用"，永不导致拒绝；缺失时回退 meta.net（WebSocket 唤醒后处理消息需要） | → 网络上下文 |
 
 **B. 鉴权与防重放**
 
@@ -459,7 +460,7 @@ D1：控制面权威（networks、admin_*）；未绑定 DO 的 Worker 仍走 le
 | cursor 与 seq | DO、HTTP events、WS、Rust session | 每网络单调；服务端数据重置时通过 epoch 通知客户端重新 register |
 | 管理面响应字段 | `/admin` 页面、管理 API | 只增不删，新字段给默认值 |
 | 额度与 503 | DO、Worker、客户端断路器 | 约定 `room_unavailable` 为退避信号（轮询同样受影响）；紧急回退用 Cloudflare 部署历史回滚 Worker |
-| D1 `networks` 缓存 | `getNetworkCached`、管理面 | 最多滞后 15 秒。**握手校验用的就是这张表**，所以"rotate 直达 DO"兜不住这一环（旧缓存里旧 join_hash 仍然验得过旧令牌）；兜底靠网络行的单调 `rev`：换密钥 / 删网时前进，DO 记住见过的最大值并拒绝更旧的上下文（见 §6.1、§6.3） |
+| D1 `networks` 缓存 | `getNetworkCached`、管理面 | 最多滞后 15 秒。**握手校验用的就是这张表**，所以"rotate 直达 DO"兜不住这一环（旧缓存里旧 join_hash 仍然验得过旧令牌）；兜底靠网络行的单调 `rev`：换密钥 / 删网时前进，DO 记住见过的最大值并拒绝更旧的上下文（见 §6.1、§6.3）。**配置（名字/网段）另走 `cfg_rev`**：不参与拒绝，只决定 DO 要不要覆盖自己那份——`rev` 管安全、`cfg_rev` 管配置，两件事分开 |
 
 **实现顺序（依赖方向）**：协议冻结与测试替身 → NetworkRoom 的 HTTP 适配（可被旧客户端验证）→ WS 端点 → Rust 重构 `handle_event` → `WsLink` 与 `TransportMode` → 部署器。每一步都能独立上线、独立回滚。
 

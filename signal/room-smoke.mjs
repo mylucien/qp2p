@@ -142,5 +142,63 @@ const st2 = await (await room.fetch(req("GET", "/i/stats"))).json();
 check("purge 后节点与事件归零", st2.nodes === 0 && st2.events === 0 && st2.reservations === 0, st2);
 check("purge 后网络上下文已清", room.net() === null);
 
+console.log("\n9. cfg_rev：改名/改网段不会被旧缓存回退，也不参与拒绝");
+const s2 = new RoomFakeState();
+const r2 = new NetworkRoom(s2, {});
+await s2.ready();
+const ctxReq = (net) => req("GET", "/i/stats", { headers: { "x-qp2p-net": JSON.stringify(net) } });
+const base = { v: 1, id: "cfg", name: "old-name", cidr: "10.60.0.0/16", rev: 3, cfg_rev: 1 };
+check("首次请求写入上下文", r2.loadNet(ctxReq(base))?.cidr === "10.60.0.0/16", r2.net());
+
+// 管理员改名 + 改网段：rev 不变（不踢人），cfg_rev 前进
+const newer = { v: 1, id: "cfg", name: "new-name", cidr: "10.70.0.0/16", rev: 3, cfg_rev: 2 };
+const applied = r2.loadNet(ctxReq(newer));
+check("cfg_rev 前进时应用新名字与新网段", applied?.cidr === "10.70.0.0/16" && applied?.name === "new-name", applied);
+
+// 别的 isolate 还缓存着改动前那一行：rev 相同、cfg_rev 更小
+const back = r2.loadNet(ctxReq(base));
+check("旧缓存（cfg_rev 更小）不能把网段改回去", back?.cidr === "10.70.0.0/16", back);
+check("旧缓存不会被误判为上下文过期", r2.stale === false, { stale: r2.stale });
+
+// cfg_rev 只决定"要不要应用"，绝不决定"要不要拒绝"：rev 更旧照样 403
+const olderRev = await r2.fetch(
+  ctxReq({ v: 1, id: "cfg", name: "older-name", cidr: "10.80.0.0/16", rev: 2, cfg_rev: 99 }),
+);
+const olderBody = await olderRev.json();
+check(
+  "cfg_rev 再大也不能绕过 rev 的单调判定",
+  olderRev.status === 403 && olderBody.error === "stale_net_rev",
+  olderBody,
+);
+check("被拒的请求没有改动上下文", r2.net()?.cidr === "10.70.0.0/16", r2.net());
+
+// 管理面推送同样要按 cfg_rev 单调：滞后的推送（并发改两次、或重试比首次还慢）
+// 不能把已经生效的新配置改回去。换密钥（close=true）不在此列——它的 rev 一定前进。
+const lagPush = await r2.fetch(
+  req("POST", "/i/net-updated", {
+    headers: { "x-qp2p-net": JSON.stringify(newer) },
+    body: {
+      net: { v: 1, id: "cfg", name: "old-name", cidr: "10.99.0.0/16", rev: 3, cfg_rev: 1 },
+      reassign: true,
+    },
+  }),
+);
+check("滞后的 /i/net-updated 不覆盖现有配置", lagPush.status === 200 && r2.net()?.cidr === "10.70.0.0/16", r2.net());
+
+// 删网墓碑 + 重删：purge 必须幂等，否则"再删一次收尾"永远进不来
+const purgeNet = { v: 1, id: "cfg", name: "new-name", cidr: "10.70.0.0/16", rev: 3, cfg_rev: 2 };
+const p1 = await r2.fetch(req("POST", "/i/purge", { headers: { "x-qp2p-net": JSON.stringify(purgeNet) }, body: {} }));
+const p2 = await r2.fetch(req("POST", "/i/purge", { headers: { "x-qp2p-net": JSON.stringify(purgeNet) }, body: {} }));
+check("删网后再次 /i/purge 仍然成功（幂等）", p1.status === 200 && p2.status === 200, [p1.status, p2.status]);
+const afterPurge = await r2.fetch(req("GET", "/i/events?node_id=0&since=0", {
+  headers: { "x-qp2p-net": JSON.stringify(purgeNet) },
+}));
+const afterPurgeBody = await afterPurge.json();
+check(
+  "墓碑生效，且报的是网络已删除",
+  afterPurge.status === 403 && afterPurgeBody.error === "network_deleted",
+  afterPurgeBody,
+);
+
 console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
 process.exit(failed === 0 ? 0 : 1);

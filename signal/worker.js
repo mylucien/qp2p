@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.8.2";
+const VERSION = "2.8.3";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -58,8 +58,16 @@ const DDL_STATEMENTS = [
   // 换密钥后旧令牌在另一个 isolate 里能握手成功（§6.1 的已知滞后被放大成安全漏洞）。
   // 所以把 rev 一路带到 DO，DO 只认不小于自己见过的最大值（-15 秒缓存的安全阀）。
   `ALTER TABLE networks ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`,
+  // 配置版本号（名字 / 网段）：**只管"要不要应用"**，不参与鉴权。
+  //
+  // rev 解决的是安全问题（换密钥后拒绝更旧的上下文），所以它必须只在换密钥、新建时
+  // 前进——改名也前进的话，别的 isolate 手里同 rev 的旧行会立刻被判过期，改个名字
+  // 等于把全网踢 15 秒。但这也意味着"rev 没变"的上下文推不动 DO 里的名字/网段，
+  // 于是派生第二个计数器：改名/改网段时前进它，DO 只在它更大时才覆盖名字与网段。
+  `ALTER TABLE networks ADD COLUMN cfg_rev INTEGER NOT NULL DEFAULT 0`,
   // 全局单调计数器。用全局而不是"每个网络取 MAX+1"，是为了删网后重建同一个 id
   // 也能拿到比墓碑更大的 rev，否则新网络会被自己上一次删掉的墓碑永久拒绝。
+  // k = 'seq' 是 rev，k = 'cfg' 是 cfg_rev，两条序列互不影响。
   `CREATE TABLE IF NOT EXISTS net_rev (
     k TEXT PRIMARY KEY,
     v INTEGER NOT NULL
@@ -260,18 +268,30 @@ function roomStub(env, network) {
 /**
  * 传给 DO 的网络上下文。**不含 join_hash**，DO 不需要也不应该拿到它。
  *
- * `rev` 是 D1 里这一行的版本号：DO 记住见过的最大值，比它小的上下文一律拒绝。
- * 这样"另一个 isolate 的 15 秒旧缓存"最多让它拿到一个旧的 rev，卡在 DO 这一关，
- * 而不是靠缓存新鲜度去赌。
+ * `rev` 是安全版本号：DO 记住见过的最大值，比它小的上下文一律拒绝。这样"另一个
+ * isolate 的 15 秒旧缓存"最多让它拿到一个旧的 rev，卡在 DO 这一关，而不是靠缓存
+ * 新鲜度去赌。
+ *
+ * `cfg_rev` 是配置版本号：改名 / 改网段时前进，DO 只在它更大时才覆盖名字与网段。
+ * 它与 rev 分开是必需的——见 DDL_STATEMENTS 里的说明。
  */
 function netContext(network) {
-  return JSON.stringify({
+  const ctx = {
     v: 1,
     id: network.network_id,
     name: network.name,
     cidr: network.cidr,
     rev: Number(network.rev ?? 0),
-  });
+    cfg_rev: Number(network.cfg_rev ?? 0),
+  };
+  // HTTP 头只能是 ByteString（Latin-1）。网络名允许中文（只有 id 强制 ASCII），
+  // 原样塞进 JSON 会让 headers.set 抛 "Cannot convert argument to a ByteString"，
+  // 表现为这个网络的所有业务请求都 500。非 ASCII 一律转成 \uXXXX，JSON 解析后
+  // 仍是原文；纯 ASCII 的内容逐字节不变。
+  return JSON.stringify(ctx).replace(
+    /[\u007f-\uffff]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
 /**
@@ -714,30 +734,65 @@ async function deleteNetwork(request, env, networkId) {
   const data = await res.json().catch(() => null);
   if (!data?.ok) return err(502, "room_bad_response", "DO 清理失败，网络没有删除");
   const removed = data.removed ?? 0;
-  await deleteNetworkRow(env, networkId);
+
+  // 第二步失败会留下"中间态"：DO 已经写下墓碑并清空，D1 里还留着这一行（rev 与墓碑
+  // 相同），此后所有请求都会被 403 network_deleted。再删一次能收尾，所以这里重试一次，
+  // 仍然失败就把话说明白——不要让管理员看到一句笼统的 500 去猜。
+  let deleted = false;
+  let deleteError = "";
+  for (let attempt = 0; attempt < 2 && !deleted; attempt += 1) {
+    try {
+      await deleteNetworkRow(env, networkId);
+      deleted = true;
+    } catch (e) {
+      deleteError = `${e?.name ?? "Error"}: ${e?.message ?? e}`.slice(0, 160);
+    }
+  }
+  if (!deleted) {
+    return err(
+      500,
+      "delete_record_failed",
+      `数据面已清理，但删除网络记录失败（${deleteError}）。这个网络现在对所有节点不可用，请再执行一次删除收尾`,
+    );
+  }
+
   await audit(env, "network.delete", networkId, `清理 ${removed} 个节点`, await adminActor(request, env));
   console.warn(`[signal] 删除网络 ${networkId}，清理 ${removed} 个节点`);
 
   return json({ ok: true, network: { id: networkId, name: net.name }, removed_nodes: removed });
 }
 
-/** 改网络：名字 / 网段。改网段会把落在新网段外的节点重新分配地址。 */
+/**
+ * 改网络：名字 / 网段。改网段会把落在新网段外的节点重新分配地址。
+ *
+ * 两件容易做错的事，都在这里处理：
+ *
+ * 1. **D1 与 DO 的一致性**：D1 先落库，再用 `/i/net-updated` 通知 DO。通知失败时
+ *    D1 已经是新值，管理员重试时 `changes.length === 0`——所以下面即使没有字段变更
+ *    也照样推一次上下文（幂等重推），否则 DO 会永久停在旧网段，新节点被分到旧网段
+ *    的地址。真正的"只在新时才应用"由 DO 用 cfg_rev 判定，见 NetworkRoom.loadNet。
+ * 2. **失败不能变成 500**：D1 已改，返回 500 会让管理员以为没生效，而管理页读的正是
+ *    D1（显示新值）。所以降级成 200 + synced:false + warning，重试即可自愈。
+ */
 async function updateNetwork(request, env, networkId) {
   const admin = await checkAdmin(request, env);
   if (admin) return admin;
 
   const net = await getNetworkFresh(env, networkId);
   if (!net) return err(404, "network_not_found", `没有网络 ${networkId}`);
-  if (!roomStub(env, net)) return roomUnavailable();
 
   const body = await readJson(request);
   if (body === null) return err(400, "invalid_json");
 
   const changes = [];
+  let cfgChanged = false;
   if (body.name !== undefined) {
     const name = String(body.name).trim().slice(0, 48);
     if (!name) return err(400, "invalid_name", "网络名不能为空");
-    if (name !== net.name) changes.push(`名字 ${net.name} → ${name}`);
+    if (name !== net.name) {
+      changes.push(`名字 ${net.name} → ${name}`);
+      cfgChanged = true;
+    }
     net.name = name;
   }
   if (body.cidr !== undefined) {
@@ -750,36 +805,66 @@ async function updateNetwork(request, env, networkId) {
       );
       if (clash) return err(409, "cidr_in_use", `${cidr} 已被网络「${clash.name}」使用`);
       changes.push(`网段 ${net.cidr} → ${cidr}`);
-      net.cidr = cidr;
+      cfgChanged = true;
     }
-  }
-  if (changes.length === 0) {
-    return json({ ok: true, changed: false, network: { id: net.network_id, name: net.name, cidr: net.cidr } });
+    net.cidr = cidr;
   }
 
-  // 改名/改网段不 bump rev：否则全网在每个 isolate 的缓存过期前（最多 15 秒）
-  // 都会因为"上下文比 DO 见过的旧"被 403，改个名字等于踢所有人。
-  await putNetwork(env, net, { bump: false });
+  // 改名 / 改网段前进 cfg_rev，**不动 rev**：rev 一动，别的 isolate 手里同 rev 的旧行
+  // 就会被判过期，改个名字等于把全网踢 15 秒。
+  if (cfgChanged) await putNetwork(env, net, { bump: false, cfg: true });
 
-  // 节点在 DO 里：改名/改网段都要推过去，改网段时由 DO 负责重新分配地址
-  const res = await roomAdminApi(env, net, "/i/net-updated", {
-    method: "POST",
-    body: { net: JSON.parse(netContext(net)), reassign: body.cidr !== undefined },
-  });
-  const data = res ? await res.json().catch(() => null) : null;
-  const reassigned = data?.reassigned ?? 0;
-  await audit(
-    env,
-    "network.update",
-    networkId,
-    `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}`,
-    await adminActor(request, env),
-  );
+  // 节点在 DO 里：改名/改网段要推过去，改网段时由 DO 负责重新分配地址。
+  // 没有字段变更也推（幂等重推）：上一次通知失败时，管理员重试就是靠这一次收尾。
+  const hasRoom = roomEnabled(env);
+  let synced = false;
+  let notifyError = "";
+  let reassigned = 0;
+  if (hasRoom) {
+    const payload = { net: JSON.parse(netContext(net)), reassign: body.cidr !== undefined };
+    for (let attempt = 0; attempt < 2 && !synced; attempt += 1) {
+      try {
+        const res = await roomAdminApi(env, net, "/i/net-updated", { method: "POST", body: payload });
+        const data = res?.ok ? await res.json().catch(() => null) : null;
+        synced = Boolean(data?.ok);
+        if (synced) reassigned = Number(data?.reassigned ?? 0);
+        else notifyError = `DO 返回 ${res?.status ?? "无响应"}`;
+      } catch (e) {
+        notifyError = `${e?.name ?? "Error"}: ${e?.message ?? e}`.slice(0, 120);
+      }
+    }
+  } else {
+    notifyError = "这个 Worker 没有绑定数据面（ROOM）";
+  }
+
+  if (changes.length) {
+    await audit(
+      env,
+      "network.update",
+      networkId,
+      `${changes.join("；")}${reassigned ? `；重分配 ${reassigned} 个节点` : ""}${
+        synced ? "" : `；数据面未确认：${notifyError}`
+      }`,
+      await adminActor(request, env),
+    );
+  }
+
+  const warnings = [];
+  if (!synced) {
+    warnings.push(
+      `数据面未确认（${notifyError || "未知原因"}）：控制面已是新配置${
+        changes.length ? "" : "（这次没有字段变更，此次为重新下发）"
+      }，节点可能仍按旧配置分配地址；再执行一次同样的修改即可重推`,
+    );
+  }
+
   return json({
     ok: true,
-    changed: true,
+    changed: changes.length > 0,
+    synced,
     network: { id: net.network_id, name: net.name, cidr: net.cidr },
     reassigned,
+    ...(warnings.length ? { warning: warnings.join("；") } : {}),
   });
 }
 
@@ -966,6 +1051,8 @@ async function reservationCounts(env) {
  * 升级前遗留的旧表（nodes/events/nonces）不再读写，留着不影响任何行为。
  */
 async function deleteNetworkRow(env, networkId) {
+  // 先失效：删除前后各清一次，避免并发请求把即将/刚被删掉的行读回缓存
+  invalidateNetwork(env, networkId);
   await env.DB.prepare("DELETE FROM networks WHERE network_id = ?").bind(networkId).run();
   // 预留备份也要一起删：否则同名网络重建时（例如测试里反复用 "home"）会把上一条
   // 网络的手填 IP 当成"历史预留"恢复出来，表现为"这个地址已被另一个节点预留"。
@@ -1448,7 +1535,15 @@ async function authenticate(request, env, url) {
   if (network && network.join_hash) {
     const digest = await sha256Hex(parsed.secret);
     if (!timingSafeEqual(digest, network.join_hash)) {
-      return { ok: false, response: err(403, "wrong_secret", "加入密钥不正确") };
+      // 缓存里对不上，不代表这把令牌是错的：换密钥后的 15 秒内，本 isolate 手里可能
+      // 还是旧 join_hash，拿到的恰恰是新令牌。鉴权失败是低频事件，直接读一次主库；
+      // 读到了就用最新行（顺手刷新缓存），读不到才判 wrong_secret。
+      // 反方向（旧令牌 + 旧缓存）不在这里兜，交给 DO 的 rev 判定，见 loadNet。
+      const fresh = await getNetworkFresh(env, parsed.networkId);
+      if (!fresh?.join_hash || !timingSafeEqual(digest, fresh.join_hash)) {
+        return { ok: false, response: err(403, "wrong_secret", "加入密钥不正确") };
+      }
+      return { ok: true, network: fresh };
     }
     return { ok: true, network };
   }
@@ -1580,39 +1675,63 @@ async function getNetworkFresh(env, id) {
 }
 
 /**
- * 取下一个全局单调的 rev。
+ * 取下一个全局单调的版本号。
  *
  * 先自增再读回，而不是 `RETURNING`：两条语句在 D1 与本地 SQLite 替身上行为一致。
  * 两个 isolate 并发时可能读到同一个值（各自的 +1 已经落库，读回的是更后面的值），
- * 这对正确性无影响——rev 只在同一个网络的 DO 内部比较，"不重复"不是必要条件，
+ * 这对正确性无影响——版本号只在同一个网络的 DO 内部比较，"不重复"不是必要条件，
  * "单调"才是。同一网络的写操作只有管理员触发，不存在并发抢同一个网络的场景。
+ *
+ * `k`：`'seq'` = 安全版本 rev，`'cfg'` = 配置版本 cfg_rev。两条序列独立编号。
  */
-async function nextRev(env) {
+async function nextCounter(env, k) {
   await env.DB.prepare(
-    "INSERT INTO net_rev (k, v) VALUES ('seq', 1) ON CONFLICT(k) DO UPDATE SET v = v + 1",
-  ).run();
-  const row = await env.DB.prepare("SELECT v FROM net_rev WHERE k = 'seq'").first();
+    "INSERT INTO net_rev (k, v) VALUES (?, 1) ON CONFLICT(k) DO UPDATE SET v = v + 1",
+  )
+    .bind(k)
+    .run();
+  const row = await env.DB.prepare("SELECT v FROM net_rev WHERE k = ?").bind(k).first();
   return Number(row?.v ?? 1);
+}
+
+function nextRev(env) {
+  return nextCounter(env, "seq");
+}
+
+function nextCfgRev(env) {
+  return nextCounter(env, "cfg");
 }
 
 /**
  * 写网络行。
  *
- * `bump: false` 用于改名/改网段：它们不需要让别的 isolate 手里的上下文立刻作废
- * （那会让全网在每个 isolate 的缓存过期前都收到 403，改名变成"踢所有人 15 秒"）。
- * 换密钥与新建会 bump，删网则由 DO 记墓碑。
+ * - `bump: true`（默认）前进 rev：仅用于新建与换密钥。它会让别的 isolate 手里的
+ *   上下文立刻作废（那些请求会收到 403 stale_net_rev），改名绝不能用。
+ * - `cfg: true` 前进 cfg_rev：用于改名 / 改网段。它不拒绝任何请求，只让 DO 知道
+ *   "名字或网段变了，请覆盖你手里那份"。
+ * - 删网则由 DO 记墓碑。
  */
-async function putNetwork(env, net, { bump = true } = {}) {
+async function putNetwork(env, net, { bump = true, cfg = false } = {}) {
   await ready(env);
   invalidateNetwork(env, net.network_id);
-  const rev = bump ? await nextRev(env) : Number(net.rev ?? 0);
-  net.rev = rev;
+  if (bump) net.rev = await nextRev(env);
+  else net.rev = Number(net.rev ?? 0);
+  if (cfg) net.cfg_rev = await nextCfgRev(env);
+  else net.cfg_rev = Number(net.cfg_rev ?? 0);
   await env.DB.prepare(
-    "INSERT OR REPLACE INTO networks (network_id, name, cidr, created_at, join_hash, rev) VALUES (?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO networks (network_id, name, cidr, created_at, join_hash, rev, cfg_rev) VALUES (?, ?, ?, ?, ?, ?, ?)",
   )
-    .bind(net.network_id, net.name, net.cidr, net.created_at, net.join_hash ?? "", rev)
+    .bind(
+      net.network_id,
+      net.name,
+      net.cidr,
+      net.created_at,
+      net.join_hash ?? "",
+      net.rev,
+      net.cfg_rev,
+    )
     .run();
-  // 再失效一次：分配 rev 与写库之间有两个 await，同 isolate 的并发请求可能在这段
+  // 再失效一次：分配版本号与写库之间有两个 await，同 isolate 的并发请求可能在这段
   // 窗口里把旧行重新读进缓存。只清一次会留下一个 15 秒的旧 join_hash。
   invalidateNetwork(env, net.network_id);
 }
@@ -2400,13 +2519,18 @@ function renderNets(list){
     td.appendChild(btn('查看','sm',function(){ current=n.id; pick.value=n.id; loadNodes(n.id); }));
     td.appendChild(btn('改网段','sm',function(){
       var v=prompt('新网段（10.x.0.0/16）。落在网段外的节点会被重新分配地址', n.cidr);
-      if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(load).catch(function(e){alert(e.message)});
+      if(v) api('/v1/admin/networks/'+n.id,'PATCH',{cidr:v}).then(function(j){
+        // 控制面已生效、数据面没确认时必须说出来，否则"改了没反应"无从排查
+        if(j.warning) alert('已保存，但：'+j.warning);
+        load();
+      }).catch(function(e){alert(e.message)});
     }));
     td.appendChild(btn('换密钥','sm',function(){
       if(!confirm('换掉「'+n.name+'」的加入密钥？旧令牌立刻失效')) return;
       api('/v1/admin/networks/'+n.id+'/rotate','POST',{}).then(function(j){
         $('tokenOut').classList.remove('hide');
         $('tokenOut').textContent = '新令牌（只显示这一次）：\\n' + j.token;
+        if(j.warning) alert('新令牌已生效，但：'+j.warning);
       }).catch(function(e){alert(e.message)});
     }));
     td.appendChild(btn('删除','sm danger',function(){
@@ -2708,6 +2832,7 @@ export class NetworkRoom {
     this.lastSweep = 0;
     // 由 loadNet 每次请求重设：请求带来的网络上下文是否已经过期 / 属于已删除的网络
     this.stale = false;
+    this.gone = false;
     this.lastCtx = null;
 
     // ping 由运行时自动应答：不唤醒对象、不计入请求（设计文档 §11 的容量假设依赖它）
@@ -2743,18 +2868,23 @@ export class NetworkRoom {
       // 保持网络上下文最新：Worker 换了绑定或网络改名时会带新头过来。
       // 顺带在这里判定上下文是否过期（stale 由 loadNet 设置）。
       this.loadNet(request);
-      // 过期上下文（换密钥后别的 isolate 还拿着 15 秒旧缓存）与已删除网络的请求
-      // 一律在这里拦掉。403 不是"稍后重试"，是"你的令牌已经不算数了"——客户端
-      // 收到后应停止重连，用新令牌重新 join（设计 §5.2）。
+      // 清理必须放在 stale 判定**之前**：删网中途失败（DO 已打墓碑、D1 行还在）时，
+      // 管理员重试删除带进来的正是那块墓碑的 rev，会被判 stale。这样第二次删除
+      // 永远进不来，"再删一次收尾"就成了空话。这个端点只有 Worker 鉴权后才会调。
+      if (path === "/i/purge" && method === "POST") return await this.handlePurge();
+      // 已删除网络的请求（含删网前 15 秒内缓存的网络行）与过期上下文（换密钥后别的
+      // isolate 还拿着旧缓存）一律在这里拦掉。403 不是"稍后重试"，是"你的令牌已经
+      // 不算数了"——客户端收到后应停止重连，用新令牌重新 join（设计 §5.2）。
       if (this.stale) {
-        return err(403, "stale_net_rev", "网络授权已更新，这个上下文已过期；请用最新令牌重新连接");
+        return this.gone
+          ? err(403, "network_deleted", "这个网络已被删除；请从管理员那里重新获取加入密钥")
+          : err(403, "stale_net_rev", "网络授权已更新，这个上下文已过期；请用最新令牌重新连接");
       }
       // 重新部署后 DO 是空的，先把 D1 里的预留捞回来再处理任何请求
       // （内部有一次性标记，正常运行时只是一次布尔判断）
       await this.ensureReservations();
       if (path === "/i/init" && method === "POST") return await this.handleInit(request);
       if (path === "/i/net-updated" && method === "POST") return await this.handleNetUpdated(request);
-      if (path === "/i/purge" && method === "POST") return await this.handlePurge();
       if (path === "/i/stats" && method === "GET") return json(this.stats());
       if (path === "/i/debug" && method === "GET") return json(this.debug());
 
@@ -2794,12 +2924,16 @@ export class NetworkRoom {
    * 2. **rev 单调**：记下见过的最大 rev，比它更旧的上下文一律拒绝。这是 15 秒行缓存
    *    的安全阀——换密钥后旧令牌在旧缓存里仍然"验得过"，但它带的 rev 比 DO 见过的旧。
    *
-   * 同步规则：只有 rev 更大时才用请求里的上下文覆盖 meta.net。同 rev 的旧请求
-   * （别的 isolate 缓存了改名前的名字）不能把已经推过来的新名字/新网段改回去。
+   * 同步规则（两件事分开）：
+   * - **名字 / 网段**看 `cfg_rev`，只有它更大才覆盖。改名、改网段不前进 rev（否则
+   *   等于把全网踢 15 秒），所以 rev 相同不代表配置相同；反过来，别的 isolate 缓存
+   *   的旧名字/旧网段 cfg_rev 更小，覆盖不了新值。
+   * - **不拒绝请求**：cfg_rev 再旧也只是"不应用"，绝不因此判 stale。
    */
   loadNet(request) {
     // 每次请求重来：stale 只看这一次带来的上下文
     this.stale = false;
+    this.gone = false;
     this.lastCtx = null;
     const raw = request.headers.get("x-qp2p-net");
     const cur = this.net();
@@ -2813,11 +2947,15 @@ export class NetworkRoom {
     if (ctx.v !== 1 || !ctx.id) return cur;
 
     const rev = Number(ctx.rev ?? 0);
+    const cfgRev = Number(ctx.cfg_rev ?? 0);
     this.lastCtx = { id: ctx.id, rev };
 
     const tomb = this.tombstone();
     if (tomb && tomb.id === ctx.id && rev <= Number(tomb.rev ?? 0)) {
+      // 网络已删除：与"上下文过期"区分开。删网中途失败（DO 清理成功、D1 行没删掉）
+      // 时也会走到这里，报"上下文已过期"会让人以为重连能好，其实要管理员再删一次。
       this.stale = true;
+      this.gone = true;
       return cur;
     }
 
@@ -2829,9 +2967,18 @@ export class NetworkRoom {
     if (rev > maxRev) this.setMeta("rev", String(rev));
 
     // 比整个上下文，不只比 id：改名、改网段后 DO 里的话术也得跟着变。
-    // 只有 rev 前进（或首次拿到上下文）才覆盖，避免旧缓存把新值改回去。
-    if (!cur || cur.id !== ctx.id || rev > maxRev) {
-      const next = { v: 1, id: ctx.id, name: ctx.name, cidr: ctx.cidr, rev };
+    // 名字/网段只在 cfg_rev 前进（或首次拿到上下文、或换了网络 id）时覆盖，避免
+    // 别的 isolate 缓存里的旧值把新值改回去；rev 前进说明是更新的行，一并采用。
+    const curCfg = Number(cur?.cfg_rev ?? 0);
+    if (!cur || cur.id !== ctx.id || cfgRev > curCfg || rev > maxRev) {
+      const next = {
+        v: 1,
+        id: ctx.id,
+        name: ctx.name,
+        cidr: ctx.cidr,
+        rev,
+        cfg_rev: cfgRev,
+      };
       this.setMeta("net", JSON.stringify(next));
       return next;
     }
@@ -2901,12 +3048,27 @@ export class NetworkRoom {
     // rev 必须一路带进来：换密钥时 Worker 先写了 D1（rev 前进），这里的 maxRev
     // 要立刻跟上，之后拿着 15 秒旧缓存送来的旧 rev 才会被 loadNet 拒掉。
     const rev = Number(body.net.rev ?? 0);
-    const net = { v: 1, id: body.net.id, name: body.net.name, cidr: body.net.cidr, rev };
-    this.setMeta("net", JSON.stringify(net));
+    const cfgRev = Number(body.net.cfg_rev ?? 0);
+    const cur = this.net();
+    // 同一个网络、cfg_rev 却比手里的小：这是一次滞后的推送（并发改两次、或重试比
+    // 首次还慢），应用它会把名字/网段、节点地址一起改回去。忽略配置部分。
+    // 换密钥（close=true）不受影响：那条路径 rev 一定前进、cfg_rev 不变。
+    const lagging = Boolean(cur) && cur.id === body.net.id && cfgRev < Number(cur.cfg_rev ?? 0);
+    const net = lagging
+      ? cur
+      : {
+          v: 1,
+          id: body.net.id,
+          name: body.net.name,
+          cidr: body.net.cidr,
+          rev,
+          cfg_rev: cfgRev,
+        };
+    if (!lagging) this.setMeta("net", JSON.stringify(net));
     if (rev > Number(this.getMeta("rev", "0"))) this.setMeta("rev", String(rev));
 
     let reassigned = 0;
-    if (body.reassign === true) {
+    if (body.reassign === true && !lagging) {
       const nodes = this.listNodes();
       for (const node of nodes) {
         if (ipInCidr(net.cidr, node.virtual_ip)) continue;

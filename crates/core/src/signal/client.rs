@@ -39,6 +39,10 @@ impl std::fmt::Display for SignalError {
         let hint = match self.code.as_str() {
             "invalid_token" => "令牌格式应为 qp2p1_<网络>_<密钥>，请向建网的人要完整的令牌",
             "wrong_secret" => "加入密钥不正确：可能已被换掉（rotate），或者你被移出了这个网络",
+            "stale_net_rev" => {
+                "服务端判定这份网络配置已过期（管理员换过准入密码）：拿最新令牌重新 join"
+            }
+            "network_deleted" => "这个网络已被删除：找管理员重新建网并拿新令牌",
             "network_not_found" => "服务端没有这个网络，确认 Worker 地址和令牌来自同一套部署",
             "target_not_found" => "对端不在这个网络里（可能已退出）",
             "target_offline" => "对端心跳已超时：它可能没在运行 qp2p up",

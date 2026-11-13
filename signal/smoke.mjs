@@ -276,6 +276,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     otherNet.body.token,
   );
 
+
   // 轮换：只作废这一个网络的密钥，ADMIN_SECRET 不动
   const rotNet = await call("POST", "/v1/admin/networks", {
     admin: secret,
@@ -286,6 +287,16 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     call("GET", "/v1/events", { token: tk, query: { node_id: "0".repeat(32), since: 0 } });
   const before = await probe(rotOld);
   check("轮换前令牌可用", before.body.error === "unknown_node", before.body);
+
+  // 网络名允许中文（只有 id 强制 ASCII）。名字要经 x-qp2p-net 头传给 DO，而 HTTP 头
+  // 只能是 Latin-1——原样塞中文会让这个网络的每个业务请求都 500。
+  const zhNet = await call("POST", "/v1/admin/networks", {
+    admin: secret,
+    body: { name: "我的家庭网络", join_key: "chinese-key-000001" },
+  });
+  check("可以用中文给网络起名", zhNet.status === 200 && zhNet.body.network?.name === "我的家庭网络", zhNet.body);
+  const zhProbe = await probe(zhNet.body.token);
+  check("中文名网络的业务请求不 500", zhProbe.status === 404 && zhProbe.body.error === "unknown_node", zhProbe.body);
 
   /**
    * 第二个 isolate：独立的网络行缓存（15 秒），D1 与 DO 仍与主 isolate 共用。
@@ -340,6 +351,20 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       "换密钥后旧缓存 isolate 的握手被拒（不是 101）",
       staleWs.status === 403 && staleWs.body.error === "stale_net_rev",
       staleWs.body,
+    );
+
+    // 反方向：这个 isolate 缓存里还是旧 join_hash，拿**新**令牌来反而"对不上"。
+    // 鉴权失败时读一次主库即可消掉这 15 秒窗口；否则客户端会因为 403 直接停止。
+    const newOnStale = await call("GET", "/v1/events", {
+      token: rotated.body.token,
+      query: { node_id: "0".repeat(32), since: 0 },
+      impl: workerB,
+      clientIp: "198.18.0.5",
+    });
+    check(
+      "换密钥后新令牌在旧缓存 isolate 里也能用（不是 403 wrong_secret）",
+      newOnStale.status === 404 && newOnStale.body.error === "unknown_node",
+      newOnStale.body,
     );
   }
 
@@ -401,8 +426,8 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       }),
     });
     check(
-      "删网后旧缓存 isolate 不能再 join",
-      ghostJoin.status === 403 && ghostJoin.body.error === "stale_net_rev",
+      "删网后旧缓存 isolate 不能再 join（报网络已删除）",
+      ghostJoin.status === 403 && ghostJoin.body.error === "network_deleted",
       ghostJoin.body,
     );
 
@@ -453,6 +478,178 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     );
     const downAfter = await probe(downRes.body.token);
     check("DO 恢复后新令牌可用", downAfter.body.error === "unknown_node", downAfter.body);
+  }
+
+  if (!remote) {
+    /**
+     * 回归：改网段时通知 DO 失败，DO 原先会永久停在旧网段。
+     *
+     * 成因：改动只写 D1（rev 不前进），DO 只在 rev 前进时覆盖上下文；管理员重试时
+     * D1 里已是新值，`changes.length === 0` 直接返回，永远不再推给 DO。
+     * 现在两条路都能收尾：cfg_rev（普通请求即可自愈）与幂等重推（管理员重试）。
+     */
+    console.log("\n2.5 改网段：通知失败后可自愈");
+
+    const breakRoom = () => {
+      const real = env.ROOM;
+      env.ROOM = {
+        idFromName: (n) => ({ name: String(n) }),
+        get: () => ({
+          fetch: async () => {
+            throw new Error("DO down (simulated)");
+          },
+        }),
+      };
+      return () => {
+        env.ROOM = real;
+        return real;
+      };
+    };
+
+    // A. 管理员重试路径：第二次 PATCH（同网段）只为重推上下文
+    const cfgId = "cidr-down";
+    const cfgNet = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: cfgId, join_key: "cidr-down-key-0001" },
+    });
+    const cfgToken = cfgNet.body.token;
+    const cfgOld = cfgNet.body.network.cidr;
+    await probe(cfgToken); // 让 DO 先拿到旧网段（创建网络本身不碰 DO）
+    const roomOf = env.ROOM.roomOf(cfgId);
+    check("DO 已记下旧网段", roomOf.net()?.cidr === cfgOld, roomOf.net());
+
+    const restore = breakRoom();
+    let cfgDown;
+    try {
+      cfgDown = await call("PATCH", `/v1/admin/networks/${cfgId}`, {
+        admin: secret,
+        body: { cidr: "10.201.0.0/16" },
+      });
+    } finally {
+      restore();
+    }
+    check(
+      "改网段通知失败时返回 200（不是 500）",
+      cfgDown.status === 200 && cfgDown.body.changed === true,
+      cfgDown.body,
+    );
+    check(
+      "改网段通知失败时标明 synced=false 并给出提示",
+      cfgDown.body.synced === false && Boolean(cfgDown.body.warning),
+      cfgDown.body,
+    );
+    check("DO 确实停在旧网段（复现前提）", roomOf.net()?.cidr === cfgOld, roomOf.net());
+
+    const retried = await call("PATCH", `/v1/admin/networks/${cfgId}`, {
+      admin: secret,
+      body: { cidr: "10.201.0.0/16" },
+    });
+    check(
+      "重试同样的修改：changed=false 但仍然重推",
+      retried.status === 200 && retried.body.changed === false && retried.body.synced === true,
+      retried.body,
+    );
+    check(
+      "重试后 DO 跟上新网段",
+      roomOf.net()?.cidr === "10.201.0.0/16",
+      roomOf.net(),
+    );
+
+    // B. cfg_rev 路径：不靠管理员重试，普通业务请求也能把新网段推过去
+    const cfg2 = "cidr-cfg";
+    const cfg2Net = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: cfg2, join_key: "cidr-cfg-key-00001" },
+    });
+    const cfg2Old = cfg2Net.body.network.cidr;
+    await probe(cfg2Net.body.token);
+    const room2 = env.ROOM.roomOf(cfg2);
+    const restore2 = breakRoom();
+    try {
+      await call("PATCH", `/v1/admin/networks/${cfg2}`, {
+        admin: secret,
+        body: { cidr: "10.202.0.0/16" },
+      });
+    } finally {
+      restore2();
+    }
+    check("cfg 路径：DO 仍在旧网段", room2.net()?.cidr === cfg2Old, room2.net());
+    const healed = await probe(cfg2Net.body.token);
+    check("cfg 路径：普通请求不被当成过期", healed.body.error === "unknown_node", healed.body);
+    check(
+      "cfg 路径：普通请求把新网段推给了 DO",
+      room2.net()?.cidr === "10.202.0.0/16",
+      room2.net(),
+    );
+    check(
+      "cfg_rev 前进但 rev 不变（改名/改网段不踢人）",
+      Number(room2.net()?.rev ?? 0) > 0 && Number(room2.net()?.cfg_rev ?? 0) > 0,
+      room2.net(),
+    );
+  }
+
+  if (!remote) {
+    /**
+     * 删网中途失败：DO 已打墓碑、D1 行还在。此时请求应当报"网络已删除"，
+     * 而不是误导人的"上下文已过期"；管理员再删一次能收尾。
+     */
+    console.log("\n2.6 删网中途失败");
+
+    const delId = "del-half";
+    const delNet = await call("POST", "/v1/admin/networks", {
+      admin: secret,
+      body: { name: delId, join_key: "del-half-key-00001" },
+    });
+    const delToken = delNet.body.token;
+    await probe(delToken);
+
+    const realDB = env.DB;
+    // 两次（首次 + 内部重试）都失败，才走到"请再执行一次删除"这条分支
+    let failsLeft = 2;
+    env.DB = {
+      prepare(sql) {
+        if (/^\s*DELETE\s+FROM\s+networks/i.test(sql) && failsLeft > 0) {
+          failsLeft -= 1;
+          return {
+            bind: () => ({
+              run: () => {
+                throw new Error("D1 write failed (simulated)");
+              },
+            }),
+          };
+        }
+        return realDB.prepare(sql);
+      },
+    };
+    let delRes;
+    try {
+      delRes = await call("DELETE", `/v1/admin/networks/${delId}`, {
+        admin: secret,
+        body: { confirm: delId },
+      });
+    } finally {
+      env.DB = realDB;
+    }
+    check(
+      "删网记录失败时给出明确错误码与收尾提示",
+      delRes.status === 500 &&
+        delRes.body.error === "delete_record_failed" &&
+        String(delRes.body.detail).includes("再执行一次"),
+      delRes.body,
+    );
+    const halfProbe = await probe(delToken);
+    check(
+      "中间态报网络已删除（不是上下文过期）",
+      halfProbe.status === 403 && halfProbe.body.error === "network_deleted",
+      halfProbe.body,
+    );
+    const delAgain = await call("DELETE", `/v1/admin/networks/${delId}`, {
+      admin: secret,
+      body: { confirm: delId },
+    });
+    check("再删一次收尾", delAgain.status === 200, delAgain.body);
+    const goneRow = await call("GET", `/v1/admin/networks/${delId}`, { admin: secret });
+    check("收尾后网络行已删除", goneRow.status === 404, goneRow.body);
   }
 
   // 兼容 2.0：那时没有 join_hash，令牌由 ADMIN_SECRET 派生，服务端仍要认

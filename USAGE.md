@@ -66,7 +66,7 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 ```
 ✓ Worker 可达
-  版本    : 2.8.2
+  版本    : 2.8.3
   引擎    : room（支持 WebSocket 长连接）
   存储    : D1（多地域一致）
   管理密钥: 已配置
