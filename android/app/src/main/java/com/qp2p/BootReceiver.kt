@@ -24,8 +24,9 @@ import android.util.Log
 class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action ?: return
-        if (action != Intent.ACTION_BOOT_COMPLETED && action != ACTION_QUICKBOOT) return
+        // 变量别叫 action：它会遮蔽 Intent.action，下面就写不出 `action = ...` 了
+        val act = intent.action ?: return
+        if (act != Intent.ACTION_BOOT_COMPLETED && act != ACTION_QUICKBOOT) return
 
         if (!AppConfig.autoConnect(context)) {
             Log.i(TAG, "开机自启：未开启「自动连接」，跳过")
@@ -42,7 +43,6 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         val service = Intent(context, Qp2pVpnService::class.java).apply {
-            // 显式 setAction：Intent.action 不是可写属性
             setAction(Qp2pVpnService.ACTION_CONNECT)
             putExtra(Qp2pVpnService.EXTRA_CONFIG, config)
             putExtra(Qp2pVpnService.EXTRA_FROM_BOOT, true)
