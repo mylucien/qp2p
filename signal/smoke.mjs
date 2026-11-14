@@ -1386,6 +1386,27 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     const pwdRes = await worker.fetch(pwdReq, env, ctx);
     check("登录后可以改密码", pwdRes.status === 200, pwdRes.status);
 
+    // 改密码的首要目的是"把可能被偷走的那份会话踢掉"。原来 cookie 的 MAC 只绑
+    // username + 过期时间，改完密码旧 cookie 照样能用满 2 小时。
+    const staleCookieRes = await worker.fetch(
+      new Request(`${base}/v1/admin/networks`, { headers: { cookie: cookieHeader } }),
+      env,
+      ctx,
+    );
+    check("改密码后旧 cookie 立刻失效", staleCookieRes.status === 401, staleCookieRes.status);
+
+    const freshCookie = (pwdRes.headers.get("set-cookie") ?? "").split(";")[0];
+    const freshCookieRes = await worker.fetch(
+      new Request(`${base}/v1/admin/networks`, { headers: { cookie: freshCookie } }),
+      env,
+      ctx,
+    );
+    check(
+      "改密码发的新 cookie 直接可用（不会把自己踢下线）",
+      freshCookieRes.status === 200,
+      freshCookieRes.status,
+    );
+
     const oldPwdLogin = await call("POST", "/v1/admin/login", {
       body: { username: "admin", password: "password123" },
     });
@@ -1397,10 +1418,68 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     });
     check("命令行密钥可重置密码", reset.status === 200, reset.body);
 
+    const afterResetRes = await worker.fetch(
+      new Request(`${base}/v1/admin/networks`, { headers: { cookie: freshCookie } }),
+      env,
+      ctx,
+    );
+    check("命令行重置密码后旧 cookie 失效", afterResetRes.status === 401, afterResetRes.status);
+
     const resetLogin = await call("POST", "/v1/admin/login", {
       body: { username: "admin", password: "resetpassword1" },
     });
     check("重置后新密码可登录", resetLogin.status === 200, resetLogin.body);
+
+    // 登出只清浏览器 cookie 是不够的：泄漏出去的副本会一直用到过期（最长 2 小时），
+    // 管理员点"登出"等于没做。这里验服务端真的把会话作废了。
+    const logoutLoginRes = await worker.fetch(
+      new Request(`${base}/v1/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "admin", password: "resetpassword1" }),
+      }),
+      env,
+      ctx,
+    );
+    const logoutCookie = (logoutLoginRes.headers.get("set-cookie") ?? "").split(";")[0];
+    const logoutRes = await worker.fetch(
+      new Request(`${base}/v1/admin/logout`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie: logoutCookie },
+      }),
+      env,
+      ctx,
+    );
+    const logoutBody = await logoutRes.json().catch(() => null);
+    check(
+      "带会话登出返回 revoked:true",
+      logoutRes.status === 200 && logoutBody?.revoked === true,
+      logoutBody,
+    );
+
+    const afterLogoutRes = await worker.fetch(
+      new Request(`${base}/v1/admin/networks`, { headers: { cookie: logoutCookie } }),
+      env,
+      ctx,
+    );
+    check("登出后旧 cookie 立刻失效", afterLogoutRes.status === 401, afterLogoutRes.status);
+
+    // 未登录也要能调登出（清掉自己浏览器里的死 cookie），但绝不能推动别人的代次，
+    // 否则任何人都能凭一个用户名把管理员踢下线。
+    const anonLogoutRes = await worker.fetch(
+      new Request(`${base}/v1/admin/logout`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      }),
+      env,
+      ctx,
+    );
+    const anonLogoutBody = await anonLogoutRes.json().catch(() => null);
+    check(
+      "未登录调登出不撤销任何会话",
+      anonLogoutRes.status === 200 && anonLogoutBody?.revoked === false,
+      anonLogoutBody,
+    );
 
     // 爆破防护：3 次失败后成功登录应清零计数
     for (let i = 0; i < 3; i += 1) {

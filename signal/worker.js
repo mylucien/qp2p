@@ -15,7 +15,7 @@
  * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
  */
 
-const VERSION = "2.8.3";
+const VERSION = "2.8.4";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -114,6 +114,10 @@ const DDL_STATEMENTS = [
   )`,
   // 老库补列必须放在建表之后：新库上 ALTER 会报 no such table
   `ALTER TABLE admin_actions ADD COLUMN actor TEXT NOT NULL DEFAULT ''`,
+  // 会话代次：进 cookie 的 MAC 输入。改密码 / 重置密码 / 登出时 +1，
+  // 于是所有已签发的 cookie 立刻失效——原来 MAC 只绑 username+过期时间，
+  // 改密码和登出都踢不掉旧 cookie（哪怕它们写的是"旧 cookie 立刻失效"）。
+  `ALTER TABLE admin_users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0`,
 ];
 
 // ---------------------------------------------------------------------------
@@ -202,7 +206,7 @@ async function route(request, url, env, ctx) {
   if (path === "/v1/admin/status" && method === "GET") return adminStatus(request, env);
   if (path === "/v1/admin/bootstrap" && method === "POST") return adminBootstrap(request, env);
   if (path === "/v1/admin/login" && method === "POST") return adminLogin(request, env);
-  if (path === "/v1/admin/logout" && method === "POST") return adminLogout(request);
+  if (path === "/v1/admin/logout" && method === "POST") return adminLogout(request, env);
   if (path === "/v1/admin/me" && method === "GET") return adminMe(request, env);
   if (path === "/v1/admin/password" && method === "POST") return adminPassword(request, env);
   if (path === "/v1/admin/password/reset" && method === "POST") return adminResetPassword(request, env);
@@ -1163,27 +1167,66 @@ function validateAccount(username, password) {
   return null;
 }
 
-async function adminCookieFor(env, username, expiresAt) {
-  const mac = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${expiresAt}`);
-  return `${expiresAt}.${username}.${mac.slice(0, 32)}`;
+/**
+ * 签发会话 cookie。
+ *
+ * 签名输入含 `epoch`（账号行里的 `session_epoch`）：改密码、重置密码、登出都会让它
+ * +1，于是**所有**已签发的 cookie 立刻失效。原先只绑 `username` + 过期时间，
+ * 那两类动作都踢不掉旧 cookie，而注释写的是"账号被删/改过，旧 cookie 立刻失效"——
+ * 实际只有"删"生效。
+ */
+async function adminCookieFor(env, username, expiresAt, epoch) {
+  const mac = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${epoch}:${expiresAt}`);
+  return `${expiresAt}.${username}.${epoch}.${mac.slice(0, 32)}`;
 }
 
-/** 解析 cookie 里的会话：签名对、没过期、账号还在，三者都满足才算数。 */
+/**
+ * 解析 cookie 里的会话：签名对、没过期、账号还在、代次没变，四者都满足才算数。
+ *
+ * 顺序上**先查库再验签**（原来相反）：MAC 里要拼库中当前的 `session_epoch`。
+ * 这次查询本来就在（原来用于判断"账号是否还在"），没有多出一次 D1 读。
+ */
 async function adminSession(request, env) {
   if (!env.ADMIN_SECRET) return null;
   const raw = cookieValue(request, ADMIN_COOKIE);
   if (!raw) return null;
   const parts = raw.split(".");
-  if (parts.length !== 3) return null;
-  const [expText, username, mac] = parts;
+  if (parts.length !== 4) return null;
+  const [expText, username, epochText, mac] = parts;
   const expiresAt = Number(expText);
+  const epoch = Number(epochText);
   if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return null;
+  if (!Number.isInteger(epoch) || epoch < 0) return null;
   if (!USERNAME_RE.test(username)) return null;
-  const expect = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${expiresAt}`);
-  if (!timingSafeEqual(mac, expect.slice(0, 32))) return null;
-  // 账号被删/改过，旧 cookie 立刻失效
+
   const user = await getAdminUser(env, username);
-  return user ? { username } : null;
+  if (!user) return null;
+  const current = Number(user.session_epoch ?? 0);
+  const expect = await hmacHex(env.ADMIN_SECRET, `admin:${username}:${current}:${expiresAt}`);
+  if (!timingSafeEqual(mac, expect.slice(0, 32))) return null;
+  // 代次落后 = 改过密码或登出过。MAC 已经覆盖了 current，这里显式比一次，
+  // 让"为什么失效"不必依赖读者记住签名输入里有什么。
+  if (epoch !== current) return null;
+  return { username, epoch: current };
+}
+
+/**
+ * 会话代次 +1：让该账号所有已签发的 cookie 立刻失效。
+ *
+ * 按账号而不是按设备——单管理员场景下这是想要的（"一键踢掉我在所有浏览器上的登录"），
+ * 多设备同时用同一账号时 A 设备登出会把 B 也踢下线，需要重登。
+ */
+async function bumpSessionEpoch(env, username) {
+  await ready(env);
+  await env.DB.prepare(
+    "UPDATE admin_users SET session_epoch = session_epoch + 1 WHERE username = ?",
+  )
+    .bind(username)
+    .run();
+  const row = await env.DB.prepare("SELECT session_epoch FROM admin_users WHERE username = ?")
+    .bind(username)
+    .first();
+  return Number(row?.session_epoch ?? 0);
 }
 
 function cookieValue(request, name) {
@@ -1200,8 +1243,8 @@ function sessionCookie(request, value, maxAgeSeconds) {
   return `${ADMIN_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
-function loginResponse(request, env, username) {
-  return adminCookieFor(env, username, Date.now() + ADMIN_SESSION_MS).then(
+function loginResponse(request, env, username, epoch) {
+  return adminCookieFor(env, username, Date.now() + ADMIN_SESSION_MS, epoch).then(
     (value) =>
       new Response(JSON.stringify({ ok: true, username }), {
         status: 200,
@@ -1261,7 +1304,8 @@ async function adminBootstrap(request, env) {
     updated_at: now,
   });
   await audit(env, "admin.bootstrap", username, "首次初始化", username);
-  return loginResponse(request, env, username);
+  // 新账号代次是 0（建表默认值），不需要额外读一次
+  return loginResponse(request, env, username, 0);
 }
 
 // 登录爆破防护：内存挡一层（isolate 内），D1 挡一层（跨 isolate、跨实例）。
@@ -1385,7 +1429,7 @@ async function adminLogin(request, env) {
 
   await clearFailures(env, username, ip);
   await audit(env, "login.ok", username, "", username);
-  return loginResponse(request, env, username);
+  return loginResponse(request, env, username, Number(user.session_epoch ?? 0));
 }
 
 /** 改自己的密码：必须验证旧密码。 */
@@ -1419,8 +1463,10 @@ async function adminPassword(request, env) {
     updated_at: Date.now(),
   });
   await audit(env, "admin.password", session.username, "", session.username);
-  // 旧 cookie 立即失效，用新会话回到页面
-  return loginResponse(request, env, session.username);
+  // 代次 +1：所有已签发的 cookie（包括可能已经被偷走的那份）立刻作废；
+  // 同时给当前浏览器发一张新代次的，避免改完密码把自己弹回登录页。
+  const epoch = await bumpSessionEpoch(env, session.username);
+  return loginResponse(request, env, session.username, epoch);
 }
 
 /** 忘记密码时的兜底：需要 ADMIN_SECRET（等同于服务器控制权）。 */
@@ -1447,6 +1493,9 @@ async function adminResetPassword(request, env) {
     created_at: Number(user.created_at),
     updated_at: Date.now(),
   });
+  // 重置密码（忘记密码的兜底）同样要作废所有已登录会话：
+  // 重置的典型场景就是"怀疑账号被别人用过"。
+  await bumpSessionEpoch(env, username);
   await audit(env, "admin.password_reset", username, "管理员重置", "cli");
   return json({ ok: true, username });
 }
@@ -1457,8 +1506,22 @@ async function adminMe(request, env) {
   return json({ ok: true, username: session.username });
 }
 
-async function adminLogout(request) {
-  return new Response(JSON.stringify({ ok: true }), {
+/**
+ * 登出：清掉浏览器里的 cookie，并把会话代次 +1。
+ *
+ * 只清 cookie 是不够的——cookie 一旦泄漏，攻击者手里那份副本会一直有效到过期
+ * （最长 2 小时），管理员"登出"这个动作等于没做。代次 +1 才会让所有副本立刻作废。
+ *
+ * 只在**带了有效会话**时才 +1：否则任何人凭一个用户名调这个接口就能把管理员
+ * 踢下线，等于白送一个拒绝服务入口。
+ */
+async function adminLogout(request, env) {
+  const session = env?.ADMIN_SECRET ? await adminSession(request, env) : null;
+  if (session) {
+    await bumpSessionEpoch(env, session.username);
+    await audit(env, "admin.logout", session.username, "", session.username);
+  }
+  return new Response(JSON.stringify({ ok: true, revoked: Boolean(session) }), {
     status: 200,
     headers: { ...JSON_HEADERS, "set-cookie": sessionCookie(request, "", 0) },
   });
