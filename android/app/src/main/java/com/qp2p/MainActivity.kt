@@ -496,13 +496,6 @@ class MainActivity : Activity() {
 
         autoSwitch = tintedSwitch()
         card.addView(switchRow("自动连接", autoSwitch))
-        // 这个开关现在管两条路径：打开 App 时、以及开机后
-        card.addView(TextView(this).apply {
-            text = "打开 App 或开机后自动连上。部分系统需在「自启动管理」里放行 qp2p，否则开机不会自动连。"
-            textSize = 12f
-            setTextColor(MUTED)
-            setPadding(0, 0, 0, dp(12))
-        })
 
         // 只有选了「保持在线」且系统确实限制后台时才出现，平时不占版面
         powerHint = TextView(this).apply {
