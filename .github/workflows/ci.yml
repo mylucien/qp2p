@@ -320,15 +320,38 @@ jobs:
         run: |
           APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
           echo "APK: $APK"
-          unzip -l "$APK" | grep -E 'lib/[^/]+/' || { echo "APK 里没有 .so" >&2; exit 1; }
-          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/' \
-            || { echo "缺 armeabi-v7a：32 位电视盒子会装不上" >&2; exit 1; }
-          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
-          "$AAPT" dump badging "$APK" | grep -E "sdkVersion|native-code"
-          "$AAPT" dump badging "$APK" | grep -q "sdkVersion:'23'" \
-            || { echo "minSdk 不是 23（Android 6.0），电视盒子装不上" >&2; exit 1; }
-          "$AAPT" dump badging "$APK" | grep -qi leanback \
-            || echo "注意：badging 里没看到 leanback，电视桌面可能不显示图标"
+          unzip -l "$APK" | grep -E 'lib/[^/]+/libqp2p'
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -l "$APK" | grep -q "lib/$abi/" \
+              || { echo "缺 $abi：电视盒子装不上（32 位盒子要 armeabi-v7a）" >&2; exit 1; }
+          done
+
+          # minSdk 用 apkanalyzer 读：新版 build-tools 的 `aapt2 dump badging`
+          # 已经不输出 sdkVersion 行了，拿它断言会误报。
+          MIN=""
+          ANALYZER="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          if [ -x "$ANALYZER" ]; then
+            MIN=$("$ANALYZER" manifest min-sdk "$APK" | tr -dc '0-9')
+          fi
+          if [ -z "$MIN" ]; then
+            MIN=$(grep -ohE 'android:minSdkVersion="[0-9]+"' \
+                    android/app/build/intermediates/merged_manifest/debug/*/AndroidManifest.xml \
+                  | head -1 | tr -dc '0-9')
+          fi
+          echo "minSdk=$MIN"
+          if [ -z "$MIN" ]; then
+            echo "::warning::读不到 APK 的 minSdk，跳过这条断言"
+          else
+            test "$MIN" = "23" \
+              || { echo "minSdk 是 $MIN，不是 23（Android 6.0），电视盒子装不上" >&2; exit 1; }
+          fi
+
+          # 电视桌面只认 LEANBACK_LAUNCHER，删了就等于侧载后没图标
+          if [ -x "$ANALYZER" ]; then
+            "$ANALYZER" manifest print "$APK" | grep -q LEANBACK_LAUNCHER \
+              || { echo "APK 里没有 LEANBACK_LAUNCHER，电视桌面上看不到图标" >&2; exit 1; }
+            echo "LEANBACK_LAUNCHER 在"
+          fi
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
