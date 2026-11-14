@@ -298,6 +298,14 @@ jobs:
             -o android/app/src/main/jniLibs build --release -p qp2p-android
           find android/app/src/main/jniLibs -name '*.so' -exec ls -lh {} \;
 
+      # 链接期查不出来：NDK 的 stub libc 里各 API 级别的符号都在。只有真机上缺了
+      # 才会 dlopen 失败（Android 6.0 上 `if_addrs` → `getifaddrs` 就是这么炸的），
+      # 所以编译完立刻拿符号表跟 minSdk 对一遍。
+      - name: 校验 so 没引用高于 minSdk 的符号
+        run: |
+          python3 scripts/check_android_symbols.py \
+            android/app/src/main/jniLibs/*/libqp2p_android.so
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"

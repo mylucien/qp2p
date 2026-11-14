@@ -60,10 +60,13 @@ pub struct StunObservation {
 ///
 /// `tls` 决定服务端出示哪张证书：同一份 `TlsIdentity` 重启后指纹不变，
 /// 对端才能钉扎。
+///
+/// `host_ips` 是外壳预先枚举好的本机地址（Android 走这条路，见下）。
 pub async fn bind(
     bind_addr: SocketAddr,
     stun_servers: &[String],
     tls: &crate::tls::TlsIdentity,
+    host_ips: &[Ipv4Addr],
 ) -> Result<Bound> {
     let socket = bind_socket(bind_addr)?;
     socket
@@ -110,7 +113,7 @@ pub async fn bind(
         .set_nonblocking(true)
         .context("切换 socket 为非阻塞模式失败")?;
 
-    let mut candidates = host_candidates(local_addr, bind_addr);
+    let mut candidates = host_candidates(local_addr, bind_addr, host_ips);
     if let Some(addr) = srflx {
         candidates.push(Candidate::new(CandidateKind::Srflx, addr));
     }
@@ -411,31 +414,68 @@ async fn try_upnp(local_addr: SocketAddr, timeout: Duration) -> Option<upnp::Map
 ///
 /// 过滤掉链路本地地址和虚拟网卡（docker / Hyper-V / VMware 等）：
 /// 这些地址通告出去只会让别人打到错误的设备。
-fn host_candidates(local_addr: SocketAddr, requested: SocketAddr) -> Vec<Candidate> {
+///
+/// 地址有两个来源，按优先级取：
+/// 1. `injected`：外壳自己枚举好传进来的。Android 走这条——它在 Android 上
+///    落到 `getifaddrs`，而那是 API 24（Android 7.0）才有的 libc 符号。
+///    链接期发现不了（NDK 的 stub libc 里有），运行期在 Android 6.0 上
+///    `dlopen` 直接失败，整个 so 都加载不起来（UnsatisfiedLinkError）。
+///    所以 Android 侧改由 Kotlin 用 `NetworkInterface` 枚举后经 JNI 传进来。
+/// 2. 系统枚举（`if_addrs`），桌面与服务器用。Android 上这段整个不编译，
+///    依赖也按 target 关掉，从链接期就断根。
+fn host_candidates(
+    local_addr: SocketAddr,
+    requested: SocketAddr,
+    injected: &[Ipv4Addr],
+) -> Vec<Candidate> {
     let mut out = Vec::new();
     if !requested.ip().is_unspecified() {
         out.push(Candidate::new(CandidateKind::Host, local_addr));
     }
 
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for iface in interfaces {
-            if iface.is_loopback() || is_virtual_interface(&iface.name) {
+    let port = local_addr.port();
+    if !injected.is_empty() {
+        for v4 in injected {
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
                 continue;
             }
-            if let IpAddr::V4(v4) = iface.ip() {
-                if v4.is_link_local() || v4.is_unspecified() {
+            out.push(Candidate::new(
+                CandidateKind::Host,
+                SocketAddr::new(IpAddr::V4(*v4), port),
+            ));
+        }
+        return out;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Ok(interfaces) = if_addrs::get_if_addrs() {
+            for iface in interfaces {
+                if iface.is_loopback() || is_virtual_interface(&iface.name) {
                     continue;
                 }
-                out.push(Candidate::new(
-                    CandidateKind::Host,
-                    SocketAddr::new(IpAddr::V4(v4), local_addr.port()),
-                ));
+                if let IpAddr::V4(v4) = iface.ip() {
+                    if v4.is_link_local() || v4.is_unspecified() {
+                        continue;
+                    }
+                    out.push(Candidate::new(
+                        CandidateKind::Host,
+                        SocketAddr::new(IpAddr::V4(v4), port),
+                    ));
+                }
             }
         }
     }
+
+    #[cfg(target_os = "android")]
+    {
+        tracing::debug!("[socket] 没拿到注入的本机地址，内网候选退化为出口地址");
+    }
+
     out
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_virtual_interface(name: &str) -> bool {
     const VIRTUAL: [&str; 10] = [
         "docker",
@@ -460,5 +500,33 @@ pub fn primary_ipv4() -> Option<Ipv4Addr> {
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(v4) => Some(v4),
         IpAddr::V6(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_of(ip: &str) -> Candidate {
+        // 只关心地址，不看优先级
+        Candidate::new(CandidateKind::Host, format!("{ip}:5000").parse().unwrap())
+    }
+
+    #[test]
+    fn injected_hosts_take_precedence_and_filter_loopback() {
+        let local: SocketAddr = "0.0.0.0:5000".parse().unwrap();
+        let injected: Vec<Ipv4Addr> = ["192.168.1.7", "127.0.0.1", "169.254.3.4", "10.0.0.2"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let got = host_candidates(local, local, &injected);
+        assert_eq!(got, vec![host_of("192.168.1.7"), host_of("10.0.0.2")]);
+    }
+
+    #[test]
+    fn explicit_bind_addr_is_also_a_host_candidate() {
+        let local: SocketAddr = "192.168.1.9:5000".parse().unwrap();
+        let got = host_candidates(local, local, &[]);
+        assert_eq!(got.first(), Some(&host_of("192.168.1.9")));
     }
 }

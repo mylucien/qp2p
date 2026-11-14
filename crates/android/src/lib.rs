@@ -88,6 +88,12 @@ pub struct StartConfig {
     /// 空闲多少秒断开直连（`keep_online` 为 false 时生效）。
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
+    /// Kotlin 侧用 `NetworkInterface` 枚举出来的本机 IPv4 地址，用作打洞的内网候选。
+    ///
+    /// 为什么不让 Rust 自己枚举：Android 的 `if_addrs` 底层是 `getifaddrs`，
+    /// 那是 API 24 才有的符号，Android 6.0 上会让整个 so 加载失败。
+    #[serde(default)]
+    pub local_ips: Vec<String>,
 }
 
 /// `prepare` 返回给 Kotlin 的信息，用来构建 VpnService。
@@ -218,8 +224,20 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
         .filter(|text| !text.is_empty())
         .and_then(|text| text.parse().ok());
 
+    // Kotlin 给的网卡地址：解析不了的单条忽略（比如 IPv6 或带前缀的写法），
+    // 全空也不致命——候选里至少还有出口地址。
+    let local_ips: Vec<Ipv4Addr> = config
+        .local_ips
+        .iter()
+        .filter_map(|text| text.trim().parse::<Ipv4Addr>().ok())
+        .collect();
+    if !local_ips.is_empty() {
+        let shown: Vec<String> = local_ips.iter().map(ToString::to_string).collect();
+        log(&format!("本机网卡候选：{}", shown.join(", ")));
+    }
+
     let (engine, reply) = rt.block_on(async {
-        let engine = Engine::bind_in(bind, &stun, data_dir)
+        let engine = Engine::bind_in_with(bind, &stun, data_dir, local_ips)
             .await
             .context("绑定 UDP 失败")?;
         let identity = engine.identity().clone();

@@ -508,6 +508,12 @@ adb shell am start -n com.qp2p/.MainActivity \
 少数盒子的固件把「设置 → VPN」整页删了，`Builder.establish()` 会返回 null，
 App 里会显示「系统没批准建 VPN」，这种情况换盒子或换固件，客户端这边没法绕。
 
+**`本地库加载失败：UnsatisfiedLinkError`** 是 0.1.8 及更早版本的自身缺陷，重装无效：
+so 里引用了 `getifaddrs`，这个符号 Android 7.0（API 24）才引入，6.0 上加载 so
+就直接失败。0.1.9 起改由 Kotlin 侧用 `NetworkInterface` 取网卡地址再交给内核，
+不再依赖该符号；装新包即可，无需其它设置。CI 现在也会在打包前把 so 的未定义符号
+跟 minSdk 对一遍（`scripts/check_android_symbols.py`），同类问题进不了发布。
+
 - **只接管虚拟网段**（如 `10.78.0.0/16`），手机上网照旧走运营商，不做全局代理
 - 令牌就是电脑上 `qp2p create` / `qp2p token` 打出的那串
 - 内层 MTU 默认 1280，App 自己的信令流量被排除在隧道外

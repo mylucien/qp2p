@@ -838,9 +838,12 @@ class MainActivity : Activity() {
         try {
             Native.isPrepared()
         } catch (t: Throwable) {
+            // 真实原因全在 message 里（比如 "dlopen failed: cannot locate symbol ..."），
+            // 只显示类名等于把唯一的线索扔了。
             Qp2pVpnService.markError(
                 "本地库加载失败：${t.javaClass.simpleName}",
-                "APK 可能没装完整（缺 so）；卸载后重装一次",
+                t.message?.lineSequence()?.firstOrNull()?.take(200)
+                    ?: "APK 可能没装完整（缺 so）；卸载后重装一次",
             )
         }
     }

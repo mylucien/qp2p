@@ -7,7 +7,11 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import org.json.JSONArray
 import org.json.JSONObject
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.util.Collections
 
 /**
  * 把 VpnService 建出来的接口交给 Rust 内核。
@@ -173,11 +177,36 @@ class Qp2pVpnService : VpnService() {
         android.util.Log.w("qp2p", message)
     }
 
+    /**
+     * 把本机网卡的 IPv4 地址塞进配置，交给 Rust 当打洞的内网候选。
+     *
+     * 为什么在 Kotlin 侧枚举：内核不能链接 `getifaddrs`——那个符号 API 24
+     * （Android 7.0）才有，Android 6.0 上 `dlopen` 会直接失败，整个 so 都加载
+     * 不起来（表现就是 `UnsatisfiedLinkError`）。`NetworkInterface` 没有这个门槛。
+     * 过滤规则与内核侧一致：跳过环回、链路本地（169.254）、未就绪的网卡。
+     */
+    private fun withLocalIps(config: String): String = try {
+        val ips = ArrayList<String>()
+        for (nif in Collections.list(NetworkInterface.getNetworkInterfaces())) {
+            if (!nif.isUp || nif.isLoopback) continue
+            for (ia in nif.interfaceAddresses) {
+                val addr = ia.address
+                if (addr is Inet4Address && !addr.isLoopbackAddress && !addr.isLinkLocalAddress) {
+                    addr.hostAddress?.let { ips.add(it) }
+                }
+            }
+        }
+        JSONObject(config).put("local_ips", JSONArray(ips)).toString()
+    } catch (t: Throwable) {
+        logLine("枚举本机网卡失败（内网候选会少一些）: ${t.message}")
+        config
+    }
+
     private fun runTunnel(config: String) {
         try {
             // 分阶段报状态：注册和建隧道都可能卡上几秒，只写"正在连接"看不出卡在哪
             setState(Phase.CONNECTING, "正在注册…")
-            val prepared = Native.prepare(config)
+            val prepared = Native.prepare(withLocalIps(config))
             val info = JSONObject(prepared)
             if (info.has("error")) {
                 val d = diagnose(info.optString("error"))
