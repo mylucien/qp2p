@@ -93,14 +93,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.9-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.9-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.9-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.9-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 6.0+（含电视盒子） | `qp2p-0.1.9-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
+| Windows 10/11 x64 | `qp2p-0.1.10-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.10-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.10-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.10-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 6.0+（含电视盒子） | `qp2p-0.1.10-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
-`qp2p-deploy-0.1.9-<平台>`，同样有 `SHA256SUMS.txt` 校验。
+`qp2p-deploy-0.1.10-<平台>`，同样有 `SHA256SUMS.txt` 校验。
 
 下载后先校验：
 
@@ -111,8 +111,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.9-linux-x86_64-static
-sudo mv qp2p-0.1.9-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.10-linux-x86_64-static
+sudo mv qp2p-0.1.10-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -204,7 +204,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.9 · 网络 home
+qp2p 0.1.10 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
@@ -464,6 +464,7 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 
 1. 安装 APK（需允许「安装未知来源」）
 2. 打开 App，填信令地址、加入令牌、本机名称（留空用 node_id 前 8 位）
+   （保存后地址和令牌会自动打码成 `********`，要改就点方框清空重输，见下文「地址与令牌会打码」）
 3. 点「连接」，第一次会弹系统 VPN 授权，同意
 4. 通知栏出现 qp2p 即在线（Android 13+ 要先允许通知；不给权限不影响连接）
 
@@ -473,7 +474,7 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 
 ```bash
 adb connect 192.168.1.x:5555        # 盒子先在「开发者选项」里开网络调试
-adb install -r qp2p-0.1.9-android.apk
+adb install -r qp2p-0.1.10-android.apk
 ```
 
 装完电视桌面上就有 qp2p 图标（Manifest 里带了 `LEANBACK_LAUNCHER`）。
@@ -547,6 +548,18 @@ so 里引用了 `getifaddrs`，这个符号 Android 7.0（API 24）才引入，6
 想用自动入网：先填好地址和令牌，点一次「保存配置」（或直接点「连接」）把配置存下来，
 再打开「自动连接」。之后冷启动 App、以及设备重启后都会自己连；
 第一次仍会弹一次系统 VPN 授权框。
+
+**地址与令牌会打码**
+
+点过「保存配置」或「连接」之后，信令地址和加入令牌立刻变成 `********`：
+不给光标、不能长按、复制不了，两个框长度也一样。别人拿你的手机点开 App 看不到令牌。
+
+要改就点一下那个方框——内容立刻清空并恢复可编辑，重新输入后保存即可。
+只清空了没保存也没事：真实配置还在本地，退出重进 App 会回到星号状态，
+不会因为误触把配置弄丢。
+
+说明一点：打码挡的是「拿到你解锁后的手机点开 App 看一眼」。真要防到底还得靠系统
+锁屏、应用锁这类，App 内部再怎么处理都绕不过「它有权限解密自己」这件事。
 
 - 空闲断的只是**直连**，长连接在休眠满 60 秒后也会断开省电，有流量时自动接回来
 - 只有勾了「保持在线」且系统仍限制后台时，卡片里才出现「系统仍可能限制后台」提示，

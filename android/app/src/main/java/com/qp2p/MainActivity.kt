@@ -1,6 +1,7 @@
 package com.qp2p
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -19,6 +20,7 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -86,8 +88,17 @@ class MainActivity : Activity() {
     /** 加载配置时不要触发"已保存"提示 */
     private var loading = false
 
-    /** Spinner 设 adapter 时会回调一次 onItemSelected，那次不是用户操作 */
-    private var spinnerSettling = true
+    /**
+     * 信令地址 / 令牌是否处于「已保存、打码」状态。
+     *
+     * 打码后框里只有星号，真实值只在 prefs 里；读取一律走 [workerValue] / [tokenValue]，
+     * 别直接读输入框，否则会把 `********` 当成配置存进去。
+     */
+    private var workerMasked = false
+    private var tokenMasked = false
+
+    /** 打码状态下的提示行，两个框都没打码时隐藏 */
+    private lateinit var maskHint: TextView
 
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -117,6 +128,11 @@ class MainActivity : Activity() {
             })
         }
 
+        // 打码状态下点一下即清空重输。误触不要紧：真实值还在 prefs 里，
+        // 退出重进 App 就回到星号状态，不会把已保存的配置弄丢。
+        workerInput.setOnClickListener { if (workerMasked) maskWorker(false) }
+        tokenInput.setOnClickListener { if (tokenMasked) maskToken(false) }
+
         connectButton.setOnClickListener {
             if (Qp2pVpnService.connected) {
                 disconnect()
@@ -128,12 +144,15 @@ class MainActivity : Activity() {
 
         keepSwitch.setOnCheckedChangeListener { _, checked ->
             if (loading) return@setOnCheckedChangeListener
+            // 值没变就什么都不做：程序里回设开关也会回调，那不是用户操作
+            if (prefs.getBoolean("keep_online", false) == checked) return@setOnCheckedChangeListener
             prefs.edit().putBoolean("keep_online", checked).apply()
             syncPowerUi()
             flash(if (Qp2pVpnService.connected) "已保存，重连后生效" else "已保存")
         }
         autoSwitch.setOnCheckedChangeListener { _, checked ->
             if (loading) return@setOnCheckedChangeListener
+            if (prefs.getBoolean("auto_connect", false) == checked) return@setOnCheckedChangeListener
             prefs.edit().putBoolean("auto_connect", checked).apply()
             flash(if (checked) "已保存，下次打开 App 直接入网" else "已保存")
         }
@@ -141,16 +160,19 @@ class MainActivity : Activity() {
             override fun onItemSelected(
                 parent: AdapterView<*>?, view: View?, position: Int, id: Long
             ) {
-                if (loading || spinnerSettling) return
-                prefs.edit().putInt("idle_minutes", idleMinutes()).apply()
+                if (loading) return
+                val minutes = IDLE_MINUTES.getOrElse(position) { IDLE_MINUTES[0] }
+                // Spinner 要等第一次布局完成才发这次回调，所以它总在 post 之后到达。
+                // 靠标志位挡不住，只能比"值变了没"——这就是以前一打开 App 就弹
+                // 「已保存」的原因。
+                if (prefs.getInt("idle_minutes", 10) == minutes) return
+                prefs.edit().putInt("idle_minutes", minutes).apply()
                 flash(if (Qp2pVpnService.connected) "已保存，重连后生效" else "已保存")
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
         powerHint.setOnClickListener { openBatterySettings() }
-        // adapter 初始化那次回调排在前面，等它过去再允许用户操作触发保存
-        ui.post { spinnerSettling = false }
 
         // 「自动连接」在 App 冷启动时生效：旋转屏幕、VPN 授权回来都不重复触发。
         // 已连上时不重复发起；Service 侧也做了幂等，防止 App 进程重建再次拉起隧道。
@@ -213,24 +235,28 @@ class MainActivity : Activity() {
         var filled = false
         extra("join").takeIf { it.isNotEmpty() }?.let { link ->
             parseJoinLink(link)?.let { (worker, token) ->
-                workerInput.setText(worker)
-                tokenInput.setText(token)
+                revealWorker(worker)
+                revealToken(token)
                 filled = true
             }
         }
         extra("worker").takeIf { it.isNotEmpty() }?.let {
-            workerInput.setText(it)
+            revealWorker(it)
             filled = true
         }
         extra("token").takeIf { it.isNotEmpty() }?.let {
-            tokenInput.setText(it)
+            revealToken(it)
             filled = true
         }
         extra("name").takeIf { it.isNotEmpty() }?.let {
             nameInput.setText(it)
             filled = true
         }
-        if (filled) saveSettings()
+        // 灌进去就算存过：和界面上点保存一致，立刻打码
+        if (filled) {
+            saveSettings()
+            maskSavedSecrets()
+        }
 
         val connect = extra("connect").lowercase().let { it == "1" || it == "true" || it == "yes" }
         return LaunchConfig(filled, connect)
@@ -380,15 +406,26 @@ class MainActivity : Activity() {
         card.addView(sectionTitle("连接信息"))
 
         card.addView(label("信令地址"))
-        workerInput = field(
-            "https://你的-worker.workers.dev",
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
-        )
+        workerInput = field("https://你的-worker.workers.dev", WORKER_TYPE)
+        // 关掉 View 状态自动恢复：旋转屏幕/重建会从 savedInstanceState 把明文捞回来，
+        // 那等于打码白做。这两个框的显示状态一律由 loadSettings 决定。
+        workerInput.isSaveEnabled = false
         card.addView(workerInput)
 
         card.addView(label("加入令牌", top = 14))
-        tokenInput = field("qp2p1_home_xxxx", InputType.TYPE_CLASS_TEXT)
+        tokenInput = field("qp2p1_home_xxxx", TOKEN_TYPE)
+        tokenInput.isSaveEnabled = false
         card.addView(tokenInput)
+
+        // 打码后必须让人知道怎么改回来，否则会以为配置丢了
+        maskHint = TextView(this).apply {
+            text = "地址与令牌已隐藏：点方框即清空，重新输入后保存"
+            textSize = 12f
+            setTextColor(MUTED)
+            setPadding(dp(2), dp(8), 0, 0)
+            visibility = View.GONE
+        }
+        card.addView(maskHint)
 
         card.addView(label("本机名称（可留空）", top = 14))
         nameInput = field("phone", InputType.TYPE_CLASS_TEXT)
@@ -856,8 +893,11 @@ class MainActivity : Activity() {
 
     private fun loadSettings() {
         loading = true
-        workerInput.setText(prefs.getString("worker", ""))
-        tokenInput.setText(prefs.getString("token", ""))
+        // 存过就一律打码：不因为"重新打开了 App"就把明文又摆出来一次
+        val worker = prefs.getString("worker", "").orEmpty().trim()
+        val token = prefs.getString("token", "").orEmpty().trim()
+        maskWorker(worker.isNotEmpty(), focus = false)
+        maskToken(token.isNotEmpty(), focus = false)
         nameInput.setText(prefs.getString("name", ""))
         ipInput.setText(prefs.getString("virtual_ip", ""))
         keepSwitch.isChecked = prefs.getBoolean("keep_online", false)
@@ -869,8 +909,8 @@ class MainActivity : Activity() {
 
     private fun saveSettings() {
         prefs.edit()
-            .putString("worker", workerInput.text.toString().trim())
-            .putString("token", tokenInput.text.toString().trim())
+            .putString("worker", workerValue())
+            .putString("token", tokenValue())
             .putString("name", nameInput.text.toString().trim())
             .putString("virtual_ip", ipInput.text.toString().trim())
             .putBoolean("keep_online", keepSwitch.isChecked)
@@ -879,12 +919,116 @@ class MainActivity : Activity() {
             .apply()
     }
 
+    // ------------------------------------------------------------------
+    // 信令地址 / 令牌打码
+    // ------------------------------------------------------------------
+
+    /**
+     * 掩码状态下框里只有星号，真实值只在 prefs 里。
+     *
+     * 所以读配置一律走这两个函数，**不能**直接读输入框——否则会把 `********`
+     * 当成地址存进 prefs，下次连接直接连到不存在的域名。
+     */
+    private fun workerValue(): String =
+        if (workerMasked) prefs.getString("worker", "").orEmpty().trim()
+        else workerInput.text.toString().trim()
+
+    private fun tokenValue(): String =
+        if (tokenMasked) prefs.getString("token", "").orEmpty().trim()
+        else tokenInput.text.toString().trim()
+
+    /** 配置已落盘：把有值的字段打成星号。保存和连接都走这里，两条路径行为一致。 */
+    private fun maskSavedSecrets() {
+        if (prefs.getString("worker", "").orEmpty().isNotEmpty()) maskWorker(true)
+        if (prefs.getString("token", "").orEmpty().isNotEmpty()) maskToken(true)
+    }
+
+    private fun maskWorker(masked: Boolean, focus: Boolean = true) {
+        workerMasked = masked
+        if (masked) applyMask(workerInput) else prepareForEdit(workerInput, WORKER_TYPE, focus)
+        refreshMaskHint()
+    }
+
+    private fun maskToken(masked: Boolean, focus: Boolean = true) {
+        tokenMasked = masked
+        if (masked) applyMask(tokenInput) else prepareForEdit(tokenInput, TOKEN_TYPE, focus)
+        refreshMaskHint()
+    }
+
+    /**
+     * 打码：固定 8 个星号（不透露真实长度），同时关掉焦点、光标、长按——
+     * 长按菜单里能「复制」，关了才真的拿不到。点击保留，用来清空重输。
+     */
+    private fun applyMask(input: EditText) {
+        input.setTextIsSelectable(false)
+        input.setText(MASK_TEXT)
+        input.inputType = InputType.TYPE_NULL
+        input.isFocusable = false
+        input.isFocusableInTouchMode = false
+        input.isLongClickable = false
+        input.isClickable = true
+        input.setTextColor(MUTED)
+    }
+
+    /** adb 灌进来的值：先按明文放好（后面 saveSettings + maskSavedSecrets 统一打码） */
+    private fun revealWorker(text: String) {
+        workerInput.setText(text)
+        restoreEditable(workerInput, WORKER_TYPE)
+        workerMasked = false
+        refreshMaskHint()
+    }
+
+    private fun revealToken(text: String) {
+        tokenInput.setText(text)
+        restoreEditable(tokenInput, TOKEN_TYPE)
+        tokenMasked = false
+        refreshMaskHint()
+    }
+
+    /** 只恢复可编辑属性，不动已有文本 */
+    private fun restoreEditable(input: EditText, type: Int) {
+        input.inputType = type
+        input.isFocusable = true
+        input.isFocusableInTouchMode = true
+        input.isLongClickable = true
+        input.isClickable = true
+        input.setTextIsSelectable(true)
+        input.setTextColor(INK)
+    }
+
+    /**
+     * 清空成空框并恢复可编辑。
+     *
+     * [focus] 为 false 时只恢复属性、不抢焦点——进 App 加载配置时字段本来可能为空，
+     * 那时候弹软键盘、把光标塞进去只会让人以为出错了。
+     */
+    private fun prepareForEdit(input: EditText, type: Int, focus: Boolean) {
+        input.setText("")
+        input.inputType = type
+        input.isFocusable = true
+        input.isFocusableInTouchMode = true
+        input.isLongClickable = true
+        input.isClickable = true
+        input.setTextIsSelectable(true)
+        input.setTextColor(INK)
+        if (!focus) return
+        input.requestFocus()
+        // 电视盒子常常没软键盘，这步失败也无所谓
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+            ?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    private fun refreshMaskHint() {
+        if (!::maskHint.isInitialized) return
+        maskHint.visibility = if (workerMasked || tokenMasked) View.VISIBLE else View.GONE
+    }
+
     /** 拼装交给 [AppConfig]：开机自启那条路径用的必须是同一份字段，别在两处各写一遍 */
     private fun configJson(): String {
         val keep = keepSwitch.isChecked
         return AppConfig.build(
-            worker = workerInput.text.toString().trim().trimEnd('/'),
-            token = tokenInput.text.toString().trim(),
+            worker = workerValue().trimEnd('/'),
+            token = tokenValue(),
             name = nameInput.text.toString().trim(),
             virtualIp = ipInput.text.toString().trim(),
             dataDir = filesDir.absolutePath,
@@ -941,7 +1085,7 @@ class MainActivity : Activity() {
      * 只报告、不自动纠正——静默改写用户填的地址比直接报错更难排查。
      */
     private fun validate(): String? {
-        val worker = workerInput.text.toString().trim()
+        val worker = workerValue()
         if (worker.isEmpty()) return "请填写信令地址（Worker 地址）"
         // 只接受 https：Rust 侧 normalize_worker 同样拒绝明文地址，两端保持一致
         if (!worker.startsWith("https://")) {
@@ -951,7 +1095,7 @@ class MainActivity : Activity() {
         if (!host.contains(".") || host.startsWith(".") || host.endsWith(".")) {
             return "信令地址不完整，例如 https://p2p.example.com"
         }
-        val token = tokenInput.text.toString().trim()
+        val token = tokenValue()
         if (token.isEmpty()) return "请填写加入令牌"
         if (!token.startsWith("qp2p1_")) return "令牌应以 qp2p1_ 开头"
         if (token.count { it == '_' } < 2) return "令牌格式应为 qp2p1_<网络>_<密钥>"
@@ -977,6 +1121,7 @@ class MainActivity : Activity() {
             return
         }
         saveSettings()
+        maskSavedSecrets()
         flash(if (Qp2pVpnService.connected) "已保存，下次连接生效" else "已保存")
     }
 
@@ -987,6 +1132,7 @@ class MainActivity : Activity() {
             return
         }
         saveSettings()
+        maskSavedSecrets()
         val intent = VpnService.prepare(this)
         if (intent != null) {
             // 第一次用会弹系统授权框（系统行为，无法内联）
@@ -1006,6 +1152,8 @@ class MainActivity : Activity() {
         }
         saveSettings()
         val config = configJson()
+        // 配置已进 prefs，先取好 JSON 再打码（打码只动界面，prefs 里仍是明文那次快照）
+        maskSavedSecrets()
         val intent = Intent(this, Qp2pVpnService::class.java).apply {
             action = Qp2pVpnService.ACTION_CONNECT
             putExtra(Qp2pVpnService.EXTRA_CONFIG, config)
@@ -1055,6 +1203,14 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQUEST_VPN = 1001
+
+        /** 打码后框里固定显示这个：不给长度信息，两个框长得一样 */
+        const val MASK_TEXT = "********"
+
+        /** 从掩码恢复成可编辑时要按原类型设回去，否则 URI 键盘和令牌输入会串 */
+        val WORKER_TYPE = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        val TOKEN_TYPE = InputType.TYPE_CLASS_TEXT
+
         val IDLE_MINUTES = listOf(10, 30, 60)
 
         val BG = Color.parseColor("#F4F6F8")
