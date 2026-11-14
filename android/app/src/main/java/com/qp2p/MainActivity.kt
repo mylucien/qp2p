@@ -97,9 +97,6 @@ class MainActivity : Activity() {
     private var workerMasked = false
     private var tokenMasked = false
 
-    /** 打码状态下的提示行，两个框都没打码时隐藏 */
-    private lateinit var maskHint: TextView
-
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -291,17 +288,17 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.MATCH_PARENT,
             )
-            setPadding(dp(20), dp(18), dp(20), dp(16))
+            setPadding(dp(16), dp(12), dp(16), dp(12))
         }
         scroll.addView(root)
 
         root.addView(
             TextView(this).apply {
                 text = "qp2p"
-                textSize = 24f
+                textSize = 22f
                 setTextColor(INK)
                 setTypeface(typeface, Typeface.BOLD)
-                setPadding(0, 0, 0, dp(14))
+                setPadding(0, 0, 0, dp(8))
             }
         )
 
@@ -313,7 +310,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(14) },
+            ).apply { topMargin = dp(10) },
         )
         return scroll
     }
@@ -321,7 +318,7 @@ class MainActivity : Activity() {
     private fun buildStatusCard(): LinearLayout {
         statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(14))
+            setPadding(dp(14), dp(11), dp(14), dp(11))
         }
 
         val row = LinearLayout(this).apply {
@@ -334,7 +331,7 @@ class MainActivity : Activity() {
         }
         statusTitle = TextView(this).apply {
             text = "未连接"
-            textSize = 20f
+            textSize = 18f
             setTextColor(INK)
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -353,7 +350,7 @@ class MainActivity : Activity() {
             text = "填好下面的信息，点连接"
             textSize = 13f
             setTextColor(MUTED)
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(4), 0, 0)
         }
         statusCard.addView(statusDetail)
         return statusCard
@@ -367,7 +364,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(12) }
+            ).apply { topMargin = dp(10) }
         }
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -412,26 +409,16 @@ class MainActivity : Activity() {
         workerInput.isSaveEnabled = false
         card.addView(workerInput)
 
-        card.addView(label("加入令牌", top = 14))
+        card.addView(label("加入令牌", top = 10))
         tokenInput = field("qp2p1_home_xxxx", TOKEN_TYPE)
         tokenInput.isSaveEnabled = false
         card.addView(tokenInput)
 
-        // 打码后必须让人知道怎么改回来，否则会以为配置丢了
-        maskHint = TextView(this).apply {
-            text = "地址与令牌已隐藏：点方框即清空，重新输入后保存"
-            textSize = 12f
-            setTextColor(MUTED)
-            setPadding(dp(2), dp(8), 0, 0)
-            visibility = View.GONE
-        }
-        card.addView(maskHint)
-
-        card.addView(label("本机名称（可留空）", top = 14))
+        card.addView(label("本机名称（可留空）", top = 10))
         nameInput = field("phone", InputType.TYPE_CLASS_TEXT)
         card.addView(nameInput)
 
-        card.addView(label("虚拟 IP（可留空，自动分配）", top = 14))
+        card.addView(label("虚拟 IP（可留空，自动分配）", top = 10))
         ipInput = field("留空 = 服务端分配，如 10.78.0.50", InputType.TYPE_CLASS_TEXT)
         card.addView(ipInput)
 
@@ -439,7 +426,7 @@ class MainActivity : Activity() {
             text = ""
             setTextColor(MUTED)
             textSize = 12f
-            setPadding(dp(2), dp(6), 0, dp(2))
+            setPadding(dp(2), dp(4), 0, 0)
         }
         card.addView(subnetHint)
 
@@ -449,8 +436,8 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
                 ).apply {
-                    topMargin = dp(10)
-                    bottomMargin = dp(14)
+                    topMargin = dp(8)
+                    bottomMargin = dp(10)
                 }
             }
         )
@@ -464,7 +451,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(8) }
         }
         idleLabel = TextView(this).apply {
             text = "直连保持"
@@ -526,7 +513,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(12) }
+            ).apply { bottomMargin = dp(8) }
         }
         row.addView(
             TextView(this).apply {
@@ -562,12 +549,12 @@ class MainActivity : Activity() {
         }
         col.addView(
             saveButton,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)),
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)),
         )
         col.addView(
             connectButton,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply {
-                topMargin = dp(10)
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)).apply {
+                topMargin = dp(8)
             },
         )
         return col
@@ -576,7 +563,7 @@ class MainActivity : Activity() {
     private fun card() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         background = roundRect(Color.WHITE, 14, 1, BORDER)
-        setPadding(dp(16), dp(14), dp(16), dp(16))
+        setPadding(dp(14), dp(12), dp(14), dp(12))
     }
 
     private fun cardParams(top: Int) = LinearLayout.LayoutParams(
@@ -590,14 +577,14 @@ class MainActivity : Activity() {
         setTextColor(MUTED)
         letterSpacing = 0.08f
         setTypeface(typeface, Typeface.BOLD)
-        setPadding(0, 0, 0, dp(4))
+        setPadding(0, 0, 0, dp(2))
     }
 
     private fun label(text: String, top: Int = 0) = TextView(this).apply {
         this.text = text
         textSize = 13f
         setTextColor(SUBTLE)
-        setPadding(dp(2), dp(top), 0, dp(6))
+        setPadding(dp(2), dp(top), 0, dp(4))
     }
 
     private fun field(hintText: String, type: Int) = EditText(this).apply {
@@ -607,9 +594,9 @@ class MainActivity : Activity() {
         setTextColor(INK)
         setHintTextColor(HINT)
         setSingleLine()
-        setPadding(dp(14), dp(13), dp(14), dp(13))
+        setPadding(dp(14), dp(10), dp(14), dp(10))
         background = inputBg()
-        minHeight = dp(50)
+        minHeight = dp(44)
     }
 
     private fun inputBg(): StateListDrawable {
@@ -939,13 +926,11 @@ class MainActivity : Activity() {
     private fun maskWorker(masked: Boolean, focus: Boolean = true) {
         workerMasked = masked
         if (masked) applyMask(workerInput) else prepareForEdit(workerInput, WORKER_TYPE, focus)
-        refreshMaskHint()
     }
 
     private fun maskToken(masked: Boolean, focus: Boolean = true) {
         tokenMasked = masked
         if (masked) applyMask(tokenInput) else prepareForEdit(tokenInput, TOKEN_TYPE, focus)
-        refreshMaskHint()
     }
 
     /**
@@ -968,14 +953,12 @@ class MainActivity : Activity() {
         workerInput.setText(text)
         restoreEditable(workerInput, WORKER_TYPE)
         workerMasked = false
-        refreshMaskHint()
     }
 
     private fun revealToken(text: String) {
         tokenInput.setText(text)
         restoreEditable(tokenInput, TOKEN_TYPE)
         tokenMasked = false
-        refreshMaskHint()
     }
 
     /** 只恢复可编辑属性，不动已有文本 */
@@ -1009,11 +992,6 @@ class MainActivity : Activity() {
         // 电视盒子常常没软键盘，这步失败也无所谓
         (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
             ?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
-    }
-
-    private fun refreshMaskHint() {
-        if (!::maskHint.isInitialized) return
-        maskHint.visibility = if (workerMasked || tokenMasked) View.VISIBLE else View.GONE
     }
 
     /** 拼装交给 [AppConfig]：开机自启那条路径用的必须是同一份字段，别在两处各写一遍 */
