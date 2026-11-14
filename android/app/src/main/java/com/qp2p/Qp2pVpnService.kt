@@ -44,6 +44,9 @@ class Qp2pVpnService : VpnService() {
         const val ACTION_CONNECT = "com.qp2p.CONNECT"
         const val ACTION_DISCONNECT = "com.qp2p.DISCONNECT"
         const val EXTRA_CONFIG = "config"
+
+        /** 由开机广播拉起时为 true：注册失败要按"等网络"重试，而不是立刻报错 */
+        const val EXTRA_FROM_BOOT = "from_boot"
         private const val CHANNEL = "qp2p-vpn"
         private const val NOTIFICATION_ID = 1
 
@@ -116,6 +119,10 @@ class Qp2pVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var worker: Thread? = null
 
+    /** 用户在开机重试期间点了断开：重试循环立刻退出，别再偷偷连上 */
+    @Volatile
+    private var bootAbort = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 任何异常都要变成界面上的文字，不能让进程崩掉——
         // 崩一次用户就再也不敢点了，而且拿不到原因
@@ -135,12 +142,13 @@ class Qp2pVpnService : VpnService() {
     private fun handleStart(intent: Intent?): Int {
         when (intent?.action) {
             ACTION_DISCONNECT -> {
+                bootAbort = true
                 Native.stop()
                 return START_NOT_STICKY
             }
         }
 
-        // 「启动连接」可能在 App 重新打开时重复拉起服务；已有会话就别开第二条隧道
+        // 「自动连接」可能在 App 重新打开、或开机广播后重复拉起服务；已有会话就别开第二条隧道
         if (intent?.action == ACTION_CONNECT &&
             (phase == Phase.CONNECTED || phase == Phase.CONNECTING)
         ) {
@@ -169,7 +177,9 @@ class Qp2pVpnService : VpnService() {
             logLine("startForeground 失败: ${t.message}")
         }
 
-        worker = Thread({ runTunnel(config) }, "qp2p-vpn").also { it.start() }
+        val fromBoot = intent?.getBooleanExtra(EXTRA_FROM_BOOT, false) ?: false
+        bootAbort = false
+        worker = Thread({ runTunnel(config, fromBoot) }, "qp2p-vpn").also { it.start() }
         return START_STICKY
     }
 
@@ -202,11 +212,39 @@ class Qp2pVpnService : VpnService() {
         config
     }
 
-    private fun runTunnel(config: String) {
+    /**
+     * 注册并拿到虚拟地址。
+     *
+     * 开机自启时网络往往还没就绪（WiFi 还没关联上、DHCP 还没回来），第一次注册
+     * 必然失败。这种情况下不能像手动连接那样直接报错，而是每 15 秒重试一次，
+     * 最多 6 次（约 75 秒）等网络起来；期间用户点断开（[bootAbort]）就立刻放弃。
+     * 手动连接保持一次到底，失败就把原因摊给用户看。
+     */
+    private fun prepareTunnel(config: String, fromBoot: Boolean): String {
+        val attempts = if (fromBoot) 6 else 1
+        var result = ""
+        for (i in 1..attempts) {
+            result = Native.prepare(withLocalIps(config))
+            if (!JSONObject(result).has("error")) return result
+            if (i == attempts || bootAbort) return result
+
+            val reason = JSONObject(result).optString("error")
+            logLine("开机自启：第 $i 次注册失败，15 秒后重试（$reason）")
+            setState(Phase.CONNECTING, "等网络就绪（第 ${i + 1}/$attempts 次）…")
+            var waited = 0
+            while (waited < 15 && !bootAbort) {
+                Thread.sleep(1000)
+                waited++
+            }
+        }
+        return result
+    }
+
+    private fun runTunnel(config: String, fromBoot: Boolean) {
         try {
             // 分阶段报状态：注册和建隧道都可能卡上几秒，只写"正在连接"看不出卡在哪
             setState(Phase.CONNECTING, "正在注册…")
-            val prepared = Native.prepare(withLocalIps(config))
+            val prepared = prepareTunnel(config, fromBoot)
             val info = JSONObject(prepared)
             if (info.has("error")) {
                 val d = diagnose(info.optString("error"))

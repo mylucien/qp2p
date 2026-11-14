@@ -8,6 +8,10 @@
          少了它 startForeground 会抛 SecurityException，表现为点了连接就闪退 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 开机自启：系统启动完成后按「自动连接」开关拉起隧道。
+         Android 没有单独的"自启动权限"，就是这条普通权限 + 一个接收器；
+         真正拦人的是厂商 ROM 的「自启动管理」，那个只能用户手动放行。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- 电视盒子没有触摸屏，桌面也不是 LAUNCHER：两个都声明成「非必需」，
          否则部分 TV 桌面会直接把 App 过滤掉，不显示图标 -->
@@ -50,5 +54,16 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="p2p vpn tunnel: keep the virtual interface and peer connections alive" />
         </service>
+
+        <!-- 开机自启。BOOT_COMPLETED 是受保护广播，只有系统能发；
+             额外接一个厂商的 QUICKBOOT_POWERON，老盒子/老电视常见。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

@@ -11,7 +11,7 @@
 - 三端：Linux（TUN）、Windows（原生图形界面 + 系统托盘）、Android（VpnService）
 - 换网自愈（WiFi ↔ 4G 几秒恢复）、虚拟地址手填并预留
 - 信令走 WebSocket 长连接，事件即时推送；连不上自动退回轮询，服务端恢复后自动切回
-- 「直连保持」可选 10 / 30 / 60 分钟，或开「保持在线」不断；「启动连接」开关打开后打开 App 自动入网；桌面端默认不断
+- 「直连保持」可选 10 / 30 / 60 分钟，或开「保持在线」不断；「自动连接」开关打开后打开 App、以及开机后都自动入网；桌面端默认不断
 - 信令面是单文件 Worker + 每网络一个 Durable Object（SQLite）。免费额度下单网络最多 256 节点，
   百台量级的常开设备仍在额度内
 
@@ -29,14 +29,14 @@ qp2p join qp2p1_home_...
 sudo qp2p up              # Windows 用管理员终端；或直接双击 exe 开图形界面
 ```
 
-Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连接」即可；打开「启动连接」开关后，
+Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连接」即可；打开「自动连接」开关后，
 每次打开 App 会自动入网（默认关，打开 App 需要手动点「连接」）。
 
 看到 `✓ 直连已建立：bob (10.78.156.207)` 后，`ping` 这个地址就通了。
 
 ## 下载与安装
 
-当前最新版：[v0.1.8](https://github.com/mylucien/qp2p/releases/tag/v0.1.8)。
+当前最新版：[v0.1.9](https://github.com/mylucien/qp2p/releases/tag/v0.1.9)。
 每个 Release 有 10 个附件：5 个客户端、4 个服务端部署器、1 个 `SHA256SUMS.txt`。
 
 **客户端**（照着下表选一个）：
@@ -65,7 +65,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 ### 2. 下载并校验
 
-从 [v0.1.8](https://github.com/mylucien/qp2p/releases/tag/v0.1.8) 下
+从 [v0.1.9](https://github.com/mylucien/qp2p/releases/tag/v0.1.9) 下
 `qp2p-deploy`，下面用 Linux 静态版举例，换成你下载的文件名即可。
 
 ### 3. 首次部署
@@ -74,8 +74,8 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 export CLOUDFLARE_API_TOKEN=...      # Windows PowerShell：$env:CLOUDFLARE_API_TOKEN="..."
 export CLOUDFLARE_ACCOUNT_ID=...
 
-./qp2p-deploy-0.1.8-linux-x86_64-static init --dry-run   # 先看要上传什么（密钥已脱敏）
-./qp2p-deploy-0.1.8-linux-x86_64-static init             # 真正部署
+./qp2p-deploy-0.1.9-linux-x86_64-static init --dry-run   # 先看要上传什么（密钥已脱敏）
+./qp2p-deploy-0.1.9-linux-x86_64-static init             # 真正部署
 ```
 
 验收：依次打印「① 校验令牌 → ② 准备 D1 → ③ 上传 Worker → ④ 启用 workers.dev → ⑤ 冒烟」，
@@ -103,8 +103,8 @@ curl https://p2p.example.com/v1/health     # 匿名只回 {"ok":true}
 ### 5. 以后升级
 
 ```bash
-./qp2p-deploy-0.1.8-linux-x86_64-static status   # 先看当前迁移标签与线上状态
-./qp2p-deploy-0.1.8-linux-x86_64-static up       # 升级，密钥与 D1/DO 数据都保留
+./qp2p-deploy-0.1.9-linux-x86_64-static status   # 先看当前迁移标签与线上状态
+./qp2p-deploy-0.1.9-linux-x86_64-static up       # 升级，密钥与 D1/DO 数据都保留
 ```
 
 验收：输出 `✓ 已升级到标签 ...`，再跑一次 `qp2p init --admin` 确认 `引擎 room`、

@@ -93,14 +93,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.8-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.8-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.8-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.8-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 6.0+（含电视盒子） | `qp2p-0.1.8-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
+| Windows 10/11 x64 | `qp2p-0.1.9-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.9-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.9-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.9-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 6.0+（含电视盒子） | `qp2p-0.1.9-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
-`qp2p-deploy-0.1.8-<平台>`，同样有 `SHA256SUMS.txt` 校验。
+`qp2p-deploy-0.1.9-<平台>`，同样有 `SHA256SUMS.txt` 校验。
 
 下载后先校验：
 
@@ -111,8 +111,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.8-linux-x86_64-static
-sudo mv qp2p-0.1.8-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.9-linux-x86_64-static
+sudo mv qp2p-0.1.9-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -204,7 +204,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.8 · 网络 home
+qp2p 0.1.9 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
@@ -473,7 +473,7 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 
 ```bash
 adb connect 192.168.1.x:5555        # 盒子先在「开发者选项」里开网络调试
-adb install -r qp2p-0.1.8-android.apk
+adb install -r qp2p-0.1.9-android.apk
 ```
 
 装完电视桌面上就有 qp2p 图标（Manifest 里带了 `LEANBACK_LAUNCHER`）。
@@ -492,7 +492,7 @@ adb shell am start -n com.qp2p/.MainActivity \
   -e join "https://qp2p.321288.xyz/?token=qp2p1_home_xxxx"
 ```
 
-这几个参数会写进 App 配置（下次打开还在），`connect=1` 只对这一次启动生效，不改「启动连接」开关。
+这几个参数会写进 App 配置（下次打开还在），`connect=1` 只对这一次启动生效，不改「自动连接」开关。
 第一次连接仍会弹系统 VPN 授权框，用遥控器按「确定」即可。
 
 验收：
@@ -538,14 +538,15 @@ so 里引用了 `getifaddrs`，这个符号 Android 7.0（API 24）才引入，6
 |---|---|---|
 | 保持在线 | 关 | 开：锁屏、空闲都不断直连也不断长连接。关：按「直连保持」选的档位休眠 |
 | 直连保持（下拉） | 10 分钟 | 10 / 30 / 60 分钟；只有「保持在线」关闭时才生效 |
-| 启动连接 | 关 | 开：每次打开 App 直接入网，不用点按钮。关：打开 App 后要手动点「连接」 |
+| 自动连接 | 关 | 开：打开 App 自动入网，**开机后也自动连**。关：打开 App 后要手动点「连接」，开机也不连 |
 
-「启动连接」开关和「连接」按钮是两回事：前者管「打开 App 时自动连」，后者是手动连接。
-按钮就叫「连接」，连上后变成「断开连接」，不叫「自动连接」，免得和开关混淆。
+「自动连接」开关和「连接」按钮是两回事：前者管「打开 App 时、以及开机后自动连」，
+后者是手动连接。按钮就叫「连接」，连上后变成「断开连接」。
 按钮上面那个是「保存配置」，只存不改连接状态。
 
 想用自动入网：先填好地址和令牌，点一次「保存配置」（或直接点「连接」）把配置存下来，
-再打开「启动连接」。之后冷启动 App 就会自己连；第一次仍会弹一次系统 VPN 授权框。
+再打开「自动连接」。之后冷启动 App、以及设备重启后都会自己连；
+第一次仍会弹一次系统 VPN 授权框。
 
 - 空闲断的只是**直连**，长连接在休眠满 60 秒后也会断开省电，有流量时自动接回来
 - 只有勾了「保持在线」且系统仍限制后台时，卡片里才出现「系统仍可能限制后台」提示，
@@ -554,9 +555,36 @@ so 里引用了 `getifaddrs`，这个符号 Android 7.0（API 24）才引入，6
 
 **验一下**
 
-1. 「启动连接」保持关闭 → 打开 App 是灰点「未连接」，必须手动点「连接」才连上
-2. 打开「启动连接」→ 完全退出 App 再打开 → 不用点按钮，状态自己变绿「已连接」
+1. 「自动连接」保持关闭 → 打开 App 是灰点「未连接」，必须手动点「连接」才连上
+2. 打开「自动连接」→ 完全退出 App 再打开 → 不用点按钮，状态自己变绿「已连接」
 3. 把令牌改错一位再连 → 顶部出现红条「令牌被拒绝」，不弹窗；改回一位红条消失
+
+**开机自启**
+
+`自动连接` 打开后，设备重启完会自动把隧道拉起来，不需要打开 App。三条前提：
+
+1. 至少成功连接过一次（系统 VPN 授权是持久的，没授权过就没法在后台弹框）；
+2. 配置已保存（信令地址 + 令牌），否则开机时没东西可连；
+3. 系统没拦你的自启动。国产 ROM（MIUI / EMUI / ColorOS / FuntouchOS 等）默认拦，
+   要去系统的「自启动管理」「后台应用管理」里把 qp2p 加白，否则广播根本收不到。
+
+不需要 root，也不用额外的"自启动权限"——Android 里就是一条 `RECEIVE_BOOT_COMPLETED`
+普通权限加一个接收器，装的时候自动生效。
+
+开机瞬间 WiFi 常常还没连上，所以服务对"开机触发的连接"会每 15 秒重试一次、最多 6 次
+（约 75 秒）等网络就绪，期间界面显示「等网络就绪（第 n/6 次）」；这期间点「断开」
+会立刻放弃重试，不会又偷偷连上。
+
+验证（不用真的重启，用 adb 触发同一个接收器）：
+
+```bash
+adb shell am broadcast -a android.intent.action.QUICKBOOT_POWERON -n com.qp2p/.BootReceiver
+adb logcat -s qp2p     # 看到「开机自启：已拉起隧道服务」就对了
+```
+
+真机重启验证：`adb reboot`，等盒子起来后直接 `adb shell dumpsys activity services com.qp2p`，
+能看到 `Qp2pVpnService` 且通知栏有 qp2p 即成功。日志里没出现「开机自启」字样，
+就是被系统拦了自启动，回到第 3 条处理。
 
 ### 数据目录
 

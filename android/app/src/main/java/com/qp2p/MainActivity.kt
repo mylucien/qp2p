@@ -28,14 +28,13 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
-import org.json.JSONObject
 import kotlin.math.roundToInt
 
 /**
  * 一页式界面：状态卡 + 告警条 + 一张连接信息卡片 + 两个按钮。
  *
- * 「启动连接」开关和「连接」按钮是两件事：开关打开则每次打开 App 自动入网；
- * 开关没打开时，打开 App 需要手动点「连接」。文案刻意不叫「自动连接」，避免混淆。
+ * 「自动连接」开关和「连接」按钮是两件事：开关打开则打开 App、以及开机后都自动入网；
+ * 开关没打开时，需要手动点「连接」。开机自启由 [BootReceiver] 按这个开关决定。
  *
  * 刻意不引入 AndroidX —— 少一个依赖就少一处 CI 上可能挂的地方。
  * 所有提示都做在页面里（状态卡 + 内联告警条），**不用 Toast、不用对话框**：
@@ -153,9 +152,9 @@ class MainActivity : Activity() {
         // adapter 初始化那次回调排在前面，等它过去再允许用户操作触发保存
         ui.post { spinnerSettling = false }
 
-        // 「启动连接」只在冷启动生效：旋转屏幕、VPN 授权回来都不重复触发。
+        // 「自动连接」在 App 冷启动时生效：旋转屏幕、VPN 授权回来都不重复触发。
         // 已连上时不重复发起；Service 侧也做了幂等，防止 App 进程重建再次拉起隧道。
-        // `-e connect 1` 与「启动连接」等价，但只对这一次启动有效，不改持久开关。
+        // `-e connect 1` 与「自动连接」等价，但只对这一次启动有效，不改持久开关。
         if (savedInstanceState == null &&
             (prefs.getBoolean("auto_connect", false) || launch.connect) &&
             !Qp2pVpnService.connected
@@ -205,7 +204,7 @@ class MainActivity : Activity() {
      *     adb shell am start -n com.qp2p/.MainActivity \
      *         -e join "https://p2p.example.com/?token=qp2p1_home_xxx"
      *
-     * `connect` 只对这一次启动生效，不改「启动连接」那个持久开关。
+     * `connect` 只对这一次启动生效，不改「自动连接」那个持久开关。
      */
     private fun applyLaunchExtras(intent: Intent?): LaunchConfig {
         val from = intent ?: return LaunchConfig(false, false)
@@ -459,7 +458,14 @@ class MainActivity : Activity() {
         card.addView(idleRow)
 
         autoSwitch = tintedSwitch()
-        card.addView(switchRow("启动连接", autoSwitch))
+        card.addView(switchRow("自动连接", autoSwitch))
+        // 这个开关现在管两条路径：打开 App 时、以及开机后
+        card.addView(TextView(this).apply {
+            text = "打开 App 或开机后自动连上。部分系统需在「自启动管理」里放行 qp2p，否则开机不会自动连。"
+            textSize = 12f
+            setTextColor(MUTED)
+            setPadding(0, 0, 0, dp(12))
+        })
 
         // 只有选了「保持在线」且系统确实限制后台时才出现，平时不占版面
         powerHint = TextView(this).apply {
@@ -662,7 +668,7 @@ class MainActivity : Activity() {
         }
 
         // 已连接时切成白底绿框的「断开连接」；平时一律叫「连接」。
-        // 文案不叫「自动连接」——那是上面「启动连接」开关的功能，两者不能混。
+        // 按钮就叫「连接」，别和上面的「自动连接」开关混。
         connectButton.text = if (phase == Qp2pVpnService.Phase.CONNECTED) "断开连接" else "连接"
         if (phase == Qp2pVpnService.Phase.CONNECTED) {
             connectButton.background = roundRect(Color.WHITE, 12, 1, GREEN)
@@ -873,21 +879,18 @@ class MainActivity : Activity() {
             .apply()
     }
 
+    /** 拼装交给 [AppConfig]：开机自启那条路径用的必须是同一份字段，别在两处各写一遍 */
     private fun configJson(): String {
-        val json = JSONObject()
-        json.put("worker", workerInput.text.toString().trim().trimEnd('/'))
-        json.put("token", tokenInput.text.toString().trim())
-        json.put("name", nameInput.text.toString().trim())
-        val ip = ipInput.text.toString().trim()
-        if (ip.isNotEmpty()) json.put("virtual_ip", ip)
-        json.put("data_dir", filesDir.absolutePath)
-        // 移动网络常见 1280 的内层 MTU，先用保守值，跑通再按需调大
-        json.put("mtu", 1280)
-        json.put("bind", "0.0.0.0:0")
         val keep = keepSwitch.isChecked
-        json.put("keep_online", keep)
-        json.put("idle_secs", if (keep) 0 else idleMinutes() * 60)
-        return json.toString()
+        return AppConfig.build(
+            worker = workerInput.text.toString().trim().trimEnd('/'),
+            token = tokenInput.text.toString().trim(),
+            name = nameInput.text.toString().trim(),
+            virtualIp = ipInput.text.toString().trim(),
+            dataDir = filesDir.absolutePath,
+            keepOnline = keep,
+            idleMinutes = idleMinutes(),
+        )
     }
 
     // ------------------------------------------------------------------
