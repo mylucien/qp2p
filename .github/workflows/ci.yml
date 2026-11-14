@@ -314,6 +314,22 @@ jobs:
           mkdir -p "$ANDROID_USER_HOME"
           gradle assembleDebug --no-daemon --stacktrace
 
+      # 电视盒子装在 Android 6.0 上，minSdk 一旦弹回 24 就装不上。打包后直接验
+      # APK 里真实写进去的值，别只信 build.gradle.kts。
+      - name: 校验 APK 的 minSdk 与 32 位 ABI
+        run: |
+          APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
+          echo "APK: $APK"
+          unzip -l "$APK" | grep -E 'lib/[^/]+/' || { echo "APK 里没有 .so" >&2; exit 1; }
+          unzip -l "$APK" | grep -q 'lib/armeabi-v7a/' \
+            || { echo "缺 armeabi-v7a：32 位电视盒子会装不上" >&2; exit 1; }
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          "$AAPT" dump badging "$APK" | grep -E "sdkVersion|native-code"
+          "$AAPT" dump badging "$APK" | grep -q "sdkVersion:'23'" \
+            || { echo "minSdk 不是 23（Android 6.0），电视盒子装不上" >&2; exit 1; }
+          "$AAPT" dump badging "$APK" | grep -qi leanback \
+            || echo "注意：badging 里没看到 leanback，电视桌面可能不显示图标"
+
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:

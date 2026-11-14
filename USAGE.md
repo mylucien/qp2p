@@ -97,7 +97,7 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 | Linux x86_64（主流发行版） | `qp2p-0.1.8-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
 | Linux x86_64（老系统/容器） | `qp2p-0.1.8-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
 | Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.8-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 8+ | `qp2p-0.1.8-android.apk` | VpnService，debug 签名 |
+| Android 6.0+（含电视盒子） | `qp2p-0.1.8-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
 `qp2p-deploy-0.1.8-<平台>`，同样有 `SHA256SUMS.txt` 校验。
@@ -466,6 +466,47 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 2. 打开 App，填信令地址、加入令牌、本机名称（留空用 node_id 前 8 位）
 3. 点「连接」，第一次会弹系统 VPN 授权，同意
 4. 通知栏出现 qp2p 即在线（Android 13+ 要先允许通知；不给权限不影响连接）
+
+**电视盒子 / Android TV**
+
+盒子一般没有应用市场，直接侧载：
+
+```bash
+adb connect 192.168.1.x:5555        # 盒子先在「开发者选项」里开网络调试
+adb install -r qp2p-0.1.8-android.apk
+```
+
+装完电视桌面上就有 qp2p 图标（Manifest 里带了 `LEANBACK_LAUNCHER`）。
+遥控器敲不进 `qp2p1_home_xxx` 这种令牌，所以配置可以从电脑灌进去：
+
+```bash
+# 分开给：信令地址 + 令牌 + 名字，最后直接连
+adb shell am start -n com.qp2p/.MainActivity \
+  -e worker https://qp2p.321288.xyz \
+  -e token qp2p1_home_xxxx \
+  -e name tvbox \
+  -e connect 1
+
+# 或者一条链接给完（电脑上 qp2p create 打印的就是这个形状）
+adb shell am start -n com.qp2p/.MainActivity \
+  -e join "https://qp2p.321288.xyz/?token=qp2p1_home_xxxx"
+```
+
+这几个参数会写进 App 配置（下次打开还在），`connect=1` 只对这一次启动生效，不改「启动连接」开关。
+第一次连接仍会弹系统 VPN 授权框，用遥控器按「确定」即可。
+
+验收：
+
+1. `adb shell dumpsys activity services com.qp2p | grep Qp2pVpnService` 能看到服务
+2. App 里状态是绿点「已连接」，副行显示虚拟 IP
+3. 在电脑上 `ping <那个虚拟 IP>` 能通
+
+盒子上装不上或建不起隧道时，先看两条：`adb shell getprop ro.build.version.sdk`
+（要 ≥ 23，即 Android 6.0）、`adb logcat -s qp2p`（失败原因都打在这里）。
+覆盖安装报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 是因为 CI 每次跑都现生成 debug 签名，
+换一个构建签名就变了——先 `adb uninstall com.qp2p` 再装（配置会丢，重新灌一次即可）。
+少数盒子的固件把「设置 → VPN」整页删了，`Builder.establish()` 会返回 null，
+App 里会显示「系统没批准建 VPN」，这种情况换盒子或换固件，客户端这边没法绕。
 
 - **只接管虚拟网段**（如 `10.78.0.0/16`），手机上网照旧走运营商，不做全局代理
 - 令牌就是电脑上 `qp2p create` / `qp2p token` 打出的那串

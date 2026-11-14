@@ -98,6 +98,8 @@ class MainActivity : Activity() {
         setContentView(buildRoot())
         loadSettings()
         checkNative()
+        // 电视盒子靠遥控器敲不进令牌，允许 adb 从启动参数里灌（见 applyLaunchExtras）
+        val launch = applyLaunchExtras(intent)
 
         // 手填 IP 实时校验：不合法就把按钮禁掉，别让人点了才看到服务端报错
         ipInput.addTextChangedListener(object : TextWatcher {
@@ -153,8 +155,9 @@ class MainActivity : Activity() {
 
         // 「启动连接」只在冷启动生效：旋转屏幕、VPN 授权回来都不重复触发。
         // 已连上时不重复发起；Service 侧也做了幂等，防止 App 进程重建再次拉起隧道。
+        // `-e connect 1` 与「启动连接」等价，但只对这一次启动有效，不改持久开关。
         if (savedInstanceState == null &&
-            prefs.getBoolean("auto_connect", false) &&
+            (prefs.getBoolean("auto_connect", false) || launch.connect) &&
             !Qp2pVpnService.connected
         ) {
             ui.post { ensurePermissionThenConnect() }
@@ -172,6 +175,80 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
         super.onDestroy()
+    }
+
+    /** 已经在运行时又被 adb 拉起来一次（比如换了令牌）：不重建界面，直接填进去。 */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent != null) setIntent(intent)
+        val launch = applyLaunchExtras(intent)
+        if (launch.connect && !Qp2pVpnService.connected && !pendingConnect) {
+            ui.post { ensurePermissionThenConnect() }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 启动参数（电视盒子 / 电视用 adb 灌配置，遥控器敲不进令牌）
+    // ------------------------------------------------------------------
+
+    private class LaunchConfig(val filled: Boolean, val connect: Boolean)
+
+    /**
+     * 从启动参数里读配置，读到就立即落盘，省得下次再敲一遍。认这几个 key：
+     *
+     *     adb shell am start -n com.qp2p/.MainActivity \
+     *         -e worker https://p2p.example.com -e token qp2p1_home_xxx \
+     *         -e name tvbox -e connect 1
+     *
+     * 也接受电脑上 `qp2p create` 打印的那种整链接，一次给完：
+     *
+     *     adb shell am start -n com.qp2p/.MainActivity \
+     *         -e join "https://p2p.example.com/?token=qp2p1_home_xxx"
+     *
+     * `connect` 只对这一次启动生效，不改「启动连接」那个持久开关。
+     */
+    private fun applyLaunchExtras(intent: Intent?): LaunchConfig {
+        val from = intent ?: return LaunchConfig(false, false)
+        fun extra(key: String): String = from.getStringExtra(key)?.trim().orEmpty()
+
+        var filled = false
+        extra("join").takeIf { it.isNotEmpty() }?.let { link ->
+            parseJoinLink(link)?.let { (worker, token) ->
+                workerInput.setText(worker)
+                tokenInput.setText(token)
+                filled = true
+            }
+        }
+        extra("worker").takeIf { it.isNotEmpty() }?.let {
+            workerInput.setText(it)
+            filled = true
+        }
+        extra("token").takeIf { it.isNotEmpty() }?.let {
+            tokenInput.setText(it)
+            filled = true
+        }
+        extra("name").takeIf { it.isNotEmpty() }?.let {
+            nameInput.setText(it)
+            filled = true
+        }
+        if (filled) saveSettings()
+
+        val connect = extra("connect").lowercase().let { it == "1" || it == "true" || it == "yes" }
+        return LaunchConfig(filled, connect)
+    }
+
+    /** `https://host/?token=qp2p1_xxx` → (https://host, qp2p1_xxx)；形状不对返回 null */
+    private fun parseJoinLink(link: String): Pair<String, String>? {
+        val q = link.indexOf('?')
+        if (q <= 0) return null
+        val worker = link.substring(0, q).trimEnd('/')
+        if (!worker.startsWith("https://")) return null
+        val marker = "token="
+        val at = link.indexOf(marker, q)
+        if (at < 0) return null
+        val token = link.substring(at + marker.length).substringBefore('&').trim()
+        if (!token.startsWith("qp2p1_")) return null
+        return worker to token
     }
 
     // ------------------------------------------------------------------

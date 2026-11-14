@@ -47,7 +47,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 | Linux x64（glibc ≥ 2.39） | `qp2p-<版本>-linux-x86_64` |
 | Linux x64（老系统 / 容器） | `qp2p-<版本>-linux-x86_64-static`，静态链接 |
 | Linux arm64（路由器 / 开发板） | `qp2p-<版本>-linux-aarch64-static`，静态链接 |
-| Android 8+ | `qp2p-<版本>-android.apk`，debug 签名 |
+| Android 6.0+（含电视盒子） | `qp2p-<版本>-android.apk`，debug 签名；arm64 / armv7 / x86_64 三种 ABI |
 
 下载后先 `sha256sum -c SHA256SUMS.txt` 校验。
 
@@ -157,4 +157,4 @@ signal/         单文件 Worker + D1（控制面）+ 每网络一个 Durable Ob
 |---|---|---|
 | Linux | `/dev/net/tun` | root 或 `CAP_NET_ADMIN` |
 | Windows 10/11 | WinTun（已内嵌） | 管理员，exe 清单会自动提权 |
-| Android 8+ | VpnService | 无需 root；Android 13+ 不给通知权限不影响连接 |
+| Android 6.0+ | VpnService | 无需 root；Android 13+ 不给通知权限不影响连接；电视盒子可用 adb 灌令牌 |
