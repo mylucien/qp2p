@@ -42,7 +42,8 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         val service = Intent(context, Qp2pVpnService::class.java).apply {
-            action = Qp2pVpnService.ACTION_CONNECT
+            // 显式 setAction：Intent.action 不是可写属性
+            setAction(Qp2pVpnService.ACTION_CONNECT)
             putExtra(Qp2pVpnService.EXTRA_CONFIG, config)
             putExtra(Qp2pVpnService.EXTRA_FROM_BOOT, true)
         }
