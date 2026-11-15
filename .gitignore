@@ -11,3 +11,9 @@ android/build/
 android/app/build/
 android/app/src/main/jniLibs/
 android/local.properties
+
+# 签名密钥永远不入库（私钥只在 GitHub Secrets 与开发者本机）
+*.p12
+*.jks
+*.keystore
+signing/

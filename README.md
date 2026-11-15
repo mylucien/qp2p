@@ -36,7 +36,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 ## 下载与安装
 
-当前最新版：[v0.1.11](https://github.com/mylucien/qp2p/releases/tag/v0.1.11)。
+当前最新版：[v0.1.12](https://github.com/mylucien/qp2p/releases/tag/v0.1.12)。
 每个 Release 有 10 个附件：5 个客户端、4 个服务端部署器、1 个 `SHA256SUMS.txt`。
 
 **客户端**（照着下表选一个）：
@@ -47,7 +47,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 | Linux x64（glibc ≥ 2.39） | `qp2p-<版本>-linux-x86_64` |
 | Linux x64（老系统 / 容器） | `qp2p-<版本>-linux-x86_64-static`，静态链接 |
 | Linux arm64（路由器 / 开发板） | `qp2p-<版本>-linux-aarch64-static`，静态链接 |
-| Android 6.0+（含电视盒子） | `qp2p-<版本>-android.apk`，debug 签名；arm64 / armv7 / x86_64 三种 ABI |
+| Android 6.0+（含电视盒子） | `qp2p-<版本>-android.apk`，固定签名（同签名可直接覆盖升级）；arm64 / armv7 / x86_64 三种 ABI |
 
 下载后先 `sha256sum -c SHA256SUMS.txt` 校验。
 
@@ -65,7 +65,7 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 
 ### 2. 下载并校验
 
-从 [v0.1.11](https://github.com/mylucien/qp2p/releases/tag/v0.1.11) 下
+从 [v0.1.12](https://github.com/mylucien/qp2p/releases/tag/v0.1.12) 下
 `qp2p-deploy`，下面用 Linux 静态版举例，换成你下载的文件名即可。
 
 ### 3. 首次部署
@@ -74,8 +74,8 @@ Android 不用敲命令：装 APK，填信令地址和这行令牌，点「连�
 export CLOUDFLARE_API_TOKEN=...      # Windows PowerShell：$env:CLOUDFLARE_API_TOKEN="..."
 export CLOUDFLARE_ACCOUNT_ID=...
 
-./qp2p-deploy-0.1.11-linux-x86_64-static init --dry-run   # 先看要上传什么（密钥已脱敏）
-./qp2p-deploy-0.1.11-linux-x86_64-static init             # 真正部署
+./qp2p-deploy-0.1.12-linux-x86_64-static init --dry-run   # 先看要上传什么（密钥已脱敏）
+./qp2p-deploy-0.1.12-linux-x86_64-static init             # 真正部署
 ```
 
 验收：依次打印「① 校验令牌 → ② 准备 D1 → ③ 上传 Worker → ④ 启用 workers.dev → ⑤ 冒烟」，
@@ -103,8 +103,8 @@ curl https://p2p.example.com/v1/health     # 匿名只回 {"ok":true}
 ### 5. 以后升级
 
 ```bash
-./qp2p-deploy-0.1.11-linux-x86_64-static status   # 先看当前迁移标签与线上状态
-./qp2p-deploy-0.1.11-linux-x86_64-static up       # 升级，密钥与 D1/DO 数据都保留
+./qp2p-deploy-0.1.12-linux-x86_64-static status   # 先看当前迁移标签与线上状态
+./qp2p-deploy-0.1.12-linux-x86_64-static up       # 升级，密钥与 D1/DO 数据都保留
 ```
 
 验收：输出 `✓ 已升级到标签 ...`，再跑一次 `qp2p init --admin` 确认 `引擎 room`、

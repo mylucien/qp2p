@@ -1,0 +1,11 @@
+# Android 签名证书（固定）
+#
+# 私钥不进仓库：keystore 以 base64 存在 GitHub Actions Secrets
+#   QP2P_KEYSTORE_B64   PKCS12 文件（别名 qp2p）
+#   QP2P_KEYSTORE_PASS  该 keystore 的密码
+# 本地备份在开发者机器上（不入库）。丢了就再也签不出同签名的包，
+# 意味着所有已装设备必须卸载重装，务必离线备份。
+#
+# CI 打包后会拿这个指纹和 APK 实际签名比对，不一致直接失败——
+# 否则一旦悄悄退回随机 debug 签名，用户又只能卸载重装。
+sha256=63:0E:4A:70:1D:7D:0E:DA:CC:92:59:36:F0:05:C5:52:EF:F0:0D:EB:C6:29:4A:5A:1B:1F:8C:A2:F2:67:22:5E

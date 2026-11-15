@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+/**
+ * CI 用固定签名：`QP2P_KEYSTORE` 指向从 GitHub Secrets 还原出来的 p12。
+ *
+ * 不设这个变量（本地开发）就走 AGP 现生成的 debug keystore。
+ * 之所以要固定：AGP 的 debug keystore 是每个全新 runner 现生成的随机密钥，
+ * 每次构建签名都不同，装到设备上只能「先卸载再装」，配置也一起丢。
+ */
+val fixedKeystorePath: String? = System.getenv("QP2P_KEYSTORE")?.takeIf { it.isNotEmpty() }
+
 android {
     namespace = "com.qp2p"
     compileSdk = 34
@@ -18,13 +27,31 @@ android {
         // 电视盒子大量停在 6.0，所以水位跟着盒子走，不跟着手机走。
         minSdk = 23
         targetSdk = 34
-        versionCode = 13
-        versionName = "0.1.11"
+        versionCode = 14
+        versionName = "0.1.12"
+    }
+
+    signingConfigs {
+        if (fixedKeystorePath != null) {
+            create("fixed") {
+                storeFile = file(fixedKeystorePath)
+                storeType = "PKCS12"
+                keyAlias = System.getenv("QP2P_KEY_ALIAS") ?: "qp2p"
+                storePassword = System.getenv("QP2P_KEYSTORE_PASS")
+                keyPassword = System.getenv("QP2P_KEYSTORE_PASS")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+        debug {
+            // 有固定密钥就用它，出的包才能覆盖升级（不设时保持 AGP 默认行为）
+            if (fixedKeystorePath != null) {
+                signingConfig = signingConfigs.getByName("fixed")
+            }
         }
     }
 

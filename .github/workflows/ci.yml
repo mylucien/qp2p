@@ -310,6 +310,20 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: 还原固定签名密钥
+        env:
+          KEYSTORE_B64: ${{ secrets.QP2P_KEYSTORE_B64 }}
+        run: |
+          # 没有固定签名就只能出「每次签名都不同」的包，装到设备上必须卸载重装。
+          # 这属于发布阻断问题，宁可红一次也不要静默出一个装不上去的包。
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::缺 secret QP2P_KEYSTORE_B64，无法用固定签名打包（出的包将无法覆盖升级）"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/qp2p-signing.p12"
+          ls -l "$RUNNER_TEMP/qp2p-signing.p12"
+          echo "签名密钥已还原"
+
       - name: 打 APK
         working-directory: android
         env:
@@ -318,6 +332,10 @@ jobs:
           # 否则 AGP 会报 "different paths to the Android Preferences folder"。
           ANDROID_SDK_HOME: ${{ runner.temp }}
           ANDROID_USER_HOME: ${{ runner.temp }}/.android
+          # 固定签名：AGP 的 debug keystore 每个 runner 都是新随机生成的，
+          # 不换掉的话每次发布的包签名都不同，只能卸载重装。
+          QP2P_KEYSTORE: ${{ runner.temp }}/qp2p-signing.p12
+          QP2P_KEYSTORE_PASS: ${{ secrets.QP2P_KEYSTORE_PASS }}
         run: |
           mkdir -p "$ANDROID_USER_HOME"
           gradle assembleDebug --no-daemon --stacktrace
@@ -360,6 +378,22 @@ jobs:
               || { echo "APK 里没有 LEANBACK_LAUNCHER，电视桌面上看不到图标" >&2; exit 1; }
             echo "LEANBACK_LAUNCHER 在"
           fi
+
+          # 签名必须是固定那一把。AGP 一旦退回随机 debug 签名，用户又只能卸载重装，
+          # 所以这里拿实际签名和仓库里记的指纹硬比，不一致就失败。
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner，没法校验签名" >&2
+            exit 1
+          fi
+          GOT=$("$APKSIGNER" verify --print-certs "$APK" \
+                  | sed -n 's/.*SHA-256 digest: //p' | head -1 | tr 'A-F' 'a-f')
+          WANT=$(sed -n 's/^sha256=//p' scripts/data/android-signing-cert.txt \
+                  | tr -d ':' | tr 'A-F' 'a-f')
+          echo "APK 签名 SHA-256：$GOT"
+          echo "固定签名 SHA-256：$WANT"
+          test "$GOT" = "$WANT" \
+            || { echo "::error::APK 不是固定签名，这个包装上去无法覆盖升级" >&2; exit 1; }
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4

@@ -93,14 +93,14 @@ qp2p init https://<你的域名> --admin <ADMIN_SECRET>
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows 10/11 x64 | `qp2p-0.1.11-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
-| Linux x86_64（主流发行版） | `qp2p-0.1.11-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
-| Linux x86_64（老系统/容器） | `qp2p-0.1.11-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
-| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.11-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
-| Android 6.0+（含电视盒子） | `qp2p-0.1.11-android.apk` | VpnService，debug 签名；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
+| Windows 10/11 x64 | `qp2p-0.1.12-windows-x86_64.exe` | 单文件，双击打开图形界面（会弹 UAC） |
+| Linux x86_64（主流发行版） | `qp2p-0.1.12-linux-x86_64` | 需要 glibc ≥ 2.39（Ubuntu 24.04 及以上） |
+| Linux x86_64（老系统/容器） | `qp2p-0.1.12-linux-x86_64-static` | 静态链接，Debian 11/12、Alpine 都能跑 |
+| Linux aarch64（ARM64 路由器/开发板） | `qp2p-0.1.12-linux-aarch64-static` | 静态链接，OpenWrt（`aarch64_cortex-a53` 一类）直接用 |
+| Android 6.0+（含电视盒子） | `qp2p-0.1.12-android.apk` | VpnService，固定签名（同签名可直接覆盖升级）；arm64-v8a / armeabi-v7a / x86_64 三种 ABI |
 
 自建信令服务还需要部署器（只在服务端用，客户端用不到）：
-`qp2p-deploy-0.1.11-<平台>`，同样有 `SHA256SUMS.txt` 校验。
+`qp2p-deploy-0.1.12-<平台>`，同样有 `SHA256SUMS.txt` 校验。
 
 下载后先校验：
 
@@ -111,8 +111,8 @@ sha256sum -c SHA256SUMS.txt
 Linux 安装：
 
 ```bash
-chmod +x qp2p-0.1.11-linux-x86_64-static
-sudo mv qp2p-0.1.11-linux-x86_64-static /usr/local/bin/qp2p
+chmod +x qp2p-0.1.12-linux-x86_64-static
+sudo mv qp2p-0.1.12-linux-x86_64-static /usr/local/bin/qp2p
 qp2p -V
 ```
 
@@ -204,7 +204,7 @@ qp2p up                         # Windows（管理员终端）
 拉取成员列表并逐个打洞 → 打通的节点打印出来。
 
 ```
-qp2p 0.1.11 · 网络 home
+qp2p 0.1.12 · 网络 home
 信令 https://p2p.example.com
 本机 laptop  node_id=e6659aba1e2a8fa837d9a1251ee1b584
 公网映射 120.229.55.68:6923
@@ -474,7 +474,7 @@ curl -X POST -H "x-admin-secret: $ADMIN" -H 'content-type: application/json' \
 
 ```bash
 adb connect 192.168.1.x:5555        # 盒子先在「开发者选项」里开网络调试
-adb install -r qp2p-0.1.11-android.apk
+adb install -r qp2p-0.1.12-android.apk
 ```
 
 装完电视桌面上就有 qp2p 图标（Manifest 里带了 `LEANBACK_LAUNCHER`）。
@@ -504,8 +504,9 @@ adb shell am start -n com.qp2p/.MainActivity \
 
 盒子上装不上或建不起隧道时，先看两条：`adb shell getprop ro.build.version.sdk`
 （要 ≥ 23，即 Android 6.0）、`adb logcat -s qp2p`（失败原因都打在这里）。
-覆盖安装报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 是因为 CI 每次跑都现生成 debug 签名，
-换一个构建签名就变了——先 `adb uninstall com.qp2p` 再装（配置会丢，重新灌一次即可）。
+0.1.12 起 CI 用**固定签名**，同签名的新版可以直接覆盖升级（`adb install -r`，
+配置和 VPN 授权都保留），不用再卸载。只有从 0.1.11 及更早的包切过来那次要
+卸载重装一遍——那些包是每次构建现生成 debug 签名的，和固定签名对不上。
 少数盒子的固件把「设置 → VPN」整页删了，`Builder.establish()` 会返回 null，
 App 里会显示「系统没批准建 VPN」，这种情况换盒子或换固件，客户端这边没法绕。
 
