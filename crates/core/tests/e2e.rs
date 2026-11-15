@@ -528,7 +528,10 @@ async fn ip_and_tcp_streams_share_one_connection() {
     let (mut ip_send, _ip_recv) = dialer.open_bi().await.unwrap();
     ip_send.write_all(&[2]).await.unwrap();
     let packet = minimal_ipv4_packet([10, 99, 0, 1], [10, 99, 0, 2]);
-    ip_send.write_all(&(packet.len() as u16).to_be_bytes()).await.unwrap();
+    ip_send
+        .write_all(&(packet.len() as u16).to_be_bytes())
+        .await
+        .unwrap();
     ip_send.write_all(&packet).await.unwrap();
 
     let got = tokio::time::timeout(Duration::from_secs(5), packets.recv())

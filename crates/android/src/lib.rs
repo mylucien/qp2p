@@ -486,7 +486,10 @@ pub fn create_network(request: CreateNetworkRequest) -> Result<NetworkCreated> {
     if name.is_empty() {
         anyhow::bail!("网络名不能为空");
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         anyhow::bail!("网络名只能用小写字母、数字和连字符：{name}");
     }
     if request.admin.trim().is_empty() {
