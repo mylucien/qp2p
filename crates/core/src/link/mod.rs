@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
-const KIND_TCP: u8 = 1;
+pub(crate) const KIND_TCP: u8 = 1;
 const HEADER_LEN: usize = 7;
 const COPY_BUF: usize = 16 * 1024;
 
@@ -67,7 +67,7 @@ pub async fn serve_flows(conn: Connection, allowed: Arc<Vec<SocketAddr>>) -> Res
             Ok((send, recv)) => {
                 let allowed = allowed.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming_flow(send, recv, &allowed).await {
+                    if let Err(e) = dispatch_incoming(send, recv, &allowed).await {
                         tracing::debug!("[link] 流处理结束: {e}");
                     }
                 });
@@ -80,13 +80,38 @@ pub async fn serve_flows(conn: Connection, allowed: Arc<Vec<SocketAddr>>) -> Res
     }
 }
 
-async fn handle_incoming_flow(
+/// 读首字节判断流类型，只处理端口映射（`KIND_TCP`）流。
+///
+/// TUN 模式那边有一个同构的入口（`tun::serve_inbound`），它会把 `KIND_IP`
+/// 交给自己、`KIND_TCP` 交给 [`handle_tcp_flow`]——两条数据面共用一条 QUIC
+/// 连接时，必须由**同一个** `accept_bi` 循环按类型分派，否则谁先抢到算谁的。
+async fn dispatch_incoming(
+    send: SendStream,
+    mut recv: RecvStream,
+    allowed: &[SocketAddr],
+) -> Result<()> {
+    let mut kind = [0u8; 1];
+    tokio::time::timeout(HEADER_TIMEOUT, recv.read_exact(&mut kind))
+        .await
+        .context("读取流类型超时")?
+        .context("读取流类型失败")?;
+    handle_tcp_flow(kind[0], send, recv, allowed).await
+}
+
+/// 处理一条已经读过流类型字节的端口映射流。
+pub(crate) async fn handle_tcp_flow(
+    kind: u8,
     mut send: SendStream,
     mut recv: RecvStream,
     allowed: &[SocketAddr],
 ) -> Result<()> {
+    if kind != KIND_TCP {
+        bail!("不是端口映射流（类型 {kind}）");
+    }
+
     let mut header = [0u8; HEADER_LEN];
-    tokio::time::timeout(HEADER_TIMEOUT, recv.read_exact(&mut header))
+    header[0] = kind;
+    tokio::time::timeout(HEADER_TIMEOUT, recv.read_exact(&mut header[1..]))
         .await
         .context("读取目标头部超时")?
         .context("读取目标头部失败")?;

@@ -1296,7 +1296,7 @@ fn open_tun(
     }
 
     let link = qp2p_core::route::spawn_io(device, mtu);
-    let links = MeshLinks::new(link.to_tun.clone());
+    let links = MeshLinks::new(link.to_tun.clone(), Vec::new());
     let runner = links.clone();
     tokio::spawn(async move {
         if let Err(e) = link::tun::run_mesh(runner, link.from_tun, virtual_ip, mtu).await {

@@ -67,6 +67,8 @@ pub struct Engine {
     stun_task: Option<tokio::task::JoinHandle<()>>,
     /// 外壳预先枚举的本机地址（Android 专属来源），刷新端点时原样沿用
     host_ips: Vec<std::net::Ipv4Addr>,
+    /// UPnP 是否启用；刷新端点时要沿用同一个选择
+    upnp_enabled: bool,
 }
 
 /// 把 `Bound` 里的 STUN 旁路接到保活任务上。
@@ -100,7 +102,7 @@ impl Engine {
         stun_servers: &[String],
         data_dir: Option<&Path>,
     ) -> Result<Self> {
-        Self::bind_in_with(bind_addr, stun_servers, data_dir, Vec::new()).await
+        Self::bind_in_with(bind_addr, stun_servers, data_dir, Vec::new(), true).await
     }
 
     /// 额外接受外壳枚举好的本机地址，作为打洞的内网候选。
@@ -108,15 +110,19 @@ impl Engine {
     /// Android 必须走这个入口：那边的 so 不能依赖 `getifaddrs`（API 24 才有，
     /// Android 6.0 上会让整个库加载失败），地址由 Kotlin 侧用
     /// `NetworkInterface` 取好后传进来。刷新端点（`renew`）时会继续沿用。
+    ///
+    /// `enable_upnp` 关掉后既不问路由器要映射，也不把映射地址放进候选；
+    /// 只影响"有没有 UPnP 候选"，STUN 与内网候选照旧。
     pub async fn bind_in_with(
         bind_addr: SocketAddr,
         stun_servers: &[String],
         data_dir: Option<&Path>,
         host_ips: Vec<std::net::Ipv4Addr>,
+        enable_upnp: bool,
     ) -> Result<Self> {
         let identity = crate::identity::Identity::load_or_create(data_dir)?;
         let tls = TlsIdentity::load_or_create(data_dir)?;
-        let mut bound = socket::bind(bind_addr, stun_servers, &tls, &host_ips).await?;
+        let mut bound = socket::bind(bind_addr, stun_servers, &tls, &host_ips, enable_upnp).await?;
         let mapping = bound.mapping.clone();
         let renewer = start_upnp_renewer(mapping.clone());
         let (stun_shared, stun_task) = start_stun_watch(&mut bound, stun_servers, 0);
@@ -139,6 +145,7 @@ impl Engine {
             stun_shared,
             stun_task,
             host_ips,
+            upnp_enabled: enable_upnp,
         })
     }
 
@@ -325,7 +332,15 @@ impl Engine {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(120)).await;
             }
-            match socket::bind(self.bind_addr, &self.stun, &self.tls, &self.host_ips).await {
+            match socket::bind(
+                self.bind_addr,
+                &self.stun,
+                &self.tls,
+                &self.host_ips,
+                self.upnp_enabled,
+            )
+            .await
+            {
                 Ok(bound) => {
                     self.install(bound);
                     return Ok(());
@@ -336,7 +351,15 @@ impl Engine {
 
         // 原端口一时半会儿释放不了（Windows 常见），换临时端口也比用旧映射强
         let fallback = SocketAddr::new(self.bind_addr.ip(), 0);
-        match socket::bind(fallback, &self.stun, &self.tls, &self.host_ips).await {
+        match socket::bind(
+            fallback,
+            &self.stun,
+            &self.tls,
+            &self.host_ips,
+            self.upnp_enabled,
+        )
+        .await
+        {
             Ok(bound) => {
                 tracing::warn!(
                     "[engine] 原端口 {} 不可用，刷新后改用 {}",

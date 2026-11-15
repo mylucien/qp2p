@@ -12,7 +12,7 @@
 //! - [`run_mesh`]：多对端组网（`qp2p up`），按目标虚拟 IP 选连接
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,10 +78,14 @@ pub struct MeshLinks {
     /// 上一次唤醒的时间（毫秒）；3 秒冷却，避免持续丢包把信令打成洪水
     started: Instant,
     last_wake_ms: Arc<AtomicU64>,
+    /// 允许对端经本机访问的目标（局域网出口）；空 = 拒绝一切端口映射请求
+    allowed: Arc<Vec<SocketAddr>>,
 }
 
 impl MeshLinks {
-    pub fn new(to_tun: mpsc::Sender<Vec<u8>>) -> Arc<Self> {
+    /// `allowed` 非空时，同一条连接上除了 IP 包流，还会处理对端发起的
+    /// 端口映射流（`KIND_TCP`）——安卓当局域网出口就是靠它。
+    pub fn new(to_tun: mpsc::Sender<Vec<u8>>, allowed: Vec<SocketAddr>) -> Arc<Self> {
         Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
             to_tun,
@@ -89,6 +93,7 @@ impl MeshLinks {
             activity: Activity::new(),
             started: Instant::now(),
             last_wake_ms: Arc::new(AtomicU64::new(0)),
+            allowed: Arc::new(allowed),
         })
     }
 
@@ -154,8 +159,9 @@ impl MeshLinks {
             let conn = conn.clone();
             let to_tun = self.to_tun.clone();
             let activity = self.activity.clone();
+            let allowed = self.allowed.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_inbound(conn, to_tun, activity).await {
+                if let Err(e) = serve_inbound(conn, to_tun, allowed, activity).await {
                     tracing::debug!("[tun] 接收循环结束: {e:#}");
                 }
             });
@@ -204,8 +210,10 @@ pub async fn run(conn: Connection, link: TunLink, local: Ipv4Addr) -> Result<()>
         let conn = conn.clone();
         let to_tun = to_tun.clone();
         let activity = Activity::new();
+        // 单对端调试模式不开放端口映射：白名单为空，行为与以前完全一致
+        let allowed = Arc::new(Vec::new());
         tokio::spawn(async move {
-            if let Err(e) = serve_inbound(conn, to_tun, activity).await {
+            if let Err(e) = serve_inbound(conn, to_tun, allowed, activity).await {
                 tracing::debug!("[tun] 接收循环结束: {e:#}");
             }
         })
@@ -368,9 +376,14 @@ async fn write_frame(send: &mut SendStream, packet: &[u8]) -> Result<()> {
 }
 
 /// 接收方向：对端每开一条流就是一个新 flow。
+///
+/// 同一条连接上会混着两种流：`KIND_IP`（IP 包，TUN 用）和 `KIND_TCP`
+/// （端口映射，本机当局域网出口时用）。分派必须发生在**同一个** accept 循环里，
+/// 否则两个循环会互相抢流，抢到不认识的类型只能丢弃。
 async fn serve_inbound(
     conn: Connection,
     to_tun: mpsc::Sender<Vec<u8>>,
+    allowed: Arc<Vec<SocketAddr>>,
     activity: Activity,
 ) -> Result<()> {
     loop {
@@ -383,11 +396,32 @@ async fn serve_inbound(
         };
         let to_tun = to_tun.clone();
         let activity = activity.clone();
+        let allowed = allowed.clone();
         tokio::spawn(async move {
-            if let Err(e) = pump_stream(&mut recv, to_tun, activity).await {
-                tracing::trace!("[tun] 流结束: {e:#}");
+            let mut kind = [0u8; 1];
+            if let Err(e) = recv.read_exact(&mut kind).await {
+                tracing::trace!("[tun] 读流类型失败: {e}");
+                return;
             }
-            drop(send);
+            match kind[0] {
+                KIND_IP => {
+                    if let Err(e) = pump_stream(&mut recv, to_tun, activity).await {
+                        tracing::trace!("[tun] 流结束: {e:#}");
+                    }
+                    drop(send);
+                }
+                super::KIND_TCP => {
+                    if let Err(e) =
+                        super::handle_tcp_flow(super::KIND_TCP, send, recv, &allowed).await
+                    {
+                        tracing::debug!("[tun] 端口映射流结束: {e:#}");
+                    }
+                }
+                other => {
+                    tracing::debug!("[tun] 未知流类型 {other}，丢弃");
+                    drop(send);
+                }
+            }
         });
     }
 }
@@ -397,12 +431,6 @@ async fn pump_stream(
     to_tun: mpsc::Sender<Vec<u8>>,
     activity: Activity,
 ) -> Result<()> {
-    let mut kind = [0u8; 1];
-    recv.read_exact(&mut kind).await.context("读流类型失败")?;
-    if kind[0] != KIND_IP {
-        bail!("不是 IP 流（类型 {}）", kind[0]);
-    }
-
     loop {
         let mut len = [0u8; 2];
         match recv.read_exact(&mut len).await {

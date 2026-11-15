@@ -293,12 +293,33 @@ class MainActivity : Activity() {
         scroll.addView(root)
 
         root.addView(
-            TextView(this).apply {
-                text = "qp2p"
-                textSize = 22f
-                setTextColor(INK)
-                setTypeface(typeface, Typeface.BOLD)
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
                 setPadding(0, 0, 0, dp(8))
+                addView(
+                    TextView(this@MainActivity).apply {
+                        text = "qp2p"
+                        textSize = 22f
+                        setTextColor(INK)
+                        setTypeface(typeface, Typeface.BOLD)
+                    },
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+                )
+                // 入口放在标题行右侧，不额外占一行高度
+                addView(
+                    TextView(this@MainActivity).apply {
+                        text = "高级"
+                        textSize = 14f
+                        setTextColor(BLUE)
+                        gravity = Gravity.CENTER
+                        setPadding(dp(12), dp(6), dp(2), dp(6))
+                        isClickable = true
+                        setOnClickListener {
+                            startActivity(Intent(this@MainActivity, AdvancedActivity::class.java))
+                        }
+                    }
+                )
             }
         )
 
@@ -997,6 +1018,8 @@ class MainActivity : Activity() {
     /** 拼装交给 [AppConfig]：开机自启那条路径用的必须是同一份字段，别在两处各写一遍 */
     private fun configJson(): String {
         val keep = keepSwitch.isChecked
+        // 高级页的设置在它自己那边保存，这里原样读出来一起交过去
+        val prefs = getSharedPreferences(AppConfig.PREFS, Context.MODE_PRIVATE)
         return AppConfig.build(
             worker = workerValue().trimEnd('/'),
             token = tokenValue(),
@@ -1005,6 +1028,13 @@ class MainActivity : Activity() {
             dataDir = filesDir.absolutePath,
             keepOnline = keep,
             idleMinutes = idleMinutes(),
+            mtu = prefs.getInt(AppConfig.KEY_MTU, AppConfig.MTU_DEFAULT),
+            bindPort = prefs.getInt(AppConfig.KEY_BIND_PORT, 0),
+            upnp = prefs.getBoolean(AppConfig.KEY_UPNP, true),
+            transport = prefs.getString(AppConfig.KEY_TRANSPORT, "auto").orEmpty(),
+            stun = prefs.getString(AppConfig.KEY_STUN, "").orEmpty(),
+            lanEnabled = prefs.getBoolean(AppConfig.KEY_LAN_ENABLED, false),
+            lanTargets = prefs.getString(AppConfig.KEY_LAN_TARGETS, "").orEmpty(),
         )
     }
 

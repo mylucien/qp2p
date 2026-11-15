@@ -479,3 +479,73 @@ async fn listener_rejection_is_visible_to_dialer() {
     assert!(text.contains("拒绝") || text.contains("身份"), "{text}");
     assert!(listener.is_err(), "拒绝方本身也不应成功");
 }
+
+/// 同一个 TUN 连接上必须能同时跑 IP 包流和端口映射流。
+///
+/// 两条数据面以前各有一个 `accept_bi` 循环，谁先抢到算谁的：落到 TUN 那边的
+/// `KIND_TCP` 流会被当成"不是 IP 流"直接丢掉。安卓当局域网出口时两种流会
+/// 混在同一条连接上，所以这条必须成立。
+#[tokio::test]
+async fn ip_and_tcp_streams_share_one_connection() {
+    use qp2p_core::link::tun::MeshLinks;
+    use tokio::sync::mpsc;
+
+    let echo = spawn_echo().await;
+    let a = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let b = Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+        .await
+        .unwrap();
+    let (dialer, listener) = punch_pair(&a, &b).await;
+
+    // 被叫端：接流循环挂在 listener 侧，白名单只放行 echo
+    let (to_tun, mut packets) = mpsc::channel(16);
+    let links = MeshLinks::new(to_tun, vec![echo]);
+    let peer_ip: std::net::Ipv4Addr = "10.99.0.2".parse().unwrap();
+    links.attach(peer_ip, listener.clone()).await;
+    // 给接流循环一点时间挂上
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 1) 端口映射流：按线上格式手写 7 字节头
+    let (mut send, mut recv) = dialer.open_bi().await.unwrap();
+    let mut header = [0u8; 7];
+    header[0] = 1;
+    header[1..5].copy_from_slice(&[127, 0, 0, 1]);
+    header[5..7].copy_from_slice(&echo.port().to_be_bytes());
+    send.write_all(&header).await.unwrap();
+
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status).await.unwrap();
+    assert_eq!(status[0], 0, "白名单里的目标应当放行");
+
+    send.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    recv.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+
+    // 2) 紧接着再开一条 IP 包流，同一个 accept 循环还得认得它
+    let (mut ip_send, _ip_recv) = dialer.open_bi().await.unwrap();
+    ip_send.write_all(&[2]).await.unwrap();
+    let packet = minimal_ipv4_packet([10, 99, 0, 1], [10, 99, 0, 2]);
+    ip_send.write_all(&(packet.len() as u16).to_be_bytes()).await.unwrap();
+    ip_send.write_all(&packet).await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), packets.recv())
+        .await
+        .expect("5 秒内应当收到 IP 包")
+        .expect("通道不应关闭");
+    assert_eq!(got, packet, "IP 包应原样交给 TUN 侧");
+}
+
+/// 20 字节的最小 IPv4 头，够 `ip::parse` 认出来即可
+fn minimal_ipv4_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+    let mut packet = vec![0u8; 20];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 6;
+    packet[12..16].copy_from_slice(&src);
+    packet[16..20].copy_from_slice(&dst);
+    packet
+}

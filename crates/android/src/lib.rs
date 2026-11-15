@@ -42,6 +42,32 @@ fn default_stun() -> Vec<String> {
     ]
 }
 
+/// 解析「局域网共享」目标列表。非法条目跳过并记日志，不能因为一条写错就整页失效。
+fn parse_lan_share(entries: &[String]) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for entry in entries {
+        let text = entry.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match text.parse::<SocketAddr>() {
+            Ok(addr) if addr.is_ipv4() => out.push(addr),
+            _ => log(&format!("局域网共享：忽略无法解析的目标 {text}")),
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn ws_mode_of(raw: Option<&str>) -> qp2p_core::session::WsMode {
+    match raw.unwrap_or("auto").trim().to_lowercase().as_str() {
+        "ws" | "websocket" => qp2p_core::session::WsMode::Always,
+        "poll" | "http" => qp2p_core::session::WsMode::Never,
+        _ => qp2p_core::session::WsMode::Auto,
+    }
+}
+
 /// 按界面选择算休眠档位：保持在线 = 永不断链；否则 0 当作默认 10 分钟。
 fn idle_timeout(keep_online: bool, idle_secs: u64) -> Option<Duration> {
     if keep_online {
@@ -94,6 +120,17 @@ pub struct StartConfig {
     /// 那是 API 24 才有的符号，Android 6.0 上会让整个 so 加载失败。
     #[serde(default)]
     pub local_ips: Vec<String>,
+    /// UPnP 端口映射。默认开（手机在家庭 WiFi 下最常用）；关掉时只少一个候选。
+    #[serde(default)]
+    pub upnp: Option<bool>,
+    /// 信令传输：`auto`（默认）/ `ws` / `poll`。
+    #[serde(default)]
+    pub signal_transport: Option<String>,
+    /// 允许对端经本机访问的 `IP:端口` 列表（安卓当局域网出口）。
+    ///
+    /// 空 = 拒绝一切端口映射请求；解析不了的条目直接忽略，不影响其余条。
+    #[serde(default)]
+    pub lan_share: Vec<String>,
 }
 
 /// `prepare` 返回给 Kotlin 的信息，用来构建 VpnService。
@@ -120,6 +157,10 @@ struct Prepared {
     mtu: u16,
     /// 直连空闲多久断开；`None` = 保持在线，从不断链
     idle: Option<Duration>,
+    /// 允许对端访问的局域网目标；空 = 不开放
+    lan_share: Vec<SocketAddr>,
+    /// 信令传输方式
+    ws_mode: qp2p_core::session::WsMode,
 }
 
 static PREPARED: OnceLock<Mutex<Option<Prepared>>> = OnceLock::new();
@@ -206,6 +247,9 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     // 保持在线时不设超时：会话里 `idle_timeout = None` 既不会断开直连，
     // 也不会进入休眠，长连接自然一直挂着。关掉时才按选定的档位休眠。
     let idle = idle_timeout(config.keep_online, config.idle_secs);
+    let enable_upnp = config.upnp.unwrap_or(true);
+    let ws_mode = ws_mode_of(config.signal_transport.as_deref());
+    let lan_share = parse_lan_share(&config.lan_share);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -237,7 +281,7 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     }
 
     let (engine, reply) = rt.block_on(async {
-        let engine = Engine::bind_in_with(bind, &stun, data_dir, local_ips)
+        let engine = Engine::bind_in_with(bind, &stun, data_dir, local_ips, enable_upnp)
             .await
             .context("绑定 UDP 失败")?;
         let identity = engine.identity().clone();
@@ -290,6 +334,8 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
         peers: reply.peers.clone(),
         mtu,
         idle,
+        lan_share,
+        ws_mode,
     };
     let info = PreparedInfo::from_prepared(&prepared, &cidr);
 
@@ -321,6 +367,8 @@ pub fn start(fd: i32) -> Result<()> {
         peers,
         mtu,
         idle,
+        lan_share,
+        ws_mode,
     } = prepared;
 
     log(&format!(
@@ -331,6 +379,13 @@ pub fn start(fd: i32) -> Result<()> {
         }
     ));
 
+    if lan_share.is_empty() {
+        log("局域网共享：未开启");
+    } else {
+        let text: Vec<String> = lan_share.iter().map(ToString::to_string).collect();
+        log(&format!("局域网共享：{}", text.join(", ")));
+    }
+
     let stop = stop_flag();
     stop.store(false, Ordering::SeqCst);
 
@@ -338,7 +393,7 @@ pub fn start(fd: i32) -> Result<()> {
         // Android 上没有 root，网卡由 VpnService 建好，这里只接管描述符
         let device = tun_device(fd)?;
         let tun_link = qp2p_core::route::spawn_io(device, mtu);
-        let mesh = MeshLinks::new(tun_link.to_tun.clone());
+        let mesh = MeshLinks::new(tun_link.to_tun.clone(), lan_share);
 
         {
             let runner = mesh.clone();
@@ -363,8 +418,8 @@ pub fn start(fd: i32) -> Result<()> {
                 idle_timeout: idle,
                 peers,
                 // 手机按流量计费：长连接能省 80% 的信令请求，休眠满 60 秒会自动断开。
-                // 先按 auto，连不上（旧服务端）会自己退回轮询。
-                ws_mode: qp2p_core::session::WsMode::Auto,
+                // 界面可选 auto / ws / poll，默认 auto：连不上（旧服务端）会自己退回轮询。
+                ws_mode,
             },
             engine.clone(),
             Some(mesh.clone()),
@@ -399,6 +454,68 @@ fn tun_device(fd: i32) -> Result<Box<dyn qp2p_core::route::TunDevice>> {
 /// 停止会话。可以重复调用。
 pub fn stop() {
     stop_flag().store(true, Ordering::SeqCst);
+}
+
+/// 建网请求：字段与 Worker 的 `/v1/admin/networks` 对齐，`key`/`cidr` 留空则由服务端生成。
+#[derive(Debug, Deserialize)]
+pub struct CreateNetworkRequest {
+    pub worker: String,
+    pub admin: String,
+    pub name: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub cidr: Option<String>,
+}
+
+/// 建网成功的结果，`token` 就是给别人入网用的那串。
+#[derive(Debug, Serialize)]
+pub struct NetworkCreated {
+    pub id: String,
+    pub name: String,
+    pub cidr: String,
+    pub token: String,
+    #[serde(default)]
+    pub warning: String,
+}
+
+/// 建网。放到 Rust 侧做是为了只有一份地址归一化和错误文案——
+/// Kotlin 那边再写一个 HTTP 客户端，迟早和服务端的行为对不上。
+pub fn create_network(request: CreateNetworkRequest) -> Result<NetworkCreated> {
+    let name = request.name.trim().to_string();
+    if name.is_empty() {
+        anyhow::bail!("网络名不能为空");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        anyhow::bail!("网络名只能用小写字母、数字和连字符：{name}");
+    }
+    if request.admin.trim().is_empty() {
+        anyhow::bail!("管理密钥不能为空");
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("创建 tokio 运行时失败")?;
+
+    rt.block_on(async {
+        let client = SignalClient::admin(&request.worker)?;
+        let issued = client
+            .create_network(
+                request.admin.trim(),
+                &name,
+                request.key.as_deref(),
+                request.cidr.as_deref(),
+            )
+            .await?;
+        Ok(NetworkCreated {
+            id: issued.network.id,
+            name: issued.network.name,
+            cidr: issued.network.cidr,
+            token: issued.token,
+            warning: issued.warning,
+        })
+    })
 }
 
 /// 是否已经有 prepare 过的会话在等 tun fd。
@@ -493,6 +610,40 @@ mod jni_bridge {
     ) -> jni::sys::jboolean {
         is_prepared() as jni::sys::jboolean
     }
+
+    /// `Native.createNetwork(json)` → 成功 `{"id","name","cidr","token"}`，失败 `{"error": "..."}`。
+    ///
+    /// 会阻塞到 HTTP 请求结束，调用方必须放到后台线程。
+    #[no_mangle]
+    pub extern "system" fn Java_com_qp2p_Native_createNetwork<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        request: JString<'local>,
+    ) -> jstring {
+        let text: String = match env.get_string(&request) {
+            Ok(s) => s.into(),
+            Err(e) => return reply(&mut env, &err_json(&format!("读不到请求：{e}"))),
+        };
+        let parsed: CreateNetworkRequest = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => return reply(&mut env, &err_json(&format!("请求格式不对：{e}"))),
+        };
+        install_panic_hook();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create_network(parsed)));
+        match outcome {
+            Err(_) => reply(
+                &mut env,
+                &err_json("内核崩溃（panic），详情见 logcat 里 qp2p 标记的日志"),
+            ),
+            Ok(Ok(info)) => {
+                let json = serde_json::to_string(&info)
+                    .unwrap_or_else(|e| err_json(&format!("序列化失败：{e}")));
+                reply(&mut env, &json)
+            }
+            Ok(Err(e)) => reply(&mut env, &err_json(&format!("{e:#}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -539,5 +690,55 @@ mod tests {
         // 0 是界面没选过的值，回落到默认 10 分钟
         assert_eq!(idle_timeout(false, 0), Some(Duration::from_secs(600)));
         assert_eq!(idle_timeout(false, 1800), Some(Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn lan_share_skips_junk_and_dedupes() {
+        let got = parse_lan_share(&[
+            "192.168.1.1:80".to_string(),
+            " 192.168.1.1:80 ".to_string(),
+            "192.168.1.1".to_string(),
+            "".to_string(),
+            "192.168.1.1:22".to_string(),
+        ]);
+        let want: Vec<SocketAddr> = vec![
+            "192.168.1.1:22".parse().unwrap(),
+            "192.168.1.1:80".parse().unwrap(),
+        ];
+        assert_eq!(got, want, "非法条目要丢掉，重复要去重，结果要稳定排序");
+    }
+
+    #[test]
+    fn lan_share_rejects_empty_string() {
+        assert!(parse_lan_share(&[]).is_empty());
+        assert!(parse_lan_share(&["   ".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn unknown_transport_falls_back_to_auto() {
+        use qp2p_core::session::WsMode;
+        assert_eq!(ws_mode_of(None), WsMode::Auto);
+        assert_eq!(ws_mode_of(Some("WS")), WsMode::Always);
+        assert_eq!(ws_mode_of(Some("poll")), WsMode::Never);
+        assert_eq!(ws_mode_of(Some("nonsense")), WsMode::Auto);
+    }
+
+    #[test]
+    fn advanced_settings_are_optional() {
+        let cfg: StartConfig = serde_json::from_str(
+            r#"{"worker":"https://w.dev","token":"t","upnp":false,
+                "signal_transport":"ws","lan_share":["192.168.1.1:80"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.upnp, Some(false));
+        assert_eq!(cfg.signal_transport.as_deref(), Some("ws"));
+        assert_eq!(cfg.lan_share, vec!["192.168.1.1:80".to_string()]);
+
+        // 老版本界面不传这三个字段，行为必须与以前完全一致
+        let old: StartConfig =
+            serde_json::from_str(r#"{"worker":"https://w.dev","token":"t"}"#).unwrap();
+        assert_eq!(old.upnp, None, "不传就是默认开");
+        assert!(old.signal_transport.is_none());
+        assert!(old.lan_share.is_empty(), "不传等于不开放局域网");
     }
 }

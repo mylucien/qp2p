@@ -67,6 +67,7 @@ pub async fn bind(
     stun_servers: &[String],
     tls: &crate::tls::TlsIdentity,
     host_ips: &[Ipv4Addr],
+    enable_upnp: bool,
 ) -> Result<Bound> {
     let socket = bind_socket(bind_addr)?;
     socket
@@ -102,7 +103,7 @@ pub async fn bind(
     );
 
     // 2) UPnP：失败只是少一个候选；回环地址上没有路由器可问，直接跳过
-    let mapping = if local_addr.ip().is_loopback() {
+    let mapping = if !enable_upnp || local_addr.ip().is_loopback() {
         None
     } else {
         try_upnp(local_addr, Duration::from_secs(2)).await

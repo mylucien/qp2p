@@ -22,4 +22,7 @@ object Native {
     external fun stop()
 
     external fun isPrepared(): Boolean
+
+    /** 建网：返回 {"id":..,"name":..,"cidr":..,"token":..} 或 {"error":".."}，会阻塞，需在后台线程调用 */
+    external fun createNetwork(requestJson: String): String
 }
