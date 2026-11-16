@@ -267,12 +267,10 @@ class Qp2pVpnService : VpnService() {
                 // 只接管虚拟网段：公网、局域网照旧走系统路由，不会把整机流量带走
                 .addRoute(cidr, prefix)
                 .setBlocking(true)
-            // 自己的信令/打洞流量绝不进隧道，否则会绕成死循环
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) {
-                // 个别 ROM 上不支持，忽略即可：目标地址不在路由表里，本来也不会进隧道
-            }
+            // 这里**不能**用 addDisallowedApplication：它会把这个 app 的所有流量
+            // 排除出 VPN，而局域网共享的监听 socket 正是本 app 的 socket，
+            // 回包被排除后就走不回 TUN，共享直接不通。
+            // 防环靠的是上面只 addRoute 虚拟网段——信令目标是公网地址，本来就不进隧道。
 
             setState(Phase.CONNECTING, "正在建立隧道…")
             val pfd = builder.establish() ?: run {

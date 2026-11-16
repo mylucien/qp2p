@@ -65,12 +65,50 @@ object AppConfig {
         // 留空就用内核的默认 STUN 列表，别把空数组传下去覆盖掉
         val stunList = lines(stun)
         if (stunList.isNotEmpty()) json.put("stun", JSONArray(stunList))
-        // 共享关掉时一个目标都不传：白名单为空等于拒绝一切端口映射
+        // 共享关掉时一条都不传：没有映射就等于不开放
         if (lanEnabled) {
-            val targets = lines(lanTargets)
-            if (targets.isNotEmpty()) json.put("lan_share", JSONArray(targets))
+            val targets = JSONArray()
+            for (line in lines(lanTargets)) {
+                val (listen, target) = parseShareLine(line)
+                if (target.isEmpty()) continue
+                val item = JSONObject().put("target", target)
+                // 0 = 让内核按目标端口自动选，别把 0 当成端口传下去
+                if (listen > 0) item.put("listen", listen)
+                targets.put(item)
+            }
+            if (targets.length() > 0) json.put("lan_share", targets)
         }
         return json.toString()
+    }
+
+    /**
+     * 一行共享配置 → (虚拟端口, 目标地址)。
+     *
+     * 存储格式是 `[虚拟端口 ]目标 | 备注`：端口可省略（0 = 自动），备注只给人看。
+     * 界面上要显示这两样，内核侧要的是这两个字段，所以解析只写这一处。
+     */
+    fun parseShareLine(line: String): Pair<Int, String> {
+        val body = line.substringBefore("|").trim()
+        if (body.isEmpty()) return 0 to ""
+        val parts = body.split(Regex("\\s+"))
+        if (parts.size >= 2) {
+            val port = parts[0].toIntOrNull()
+            if (port != null && port in 1..65535) return port to parts[1].trim()
+        }
+        return 0 to body
+    }
+
+    /** 取一行的备注部分；没有备注时返回空串 */
+    fun shareNote(line: String): String = line.substringAfter("|", "").trim()
+
+    /**
+     * 目标端口不填虚拟端口时的默认值：≥1024 就沿用，否则加 10000。
+     *
+     * 必须和内核 `auto_listen_port` 的规则一致，否则界面显示的端口和实际绑的不是一个。
+     */
+    fun defaultListenPort(target: String): Int {
+        val port = target.substringAfterLast(":", "").toIntOrNull() ?: return 0
+        return if (port >= 1024) port else port + 10_000
     }
 
     /** 多行文本 → 去空行去首尾空格的列表 */

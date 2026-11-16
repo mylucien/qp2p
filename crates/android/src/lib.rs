@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
 use qp2p_core::identity::{Identity, NodeId};
+use qp2p_core::link::lan::LanMap;
 use qp2p_core::link::tun::MeshLinks;
 use qp2p_core::route::Cidr;
 use qp2p_core::signal::client::{PeerInfo, SignalClient};
@@ -42,22 +43,65 @@ fn default_stun() -> Vec<String> {
     ]
 }
 
-/// 解析「局域网共享」目标列表。非法条目跳过并记日志，不能因为一条写错就整页失效。
-fn parse_lan_share(entries: &[String]) -> Vec<SocketAddr> {
-    let mut out: Vec<SocketAddr> = Vec::new();
+/// 把「局域网共享」条目解成映射表。非法条目跳过并记日志，不能因为一条写错就整页失效。
+///
+/// 虚拟端口小于 1024 的条目会被拒：Android 普通应用没有绑定特权端口的权限，
+/// 与其在 `bind` 时抛一个看不懂的权限错误，不如在解析阶段就说清楚。
+fn resolve_lan_share(entries: &[ShareEntry]) -> Vec<LanMap> {
+    let mut out: Vec<LanMap> = Vec::new();
     for entry in entries {
-        let text = entry.trim();
+        let (want, target_text) = match entry {
+            ShareEntry::Mapped { listen, target } => (Some(*listen), target.as_str()),
+            ShareEntry::Target(target) => (None, target.as_str()),
+        };
+        let text = target_text.trim();
         if text.is_empty() {
             continue;
         }
-        match text.parse::<SocketAddr>() {
-            Ok(addr) if addr.is_ipv4() => out.push(addr),
-            _ => log(&format!("局域网共享：忽略无法解析的目标 {text}")),
+        let target = match text.parse::<SocketAddr>() {
+            Ok(addr) if addr.is_ipv4() => addr,
+            _ => {
+                log(&format!("局域网共享：忽略无法解析的目标 {text}"));
+                continue;
+            }
+        };
+        let listen = match want {
+            Some(port) if port >= 1024 => port,
+            Some(port) => {
+                log(&format!(
+                    "局域网共享：端口 {port} 小于 1024，安卓普通应用绑不了，已跳过 {text}"
+                ));
+                continue;
+            }
+            None => auto_listen_port(target.port(), &out),
+        };
+        // 同一个目标只要有了一条映射就够了，再写一遍只会白占一个端口
+        if out.iter().any(|m| m.target == target) {
+            log(&format!("局域网共享：{text} 已经在列表里，已忽略"));
+            continue;
         }
+        if out.iter().any(|m| m.listen == listen) {
+            log(&format!(
+                "局域网共享：端口 {listen} 已被占用，跳过 {text}（换一个虚拟端口）"
+            ));
+            continue;
+        }
+        out.push(LanMap { listen, target });
     }
-    out.sort();
-    out.dedup();
     out
+}
+
+/// 目标端口 ≥1024 就沿用（用户不用记新号），否则加 10000；撞号时顺延。
+fn auto_listen_port(target_port: u16, used: &[LanMap]) -> u16 {
+    let mut port = if target_port >= 1024 {
+        target_port
+    } else {
+        target_port.saturating_add(10_000)
+    };
+    while port > 0 && used.iter().any(|m| m.listen == port) {
+        port = port.saturating_add(1);
+    }
+    port
 }
 
 fn ws_mode_of(raw: Option<&str>) -> qp2p_core::session::WsMode {
@@ -126,11 +170,22 @@ pub struct StartConfig {
     /// 信令传输：`auto`（默认）/ `ws` / `poll`。
     #[serde(default)]
     pub signal_transport: Option<String>,
-    /// 允许对端经本机访问的 `IP:端口` 列表（安卓当局域网出口）。
+    /// 局域网共享：远端经本机虚拟地址访问内网目标。
     ///
-    /// 空 = 拒绝一切端口映射请求；解析不了的条目直接忽略，不影响其余条。
+    /// 每条可以是 `{"listen": 10080, "target": "192.168.1.1:80"}`（指定虚拟端口），
+    /// 也可以是 `"192.168.1.1:80"`（端口按目标端口自动选）。空 = 不开放。
     #[serde(default)]
-    pub lan_share: Vec<String>,
+    pub lan_share: Vec<ShareEntry>,
+}
+
+/// 一条局域网共享条目。两种写法都收，旧配置（只有目标）不会失效。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ShareEntry {
+    /// 指定虚拟端口：远端的 `10.x.x.x:listen` 映射到 `target`
+    Mapped { listen: u16, target: String },
+    /// 只给目标：端口自动选（目标端口 ≥1024 就沿用，否则 +10000）
+    Target(String),
 }
 
 /// `prepare` 返回给 Kotlin 的信息，用来构建 VpnService。
@@ -157,8 +212,8 @@ struct Prepared {
     mtu: u16,
     /// 直连空闲多久断开；`None` = 保持在线，从不断链
     idle: Option<Duration>,
-    /// 允许对端访问的局域网目标；空 = 不开放
-    lan_share: Vec<SocketAddr>,
+    /// 局域网共享映射表；空 = 不开放
+    lan_share: Vec<LanMap>,
     /// 信令传输方式
     ws_mode: qp2p_core::session::WsMode,
 }
@@ -249,7 +304,7 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     let idle = idle_timeout(config.keep_online, config.idle_secs);
     let enable_upnp = config.upnp.unwrap_or(true);
     let ws_mode = ws_mode_of(config.signal_transport.as_deref());
-    let lan_share = parse_lan_share(&config.lan_share);
+    let lan_share = resolve_lan_share(&config.lan_share);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -382,8 +437,12 @@ pub fn start(fd: i32) -> Result<()> {
     if lan_share.is_empty() {
         log("局域网共享：未开启");
     } else {
-        let text: Vec<String> = lan_share.iter().map(ToString::to_string).collect();
-        log(&format!("局域网共享：{}", text.join(", ")));
+        for map in &lan_share {
+            log(&format!(
+                "局域网共享：远端访问 {virtual_ip}:{} → {}",
+                map.listen, map.target
+            ));
+        }
     }
 
     let stop = stop_flag();
@@ -393,7 +452,13 @@ pub fn start(fd: i32) -> Result<()> {
         // Android 上没有 root，网卡由 VpnService 建好，这里只接管描述符
         let device = tun_device(fd)?;
         let tun_link = qp2p_core::route::spawn_io(device, mtu);
-        let mesh = MeshLinks::new(tun_link.to_tun.clone(), lan_share);
+        // 局域网出口走本机监听（`link::lan`）：远端直接把包发到虚拟地址，
+        // 不需要任何端口映射配置。`KIND_TCP` 那条路留在桌面/CLI 用，
+        // 这里白名单为空 = 对端发来的端口映射流一律拒绝。
+        let mesh = MeshLinks::new(tun_link.to_tun.clone(), Vec::new());
+        if !lan_share.is_empty() {
+            qp2p_core::link::lan::spawn(virtual_ip, lan_share, stop.clone());
+        }
 
         {
             let runner = mesh.clone();
@@ -695,26 +760,64 @@ mod tests {
         assert_eq!(idle_timeout(false, 1800), Some(Duration::from_secs(1800)));
     }
 
+    fn share(raw: &str) -> ShareEntry {
+        serde_json::from_str(raw).expect("条目应当能反序列化")
+    }
+
     #[test]
     fn lan_share_skips_junk_and_dedupes() {
-        let got = parse_lan_share(&[
-            "192.168.1.1:80".to_string(),
-            " 192.168.1.1:80 ".to_string(),
-            "192.168.1.1".to_string(),
-            "".to_string(),
-            "192.168.1.1:22".to_string(),
+        let got = resolve_lan_share(&[
+            share(r#""192.168.1.1:80""#),
+            share(r#"" 192.168.1.1:80 ""#),
+            share(r#""192.168.1.1""#),
+            share(r#""""#),
+            share(r#""192.168.1.1:22""#),
         ]);
-        let want: Vec<SocketAddr> = vec![
-            "192.168.1.1:22".parse().unwrap(),
-            "192.168.1.1:80".parse().unwrap(),
+        // 80 和 22 都在特权端口段，自动加 10000；重复的那条只保留第一次
+        let want = vec![
+            LanMap {
+                listen: 10080,
+                target: "192.168.1.1:80".parse().unwrap(),
+            },
+            LanMap {
+                listen: 10022,
+                target: "192.168.1.1:22".parse().unwrap(),
+            },
         ];
-        assert_eq!(got, want, "非法条目要丢掉，重复要去重，结果要稳定排序");
+        assert_eq!(got, want, "非法条目要丢掉，重复要去重");
+    }
+
+    #[test]
+    fn lan_share_keeps_explicit_port() {
+        let got = resolve_lan_share(&[share(r#"{"listen":15000,"target":"192.168.1.1:80"}"#)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].listen, 15000);
+        assert_eq!(got[0].target, "192.168.1.1:80".parse().unwrap());
+    }
+
+    #[test]
+    fn lan_share_rejects_privileged_port() {
+        // Android 非 root 绑不了 1024 以下，与其在 bind 时报错，不如解析阶段就丢掉
+        let got = resolve_lan_share(&[share(r#"{"listen":80,"target":"192.168.1.1:80"}"#)]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn lan_share_shifts_conflicting_auto_port() {
+        // 两台设备都开 5000：第二台不能也绑 5000，得顺延
+        let got = resolve_lan_share(&[
+            share(r#""192.168.1.1:5000""#),
+            share(r#""192.168.1.2:5000""#),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].listen, 5000);
+        assert_eq!(got[1].listen, 5001);
     }
 
     #[test]
     fn lan_share_rejects_empty_string() {
-        assert!(parse_lan_share(&[]).is_empty());
-        assert!(parse_lan_share(&["   ".to_string()]).is_empty());
+        assert!(resolve_lan_share(&[]).is_empty());
+        assert!(resolve_lan_share(&[share(r#""   ""#)]).is_empty());
     }
 
     #[test]
@@ -735,7 +838,11 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.upnp, Some(false));
         assert_eq!(cfg.signal_transport.as_deref(), Some("ws"));
-        assert_eq!(cfg.lan_share, vec!["192.168.1.1:80".to_string()]);
+        assert_eq!(cfg.lan_share.len(), 1, "旧写法的字符串条目仍然要收下");
+        assert!(matches!(
+            cfg.lan_share[0],
+            ShareEntry::Target(ref text) if text == "192.168.1.1:80"
+        ));
 
         // 老版本界面不传这三个字段，行为必须与以前完全一致
         let old: StartConfig =

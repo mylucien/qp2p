@@ -125,7 +125,7 @@ class AdvancedActivity : Activity() {
         }
         body.addView(row)
 
-        body.addView(hintText("走 TCP 转发，每个端口单独加一条"))
+        body.addView(hintText("远端访问「虚拟地址:端口」，端口不小于 1024"))
 
         lanTargetsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         body.addView(lanTargetsBox)
@@ -162,53 +162,74 @@ class AdvancedActivity : Activity() {
             )
             return
         }
-        entries.forEachIndexed { index, (address, note) ->
-            lanTargetsBox.addView(targetRow(index, address, note))
+        entries.forEachIndexed { index, entry ->
+            lanTargetsBox.addView(targetRow(index, entry))
         }
     }
 
-    private fun targetRow(index: Int, address: String, note: String): LinearLayout =
+    private fun targetRow(index: Int, entry: LanEntry): LinearLayout =
         LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(42)
-            setPadding(0, dp(2), 0, dp(2))
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
             addView(
-                TextView(this@AdvancedActivity).apply {
-                    text = address
-                    textSize = 13f
-                    setTextColor(INK)
-                    typeface = Typeface.MONOSPACE
+                LinearLayout(this@AdvancedActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    minimumHeight = dp(30)
+                    addView(
+                        TextView(this@AdvancedActivity).apply {
+                            text = entry.target
+                            textSize = 13f
+                            setTextColor(INK)
+                            typeface = Typeface.MONOSPACE
+                        },
+                        LinearLayout.LayoutParams(
+                            0,
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            1f,
+                        ),
+                    )
+                    // 远端要敲的就是这个端口，跟目标地址的端口并不相同
+                    addView(
+                        TextView(this@AdvancedActivity).apply {
+                            text = ":${entry.listen}"
+                            textSize = 12f
+                            setTextColor(BLUE)
+                            typeface = Typeface.MONOSPACE
+                            setPadding(dp(6), dp(2), dp(6), dp(2))
+                            background = roundRect(Color.parseColor("#F2F6FE"), 6, 1, BORDER)
+                        }
+                    )
+                    addView(
+                        TextView(this@AdvancedActivity).apply {
+                            text = "×"
+                            textSize = 18f
+                            setTextColor(HINT)
+                            gravity = Gravity.CENTER
+                            setPadding(dp(10), 0, dp(2), 0)
+                            isClickable = true
+                            setOnClickListener {
+                                val list = lanEntries().toMutableList()
+                                if (index in list.indices) list.removeAt(index)
+                                saveLanEntries(list)
+                            }
+                        }
+                    )
                 }
             )
-            addView(
-                TextView(this@AdvancedActivity).apply {
-                    text = note
-                    textSize = 12f
-                    setTextColor(MUTED)
-                    gravity = Gravity.END
-                    setPadding(dp(8), 0, dp(8), 0)
-                },
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-            )
-            addView(
-                TextView(this@AdvancedActivity).apply {
-                    text = "×"
-                    textSize = 18f
-                    setTextColor(HINT)
-                    gravity = Gravity.CENTER
-                    setPadding(dp(8), 0, dp(2), 0)
-                    isClickable = true
-                    setOnClickListener {
-                        val list = lanEntries().toMutableList()
-                        if (index in list.indices) list.removeAt(index)
-                        saveLanEntries(list)
+            if (entry.note.isNotEmpty()) {
+                addView(
+                    TextView(this@AdvancedActivity).apply {
+                        text = entry.note
+                        textSize = 12f
+                        setTextColor(MUTED)
+                        setPadding(0, dp(1), 0, 0)
                     }
-                }
-            )
+                )
+            }
         }
 
-    /** 弹窗添加一条：地址必填，备注可选 */
+    /** 弹窗添加一条：地址必填，虚拟端口留空则按目标自动选，备注可选 */
     private fun askTarget() {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -220,6 +241,12 @@ class AdvancedActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT
             setSingleLine()
         }
+        val port = EditText(this).apply {
+            hint = "虚拟端口，留空自动"
+            textSize = 15f
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine()
+        }
         val note = EditText(this).apply {
             hint = "备注，可留空"
             textSize = 15f
@@ -227,6 +254,7 @@ class AdvancedActivity : Activity() {
             setSingleLine()
         }
         column.addView(address)
+        column.addView(port)
         column.addView(note)
 
         AlertDialog.Builder(this)
@@ -234,17 +262,31 @@ class AdvancedActivity : Activity() {
             .setView(column)
             .setNegativeButton("取消", null)
             .setPositiveButton("添加") { _, _ ->
-                val text = address.text.toString().trim()
-                if (!isAddressPort(text)) {
+                val target = address.text.toString().trim()
+                if (!isAddressPort(target)) {
                     toast("格式应为 IP:端口，例如 192.168.1.1:80")
                     return@setPositiveButton
                 }
+                val typed = port.text.toString().trim()
+                val listen = if (typed.isEmpty()) {
+                    AppConfig.defaultListenPort(target)
+                } else {
+                    typed.toIntOrNull() ?: 0
+                }
+                if (listen !in 1024..65535) {
+                    toast("虚拟端口要在 1024~65535 之间（下面的端口安卓绑不了）")
+                    return@setPositiveButton
+                }
                 val list = lanEntries().toMutableList()
-                if (list.any { it.first == text }) {
+                if (list.any { it.target == target }) {
                     toast("这条已经加过了")
                     return@setPositiveButton
                 }
-                list.add(text to note.text.toString().trim())
+                if (list.any { it.listen == listen }) {
+                    toast("端口 $listen 已经被别的目标占了")
+                    return@setPositiveButton
+                }
+                list.add(LanEntry(listen, target, note.text.toString().trim()))
                 saveLanEntries(list)
             }
             .show()
@@ -260,19 +302,25 @@ class AdvancedActivity : Activity() {
         return port in 1..65535
     }
 
-    private fun lanEntries(): List<Pair<String, String>> =
+    /** 一条共享：虚拟地址上的 [listen] → 内网 [target] */
+    private data class LanEntry(val listen: Int, val target: String, val note: String)
+
+    private fun lanEntries(): List<LanEntry> =
         prefs.getString(AppConfig.KEY_LAN_TARGETS, "").orEmpty()
             .lines()
             .mapNotNull { line ->
-                val text = line.trim()
-                if (text.isEmpty()) return@mapNotNull null
-                val parts = text.split("|", limit = 2)
-                parts[0].trim() to (parts.getOrNull(1)?.trim() ?: "")
+                if (line.trim().isEmpty()) return@mapNotNull null
+                val (saved, target) = AppConfig.parseShareLine(line)
+                if (target.isEmpty()) return@mapNotNull null
+                // 旧配置只存了目标，按同一套规则补出端口，界面和内核看到的才一致
+                val listen = if (saved > 0) saved else AppConfig.defaultListenPort(target)
+                LanEntry(listen, target, AppConfig.shareNote(line))
             }
 
-    private fun saveLanEntries(list: List<Pair<String, String>>) {
-        val text = list.joinToString("\n") { (address, note) ->
-            if (note.isEmpty()) address else "$address | $note"
+    private fun saveLanEntries(list: List<LanEntry>) {
+        val text = list.joinToString("\n") { entry ->
+            val head = "${entry.listen} ${entry.target}"
+            if (entry.note.isEmpty()) head else "$head | ${entry.note}"
         }
         prefs.edit().putString(AppConfig.KEY_LAN_TARGETS, text).apply()
         renderTargets()
