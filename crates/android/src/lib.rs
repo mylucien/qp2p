@@ -274,6 +274,74 @@ fn log(message: &str) {
     }
 }
 
+/// 把 core 里的 `tracing` 日志接到 logcat（标签同样是 `qp2p`）。
+///
+/// 之前安卓侧没装 subscriber，`tracing::info!` 全部被丢弃：`link::lan` 的
+/// 「监听成功」和「绑定失败」都属于这一类，出问题时手机上一点线索都没有。
+/// 只处理 INFO 及以上，DEBUG 会把 logcat 刷满。
+#[cfg(target_os = "android")]
+mod logcat {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex, Once};
+
+    /// 同一个事件会被拆成多次 `write`（级别、目标、正文），所以按行攒够再发。
+    struct Sink {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let mut buf = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+            buf.extend_from_slice(data);
+            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end();
+                if !text.is_empty() {
+                    super::log(text);
+                }
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MakeSink(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeSink {
+        type Writer = Sink;
+
+        fn make_writer(&'a self) -> Sink {
+            Sink {
+                buf: self.0.clone(),
+            }
+        }
+    }
+
+    static INIT: Once = Once::new();
+
+    pub fn init() {
+        INIT.call_once(|| {
+            let sink = MakeSink(Arc::new(Mutex::new(Vec::new())));
+            let _ = tracing_subscriber::fmt()
+                .with_writer(sink)
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .try_init();
+        });
+    }
+}
+
+/// 桌面编译时不装任何全局订阅者（CLI 自己会装）。
+fn init_log() {
+    #[cfg(target_os = "android")]
+    logcat::init();
+}
+
 impl PreparedInfo {
     fn from_prepared(p: &Prepared, cidr: &Cidr) -> Self {
         Self {
@@ -289,6 +357,7 @@ impl PreparedInfo {
 
 /// 第一步：注册并拿到本机地址。不产生任何流量。
 pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
+    init_log();
     let data_dir = config.data_dir.as_deref().map(std::path::Path::new);
     let bind: SocketAddr = config
         .bind
@@ -407,6 +476,7 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
 
 /// 第二步：接管 VpnService 的 tun fd，开始收发。阻塞到 `stop()`。
 pub fn start(fd: i32) -> Result<()> {
+    init_log();
     let prepared = prepared_slot()
         .lock()
         .expect("prepared 锁中毒")
