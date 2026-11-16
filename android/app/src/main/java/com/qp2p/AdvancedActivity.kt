@@ -233,29 +233,12 @@ class AdvancedActivity : Activity() {
     private fun askTarget() {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(6), dp(20), 0)
+            setPadding(dp(20), 0, dp(20), 0)
         }
-        val address = EditText(this).apply {
-            hint = "192.168.1.1:80"
-            textSize = 15f
-            inputType = InputType.TYPE_CLASS_TEXT
-            setSingleLine()
-        }
-        val port = EditText(this).apply {
-            hint = "虚拟端口，留空自动"
-            textSize = 15f
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setSingleLine()
-        }
-        val note = EditText(this).apply {
-            hint = "备注，可留空"
-            textSize = 15f
-            inputType = InputType.TYPE_CLASS_TEXT
-            setSingleLine()
-        }
-        column.addView(address)
-        column.addView(port)
-        column.addView(note)
+        // 三个框必须各有标题：只靠 hint 时用户分不清哪个是哪个
+        val address = labeledField("目标地址", "192.168.1.1:80", column)
+        val port = labeledField("虚拟端口", "留空自动，1024 以上", column, number = true)
+        val note = labeledField("备注", "可留空", column)
 
         AlertDialog.Builder(this)
             .setTitle("添加目标")
@@ -540,15 +523,14 @@ class AdvancedActivity : Activity() {
     private fun buildCreateGroup(): LinearLayout {
         val (card, body) = groupCard("新建网络", null, expanded = false)
 
-        nameInput = field("网络名，如 home")
-        adminInput = field("管理密钥 ADMIN_SECRET").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        cidrInput = field("网段，留空＝10.78.0.0/16")
-
-        body.addView(nameInput)
-        body.addView(adminInput)
-        body.addView(cidrInput)
+        nameInput = labeledField("网络名", "小写字母、数字、连字符，如 home", body)
+        adminInput = labeledField(
+            "管理密钥",
+            "部署时填的 ADMIN_SECRET",
+            body,
+            mask = true,
+        )
+        cidrInput = labeledField("网段", "留空 = 10.78.0.0/16", body)
 
         createButton = Button(this).apply {
             text = "创建并生成令牌"
@@ -565,7 +547,7 @@ class AdvancedActivity : Activity() {
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(2) },
+            ).apply { topMargin = dp(16) },
         )
 
         createResult = LinearLayout(this).apply {
@@ -755,14 +737,43 @@ class AdvancedActivity : Activity() {
         return card to body
     }
 
-    private fun field(hintText: String): EditText = EditText(this).apply {
-        hint = hintText
-        textSize = 14f
-        setTextColor(INK)
-        setHintTextColor(HINT)
-        setSingleLine()
-        setPadding(dp(12), dp(10), dp(12), dp(10))
-        background = roundRect(Color.parseColor("#FBFCFD"), 10, 1, BORDER)
+    /**
+     * 一个带标题的输入项：标题一行、输入框一行，直接挂到 [parent] 上。
+     *
+     * 只用 EditText 的 hint 不写标题时，弹窗里几个框挤在一起根本分不清哪个是哪个，
+     * 所以这里统一「标题 + 框」的写法，并把框的样式与主界面拉齐。
+     */
+    private fun labeledField(
+        label: String,
+        hint: String,
+        parent: LinearLayout,
+        mask: Boolean = false,
+        number: Boolean = false,
+    ): EditText {
+        parent.addView(
+            TextView(this).apply {
+                text = label
+                textSize = 12f
+                setTextColor(MUTED)
+                setPadding(0, dp(10), 0, dp(4))
+            }
+        )
+        val input = EditText(this).apply {
+            this.hint = hint
+            textSize = 15f
+            setTextColor(INK)
+            setHintTextColor(HINT)
+            setSingleLine()
+            inputType = when {
+                mask -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                number -> InputType.TYPE_CLASS_NUMBER
+                else -> InputType.TYPE_CLASS_TEXT
+            }
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundRect(Color.parseColor("#FBFCFD"), 10, 1, BORDER)
+        }
+        parent.addView(input)
+        return input
     }
 
     private fun hintText(text: String): TextView = TextView(this).apply {
@@ -830,6 +841,8 @@ class AdvancedActivity : Activity() {
 
         /** 与 Rust 侧 `default_stun()` 保持一致 */
         private const val DEFAULT_STUN_TEXT =
-            "stun.cloudflare.com:3478\nstun.l.google.com:19302"
+            "stun.cloudflare.com:3478\n" +
+                "stun.miwifi.com:3478\n" +
+                "stun.chat.bilibili.com:3478"
     }
 }

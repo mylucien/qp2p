@@ -36,10 +36,13 @@ fn default_idle_secs() -> u64 {
     600
 }
 
+/// 默认 STUN 列表：三个都在国内可达。改成这个组合之前用的是
+/// `stun.l.google.com`，在国内基本连不通，每次都要白等一轮超时。
 fn default_stun() -> Vec<String> {
     vec![
         "stun.cloudflare.com:3478".to_string(),
-        "stun.l.google.com:19302".to_string(),
+        "stun.miwifi.com:3478".to_string(),
+        "stun.chat.bilibili.com:3478".to_string(),
     ]
 }
 
