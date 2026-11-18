@@ -96,6 +96,11 @@ impl Notify {
     pub fn say(&self, message: &str) {
         self.0.as_ref()(message);
     }
+
+    /// 共享底层回调。数据面判定直连失效时要自己发一条提示，走的就是这个。
+    pub fn shared(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        self.0.clone()
+    }
 }
 
 /// 一次上线会话里不变的东西：身份、令牌、本机名、网络。
@@ -699,6 +704,8 @@ impl Session {
         let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<Ipv4Addr>(16);
         if let Some(mesh) = self.mesh.as_ref() {
             mesh.set_wake(wake_tx).await;
+            // 数据面判定直连失效时（A 方案），要能直接告诉用户一句
+            mesh.set_notice(self.notify.shared());
         }
         let mut forced: Option<Ipv4Addr> = None;
         // 空闲断链之后进入休眠：不主动拨号、也不高频轮询，等 TUN 里有包再来叫醒
