@@ -589,6 +589,37 @@ pub struct Session {
     peers: SharedPeers,
     notify: Notify,
     stop: Arc<AtomicBool>,
+    /// 正在应答的对端：同一时刻只允许一个 `answer_punch`。
+    ///
+    /// 服务端可能为同一个对端连着推两条 `punch_request`。两个监听任务会在
+    /// 同一个端点上各抢一条连接，后建的那条把先建的顶掉——表现为"连上就断"。
+    answers: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// 一次"我来应答"的占用。Drop 时释放，保证异常路径也不会把对端永久锁死。
+struct AnswerSlot {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for AnswerSlot {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.key);
+        }
+    }
+}
+
+/// 抢占某个对端的应答权；返回 None 表示已经有人在应答它了。
+fn claim_answer(set: &Arc<std::sync::Mutex<HashSet<String>>>, key: &str) -> Option<AnswerSlot> {
+    let mut guard = set.lock().ok()?;
+    if !guard.insert(key.to_string()) {
+        return None;
+    }
+    Some(AnswerSlot {
+        set: set.clone(),
+        key: key.to_string(),
+    })
 }
 
 impl Session {
@@ -606,6 +637,7 @@ impl Session {
             peers,
             notify,
             stop: Arc::new(AtomicBool::new(false)),
+            answers: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -835,7 +867,15 @@ impl Session {
                                 let peers = self.peers.clone();
                                 let mesh = self.mesh.clone();
                                 let notify = self.notify.clone();
+                                let answers = self.answers.clone();
+                                let key = from.to_string();
                                 tokio::spawn(async move {
+                                    let Some(_slot) = claim_answer(&answers, &key) else {
+                                        tracing::debug!(
+                                            "[session] 已经在应答 {key}，跳过重复的 punch_request"
+                                        );
+                                        return;
+                                    };
                                     answer_punch(
                                         engine, peers, mesh, notify, from, label, ip, addrs,
                                     )

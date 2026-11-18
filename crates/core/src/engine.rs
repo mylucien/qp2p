@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 use crate::candidate::{normalize, Candidate, CandidateKind};
 use crate::identity::{Identity, NodeId};
+use crate::peer::accept::AcceptHub;
 use crate::peer::{punch, Role};
 use crate::socket;
 use crate::stun_watch;
@@ -69,6 +70,9 @@ pub struct Engine {
     host_ips: Vec<std::net::Ipv4Addr>,
     /// UPnP 是否启用；刷新端点时要沿用同一个选择
     upnp_enabled: bool,
+    /// 入站连接的唯一分发中心：所有打洞任务都从这里订阅，不再各自 accept
+    accept: Option<Arc<AcceptHub>>,
+    accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// 把 `Bound` 里的 STUN 旁路接到保活任务上。
@@ -126,6 +130,7 @@ impl Engine {
         let mapping = bound.mapping.clone();
         let renewer = start_upnp_renewer(mapping.clone());
         let (stun_shared, stun_task) = start_stun_watch(&mut bound, stun_servers, 0);
+        let (accept, accept_task) = AcceptHub::spawn(bound.endpoint.clone());
 
         Ok(Self {
             endpoint: Some(bound.endpoint),
@@ -146,6 +151,8 @@ impl Engine {
             stun_task,
             host_ips,
             upnp_enabled: enable_upnp,
+            accept: Some(accept),
+            accept_task: Some(accept_task),
         })
     }
 
@@ -294,6 +301,7 @@ impl Engine {
             endpoint.close(0u32.into(), b"shutdown");
             let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
         }
+        self.stop_accept();
         self.keepalive = None;
     }
 
@@ -324,6 +332,9 @@ impl Engine {
             let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
             drop(endpoint);
         }
+        // 旧的 accept 循环跟着旧端点一起退：不 abort 的话它会一直挂在
+        // 已关闭端点的 accept() 上，而且 routes 里还留着上一轮的订阅
+        self.stop_accept();
         // 关键：先放掉复制出来的保活句柄，否则这个端口一直被占着
         self.keepalive = None;
 
@@ -391,7 +402,10 @@ impl Engine {
                 endpoint.set_default_client_config(config);
             }
         }
-        self.endpoint = Some(endpoint);
+        self.endpoint = Some(endpoint.clone());
+        let (accept, accept_task) = AcceptHub::spawn(endpoint);
+        self.accept = Some(accept);
+        self.accept_task = Some(accept_task);
         self.bind_addr = bound.bind_addr;
         self.local_addr = bound.local_addr;
         self.srflx = bound.srflx;
@@ -399,6 +413,14 @@ impl Engine {
         self.candidates = bound.candidates;
         self.keepalive = Some(bound.keepalive);
         tracing::info!("[engine] 端点已刷新 addr={}", self.local_addr);
+    }
+
+    /// 停掉当前端点的 accept 循环。端点被替换时必须调用。
+    fn stop_accept(&mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
+        self.accept = None;
     }
 
     /// 对一组候选地址打洞；`timeout` 由角色决定。
@@ -429,6 +451,9 @@ impl Engine {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return Err(punch::PunchError::Dial("端点不可用".to_string()));
         };
+        let Some(hub) = self.accept.as_ref() else {
+            return Err(punch::PunchError::Dial("端点不可用".to_string()));
+        };
 
         let handles = punch::AuthHandles {
             identity: self.identity.clone(),
@@ -436,7 +461,7 @@ impl Engine {
         };
 
         let probe = self.spawn_probe(peers, timeout);
-        let result = punch::execute(endpoint, peers, role, timeout, Some(handles)).await;
+        let result = punch::execute(endpoint, hub, peers, role, timeout, Some(handles)).await;
         if let Some(task) = probe {
             task.abort();
         }

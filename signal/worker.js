@@ -1,18 +1,18 @@
 /**
- * qp2p 信令 Worker —— 单文件版，粘贴即可部署
- * ==========================================
+ * qp2p 信令 Worker
+ * ================
  *
  * 只做三件事：登记节点、撮合打洞、维持在线状态。不转发任何业务数据。
  *
- * 部署（全程在 Cloudflare Dashboard，不需要 wrangler）：
- *   1. Workers & Pages → Create → Worker → Edit code → 粘贴本文件 → Deploy
- *   2. 可选：Storage → D1 → Create database `qp2p`，然后
- *      Worker → Settings → Bindings → 添加 D1，变量名填 DB
- *      （不绑定也能跑，但状态只存在单个 isolate 里，见 /v1/health 的 storage 字段）
- *   3. Settings → Variables → 添加 ADMIN_SECRET（用于创建网络）
- *   4. 表结构在首次请求时自动建立，不需要手动执行 SQL
+ * 部署：
+ *   用 `qp2p-deploy up`（推荐，会一并建好 D1、Durable Object 与迁移），
+ *   或者手工在 Dashboard 里配齐下面三样，缺一样就跑不起来：
+ *     1. D1 数据库 `qp2p`，绑定名 `DB`
+ *     2. Durable Object 命名空间，绑定名 `ROOM`，类名 `Room`，
+ *        并且已经跑过 `new_sqlite_classes` 迁移
+ *     3. 变量 `ADMIN_SECRET`（创建/管理网络用）
  *
- * 不需要 Durable Object，不需要 WebSocket，不需要构建步骤。
+ *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
 const VERSION = "2.8.4";
@@ -1352,32 +1352,29 @@ async function clearAttempt(env, key) {
 /** 距离解锁还有多少秒；0 表示没锁。 */
 async function lockedFor(env, username, ip) {
   const now = Date.now();
-  for (const key of [`user:${username}`, `ip:${ip}|${username}`]) {
-    const row = await getAttempt(env, key);
-    if (!row) continue;
-    if (Number(row.locked_until) > now) {
-      return Math.ceil((Number(row.locked_until) - now) / 1000);
-    }
+  // 只按 (来源 IP, 用户名) 计数：以前还有一个全局的 `user:<名字>` 键，
+  // 任何人对已知用户名连错 20 次就能把管理员锁一小时——等于送了个免费 DoS。
+  const row = await getAttempt(env, `ip:${ip}|${username}`);
+  if (!row) return 0;
+  if (Number(row.locked_until) > now) {
+    return Math.ceil((Number(row.locked_until) - now) / 1000);
   }
   return 0;
 }
 
 async function noteFailure(env, username, ip) {
   const now = Date.now();
-  let longest = 0;
-  for (const key of [`user:${username}`, `ip:${ip}|${username}`]) {
-    const row = await getAttempt(env, key);
-    const fresh =
-      !row || now - Number(row.last_at) > LOGIN_WINDOW_MS
-        ? { key, fails: 0, first_at: now, last_at: now, locked_until: 0 }
-        : { ...row };
-    fresh.fails = Number(fresh.fails) + 1;
-    fresh.last_at = now;
-    const lock = lockSecondsFor(fresh.fails);
-    fresh.locked_until = lock > 0 ? now + lock * 1000 : 0;
-    if (lock > longest) longest = lock;
-    await putAttempt(env, fresh);
-  }
+  const key = `ip:${ip}|${username}`;
+  const row = await getAttempt(env, key);
+  const fresh =
+    !row || now - Number(row.last_at) > LOGIN_WINDOW_MS
+      ? { key, fails: 0, first_at: now, last_at: now, locked_until: 0 }
+      : { ...row };
+  fresh.fails = Number(fresh.fails) + 1;
+  fresh.last_at = now;
+  const lock = lockSecondsFor(fresh.fails);
+  fresh.locked_until = lock > 0 ? now + lock * 1000 : 0;
+  await putAttempt(env, fresh);
   // 内存里再记一份，下一轮同 isolate 的请求不用查 D1 就能挡住
   const slot = loginFails.get(`${ip}|${username}`);
   if (!slot || now - slot.start > LOGIN_WINDOW_MS) {
@@ -1386,12 +1383,11 @@ async function noteFailure(env, username, ip) {
   } else {
     slot.count += 1;
   }
-  return longest;
+  return lock;
 }
 
 async function clearFailures(env, username, ip) {
   loginFails.delete(`${ip}|${username}`);
-  await clearAttempt(env, `user:${username}`);
   await clearAttempt(env, `ip:${ip}|${username}`);
 }
 
@@ -1411,14 +1407,23 @@ async function adminLogin(request, env) {
   }
 
   const user = await getAdminUser(env, username);
-  // 账号不存在时也算一次哈希，避免从响应时间上看出账号是否存在
+  // 账号不存在时也要算一次哈希，避免从响应时间上看出账号是否存在。
+  // 迭代次数必须跟着部署配置走（pbkdf2Iterations），不能写死编译期常量：
+  // 否则把 env 调成 2000 之后，"不存在的用户名"反而慢 50 倍，一眼就能枚举。
   const salt = user?.salt ?? "00".repeat(24);
-  const iterations = Number(user?.iterations ?? PBKDF2_ITERATIONS);
+  const iterations = Number(user?.iterations ?? pbkdf2Iterations(env));
   const hash = await pbkdf2Hex(password, salt, iterations);
   const ok = Boolean(user) && timingSafeEqual(hash, user.hash);
   if (!ok) {
     const lock = await noteFailure(env, username, ip);
-    await audit(env, "login.failed", username, ip, lock > 0 ? `已锁定 ${lock} 秒` : "");
+    // 签名是 (action, target, detail, actor)：这里 actor 是匿名尝试，IP 归到 detail
+    await audit(
+      env,
+      "login.failed",
+      username,
+      lock > 0 ? `${ip}，已锁定 ${lock} 秒` : ip,
+      "anonymous",
+    );
     if (lock > 0) {
       const res = err(429, "too_many_attempts", `失败次数过多，锁定 ${lock} 秒`);
       res.headers.set("retry-after", String(lock));
@@ -1446,7 +1451,7 @@ async function adminPassword(request, env) {
     Number(user.iterations),
   );
   if (!timingSafeEqual(oldHash, user.hash)) {
-    await audit(env, "admin.password_failed", session.username, "");
+    await audit(env, "admin.password_failed", session.username, "", session.username);
     return err(403, "wrong_password", "旧密码不对");
   }
   const next = String(body.new_password ?? "");
@@ -1982,7 +1987,7 @@ function publicNode(node, now) {
   };
 }
 
-function parseCandidates(raw) {
+function parseCandidates(raw, clientIp) {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw) || raw.length > MAX_CANDIDATES) return null;
   const out = [];
@@ -1994,20 +1999,35 @@ function parseCandidates(raw) {
     const port = Number(portText);
     if (port < 1 || port > 65535) return null;
     if (ip.split(".").some((part) => Number(part) > 255 || part === "")) return null;
-    if (!isDialable(ip)) return null;
+    if (!isDialable(ip, clientIp)) return null;
     if (!out.includes(text)) out.push(text);
   }
   return out;
 }
 
+/// 内网段（含运营商级 NAT 的 100.64/10）。
+function isPrivateV4(a, b) {
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
 /// 只接受能当"对端地址"的 IP：回环、0.0.0.0、链路本地、组播/保留段一律拒绝。
-/// 否则任意成员都能登记第三方地址，让其他节点往那里持续发 QUIC 包。
-function isDialable(ip) {
+///
+/// 公网地址还必须是**本次请求的来源 IP**：节点的 srflx / UPnP 映射本来就是这个
+/// 出口地址，正常部署不受影响。不这么限制的话，任意成员都能登记第三方地址，
+/// 让别的节点每 300ms 往那里发一个 1200 字节的 QUIC Initial——一个几字节的
+/// 请求就能换来上百 KB 的反射流量。
+function isDialable(ip, clientIp) {
   const [a, b] = ip.split(".").map(Number);
   if (a === 0 || a === 127) return false;
   if (a === 169 && b === 254) return false;
   if (a >= 224) return false;
-  return true;
+  if (isPrivateV4(a, b)) return true;
+  // 拿不到来源 IP（本地 wrangler / 自定义入口）时不收紧，免得连自己都连不上
+  return clientIp ? ip === clientIp : true;
 }
 
 function normalizeCidr(text) {
@@ -2033,10 +2053,34 @@ function randomId() {
 }
 
 async function readJson(request) {
-  const length = Number(request.headers.get("content-length") ?? 0);
-  if (length > MAX_BODY_BYTES) return null;
-  const text = await request.text();
-  if (text.length > MAX_BODY_BYTES) return null;
+  const declared = Number(request.headers.get("content-length") ?? 0);
+  if (declared > MAX_BODY_BYTES) return null;
+  if (!request.body) return {};
+
+  // 边读边量字节数：以前的实现先 request.text() 读完整个 body 再比长度，
+  // 而且比的是 UTF-16 码元数（非 ASCII 能到字节数的 1/3），两头都拦不住。
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  if (total === 0) return {};
+
+  const buf = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  const text = new TextDecoder().decode(buf);
   if (!text) return {};
   try {
     const parsed = JSON.parse(text);
@@ -3133,10 +3177,12 @@ export class NetworkRoom {
     let reassigned = 0;
     if (body.reassign === true && !lagging) {
       const nodes = this.listNodes();
+      // 预留要带上：以前传的是空数组，重分配会把别人预留的地址分出去
+      const reservations = this.listReservations();
       for (const node of nodes) {
         if (ipInCidr(net.cidr, node.virtual_ip)) continue;
         const oldIp = node.virtual_ip;
-        const fresh = await assignIp(net, node.node_id, nodes, []);
+        const fresh = await assignIp(net, node.node_id, nodes, reservations);
         this.deleteReservation(oldIp);
         node.virtual_ip = fresh;
         this.putNode(node);
@@ -3534,15 +3580,37 @@ export class NetworkRoom {
     }
 
     const t = now + 500;
+    // 同一对 (发起方, 目标) 两秒内只撮合一次。
+    // 一次撮合会让目标向候选连发 35 秒的 QUIC Initial（≥1200 字节 / 300ms），
+    // 不设上限的话，几字节的请求就能换来上百 KB 的放大流量。
+    const budgetKey = `${from}|${target}`;
+    const last = this.punchAt?.get(budgetKey) ?? 0;
+    if (now - last < 2000) {
+      return {
+        ok: false,
+        status: 429,
+        error: "too_many_punch",
+        detail: "撮合太频繁，两秒后再试",
+      };
+    }
     // commit=false 只做预检：HTTP 路径要先把 nonce 占掉才允许产生副作用
-    if (commit) this.emit(target, "punch_request", {
-      from,
-      from_name: self.name,
-      virtual_ip: self.virtual_ip,
-      candidates: safeParseArray(self.candidates),
-      t,
-      server_ms: now,
-    });
+    if (commit) {
+      if (!this.punchAt) this.punchAt = new Map();
+      if (this.punchAt.size > 4096) {
+        for (const [key, at] of this.punchAt) {
+          if (now - at > 60_000) this.punchAt.delete(key);
+        }
+      }
+      this.punchAt.set(budgetKey, now);
+      this.emit(target, "punch_request", {
+        from,
+        from_name: self.name,
+        virtual_ip: self.virtual_ip,
+        candidates: safeParseArray(self.candidates),
+        t,
+        server_ms: now,
+      });
+    }
 
     return {
       ok: true,
@@ -3610,7 +3678,9 @@ export class NetworkRoom {
       return err(403, "node_id_mismatch", "node_id 必须等于 sha256(pubkey)[..32]");
     }
 
-    const candidates = parseCandidates(body.candidates);
+    // cf-connecting-ip 由边缘写入并覆盖客户端自带的同名头，可以当来源信任
+    const clientIp = request.headers.get("cf-connecting-ip") ?? null;
+    const candidates = parseCandidates(body.candidates, clientIp);
     if (candidates === null) {
       return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
     }
@@ -3632,8 +3702,10 @@ export class NetworkRoom {
     let others = this.listNodes();
     const existing = others.find((n) => n.node_id === nodeId) ?? null;
     if (!existing && others.length >= MAX_NODES) {
+      // 用 liveness 而不是裸 last_seen：WS 节点的 last_seen 只在 register 时写，
+      // 一个连着几小时的长连接节点看起来"很旧"，但它明明在线，不能拿去淘汰。
       const victim = others
-        .filter((n) => now - n.last_seen > OFFLINE_MS)
+        .filter((n) => !this.liveness(n, now).online)
         .sort((a, b) => a.last_seen - b.last_seen)[0];
       if (!victim) {
         return err(507, "network_full", `每个网络上限 ${MAX_NODES} 个节点，且都在线`);

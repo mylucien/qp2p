@@ -75,6 +75,49 @@ struct Verdict {
     reason: String,
 }
 
+/// 认证失败的性质。
+///
+/// 只有 [`AuthFailure::Identity`] 才意味着"对面不是这个人，重试也没有意义"。
+/// I/O 超时、对端把连接关掉都属于 [`AuthFailure::Transient`] —— 把它们当成
+/// 身份不对，会让一次瞬时抖动把整个候选拉黑、把整轮打洞窗口提前结束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// 对端身份确定不对：node_id 与公钥不符、签名校验失败、指定的 node_id 不匹配
+    Identity,
+    /// 这次没谈成：读超时、连接被关、会话绑定值取不到
+    Transient,
+}
+
+#[derive(Debug)]
+pub struct AuthError {
+    pub failure: AuthFailure,
+    pub detail: anyhow::Error,
+}
+
+impl AuthError {
+    pub fn identity(e: anyhow::Error) -> Self {
+        Self {
+            failure: AuthFailure::Identity,
+            detail: e,
+        }
+    }
+
+    pub fn transient(e: anyhow::Error) -> Self {
+        Self {
+            failure: AuthFailure::Transient,
+            detail: e,
+        }
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.detail)
+    }
+}
+
+impl std::error::Error for AuthError {}
+
 /// 认证结果：确认过的对端身份。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -87,13 +130,13 @@ pub async fn authenticate_dialer(
     conn: &Connection,
     identity: &Identity,
     expected: Option<&NodeId>,
-) -> Result<PeerIdentity> {
+) -> std::result::Result<PeerIdentity, AuthError> {
     let (mut send, mut recv) = tokio::time::timeout(STEP_TIMEOUT, conn.open_bi())
         .await
-        .context("打开认证流超时")?
-        .context("打开认证流失败")?;
+        .map_err(|_| AuthError::transient(anyhow::anyhow!("打开认证流超时")))?
+        .map_err(|e| AuthError::transient(e.into()))?;
 
-    let binding = channel_binding(conn)?;
+    let binding = channel_binding(conn).map_err(AuthError::transient)?;
     let my_nonce = random_nonce();
 
     // 1. 我先亮身份（含 nonce）
@@ -103,13 +146,15 @@ pub async fn authenticate_dialer(
         pubkey: hex::encode(identity.public_key()),
         nonce: my_nonce.clone(),
     };
-    write_frame(&mut send, &hello).await?;
+    write_frame(&mut send, &hello)
+        .await
+        .map_err(AuthError::transient)?;
 
     // 2. 对端回身份 + 对双方 nonce 的签名
-    let peer_hello: Hello = read_frame(&mut recv).await?;
-    let peer = check_hello(&peer_hello)?;
+    let peer_hello: Hello = read_frame(&mut recv).await.map_err(AuthError::transient)?;
+    let peer = check_hello(&peer_hello).map_err(AuthError::identity)?;
 
-    let proof: Proof = read_frame(&mut recv).await?;
+    let proof: Proof = read_frame(&mut recv).await.map_err(AuthError::transient)?;
     let peer_nonce = peer_hello.nonce.clone();
     verify_proof(
         &proof,
@@ -119,7 +164,8 @@ pub async fn authenticate_dialer(
         &peer_nonce,
         &my_nonce,
         &binding,
-    )?;
+    )
+    .map_err(AuthError::identity)?;
 
     // 3. 我回签，证明我也持有私钥
     let message = auth_message(
@@ -134,12 +180,14 @@ pub async fn authenticate_dialer(
         node_id: identity.node_id().as_str().to_string(),
         sig: hex::encode(identity.sign(message.as_bytes())),
     };
-    write_frame(&mut send, &my_proof).await?;
+    write_frame(&mut send, &my_proof)
+        .await
+        .map_err(AuthError::transient)?;
 
     // 4. 等 listener 的最终裁决：它可能因为自己的 --peer-id 不匹配而拒了我
-    let verdict: Verdict = read_frame(&mut recv)
-        .await
-        .context("对端没有给出认证结论（连接可能已被拒绝后关闭）")?;
+    let verdict: Verdict = read_frame(&mut recv).await.map_err(|e| {
+        AuthError::transient(e.context("对端没有给出认证结论（连接可能已被拒绝后关闭）"))
+    })?;
 
     // 5. 我这边也要给出结论，并且必须在返回前发出去：
     //    listener 等它才敢收尾，否则它一返回、端点被丢弃，
@@ -175,7 +223,7 @@ pub async fn authenticate_dialer(
         .await;
     }
 
-    outcome?;
+    outcome.map_err(AuthError::identity)?;
     Ok(peer)
 }
 
@@ -184,17 +232,17 @@ pub async fn authenticate_listener(
     conn: &Connection,
     identity: &Identity,
     expected: Option<&NodeId>,
-) -> Result<PeerIdentity> {
+) -> std::result::Result<PeerIdentity, AuthError> {
     let (mut send, mut recv) = tokio::time::timeout(STEP_TIMEOUT, conn.accept_bi())
         .await
-        .context("等待认证流超时")?
-        .context("接受认证流失败")?;
+        .map_err(|_| AuthError::transient(anyhow::anyhow!("等待认证流超时")))?
+        .map_err(|e| AuthError::transient(e.into()))?;
 
-    let binding = channel_binding(conn)?;
+    let binding = channel_binding(conn).map_err(AuthError::transient)?;
 
     // 1. 对端先亮身份
-    let peer_hello: Hello = read_frame(&mut recv).await?;
-    let peer = check_hello(&peer_hello)?;
+    let peer_hello: Hello = read_frame(&mut recv).await.map_err(AuthError::transient)?;
+    let peer = check_hello(&peer_hello).map_err(AuthError::identity)?;
     let peer_nonce = peer_hello.nonce.clone();
 
     // 2. 我回身份 + 签名（绑定两个 nonce 和两边的 node_id）
@@ -205,7 +253,9 @@ pub async fn authenticate_listener(
         pubkey: hex::encode(identity.public_key()),
         nonce: my_nonce.clone(),
     };
-    write_frame(&mut send, &reply).await?;
+    write_frame(&mut send, &reply)
+        .await
+        .map_err(AuthError::transient)?;
 
     let message = auth_message(
         identity.node_id().as_str(),
@@ -219,10 +269,12 @@ pub async fn authenticate_listener(
         node_id: identity.node_id().as_str().to_string(),
         sig: hex::encode(identity.sign(message.as_bytes())),
     };
-    write_frame(&mut send, &my_proof).await?;
+    write_frame(&mut send, &my_proof)
+        .await
+        .map_err(AuthError::transient)?;
 
     // 3. 对端回签，证明它确实持有那把私钥
-    let peer_proof: Proof = read_frame(&mut recv).await?;
+    let peer_proof: Proof = read_frame(&mut recv).await.map_err(AuthError::transient)?;
     let outcome = verify_proof(
         &peer_proof,
         &peer,
@@ -258,9 +310,12 @@ pub async fn authenticate_listener(
     });
     let _ = send.finish();
 
-    outcome?;
+    outcome.map_err(AuthError::identity)?;
     if !peer_verdict.ok {
-        bail!("对端拒绝了本次连接：{}", peer_verdict.reason);
+        return Err(AuthError::identity(anyhow::anyhow!(
+            "对端拒绝了本次连接：{}",
+            peer_verdict.reason
+        )));
     }
     Ok(peer)
 }

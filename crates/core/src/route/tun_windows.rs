@@ -25,22 +25,50 @@ const EMBEDDED_DLL_NAME: &str = "wintun-0.14.1.dll";
 /// 内嵌的官方 wintun 0.14.1（amd64）。只发一个 exe 也能建虚拟网卡。
 const EMBEDDED_WINTUN: &[u8] = include_bytes!("../../../../assets/wintun.dll");
 
-/// 内置 dll 的落盘位置：优先 %LOCALAPPDATA%\qp2p（用户可写、不进 Program Files）。
-fn embedded_dll_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("qp2p");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(EMBEDDED_DLL_NAME);
-    // 内嵌版本换了就覆盖，避免旧文件一直留在用户目录里。
-    let stale = std::fs::read(&path)
-        .map(|existing| existing != EMBEDDED_WINTUN)
-        .unwrap_or(true);
-    if stale {
-        std::fs::write(&path, EMBEDDED_WINTUN).ok()?;
+/// 内置 dll 的落盘位置候选。
+///
+/// 优先 `%ProgramData%`：这个目录默认只允许创建者改自己写下的文件，同一用户
+/// 但**没提权**的进程替换不掉。`%LOCALAPPDATA%` 与 temp 是退路（通常可写，
+/// 也就意味着可被替换，所以放在后面）。
+fn dll_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(base) = std::env::var_os("ProgramData") {
+        dirs.push(PathBuf::from(base).join("qp2p"));
     }
-    Some(path)
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(base).join("qp2p"));
+    }
+    dirs.push(std::env::temp_dir().join("qp2p"));
+    dirs
+}
+
+/// 把内嵌的 wintun 写到磁盘并返回路径。
+///
+/// 写完之后**回读比对**：内容对不上就不加载。这挡不住"回读之后、LoadLibrary
+/// 之前"那一瞬被替换（没有能从句柄直接加载 DLL 的 API），但能挡掉预先埋好的文件。
+fn embedded_dll_path() -> Option<PathBuf> {
+    for dir in dll_dirs() {
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let path = dir.join(EMBEDDED_DLL_NAME);
+        let same = std::fs::read(&path)
+            .map(|existing| existing == EMBEDDED_WINTUN)
+            .unwrap_or(false);
+        // 内嵌版本换了就覆盖，避免旧文件一直留着
+        if !same && std::fs::write(&path, EMBEDDED_WINTUN).is_err() {
+            continue;
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes == EMBEDDED_WINTUN => return Some(path),
+            Ok(_) => tracing::warn!(
+                "[tun] {} 的内容与内置 wintun 不一致，换下一个目录",
+                path.display()
+            ),
+            Err(e) => tracing::warn!("[tun] 回读 {} 失败: {e}", path.display()),
+        }
+    }
+    None
 }
 /// 会话环形缓冲区大小，也是单包上限（WinTun 要求 128KiB 起步）。
 const RING_CAPACITY: u32 = 0x40_0000;
@@ -140,7 +168,7 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
 }
 
 fn download_hint() -> &'static str {
-    "程序自带 wintun 0.14.1，正常无需另装 dll；若 %LOCALAPPDATA%\\qp2p 不可写， \
+    "程序自带 wintun 0.14.1，正常无需另装 dll；若 %ProgramData%\\qp2p 与 %LOCALAPPDATA%\\qp2p 都不可写， \
      可把 wintun.net 的 0.14+ amd64 版 wintun.dll 放到 qp2p.exe 同目录"
 }
 

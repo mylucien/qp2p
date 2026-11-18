@@ -62,7 +62,7 @@ impl std::fmt::Display for SignalError {
             }
             "node_id_mismatch" => "身份文件和令牌不匹配：换一台机器或删掉 ~/.qp2p/identity.key 重来",
             "not_found" => {
-                "服务端不认识这个接口：Worker 版本太旧，把 signal/worker.js（2.3.0）重新粘贴部署一次"
+                "服务端不认识这个接口：Worker 版本太旧，用新版 qp2p-deploy 执行一次 up（会一并更新 Worker）"
             }
             "confirm_required" => "删除网络不可撤销，需要在请求里带 confirm=<网络 id>（qp2p delete 会自动带）",
             _ => "",
@@ -787,8 +787,16 @@ pub fn normalize_worker(raw: &str) -> Result<String> {
         Some(index) => &text[..index],
         None => text,
     };
-    if !(text.starts_with("http://") || text.starts_with("https://")) {
-        anyhow::bail!("Worker 地址要以 https:// 开头（例如 https://p2p.example.com）：{raw}");
+    if text.starts_with("http://") {
+        // 允许，但必须说清楚代价：令牌、管理员口令都会明文走网
+        tracing::warn!(
+            "[signal] Worker 走明文 http://：加入令牌与管理员口令会明文经过网络，\
+             只建议本机或完全可信的局域网使用"
+        );
+    } else if !text.starts_with("https://") {
+        anyhow::bail!(
+            "Worker 地址要以 http:// 或 https:// 开头（公网部署请用 https://，例如 https://p2p.example.com）：{raw}"
+        );
     }
     Ok(text.trim_end_matches('/').to_string())
 }

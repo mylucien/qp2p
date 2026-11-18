@@ -311,6 +311,13 @@ impl Config {
             if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
                 return Err(ConfigError::BadWorker(worker.clone()));
             }
+            // http 是允许的（本机调试、内网自建），但令牌会明文走网，必须说清楚
+            if trimmed.starts_with("http://") {
+                tracing::warn!(
+                    "[config] Worker 用的是明文 http://：加入令牌与管理员口令会明文经过网络，\
+                     只应在完全可信的本机或局域网里使用"
+                );
+            }
         }
 
         for route in &self.routes {
@@ -333,6 +340,20 @@ impl Config {
                 .map_err(|_| ConfigError::BadForwardListen(forward.listen.clone()))?;
             if forward.target.trim().is_empty() {
                 return Err(ConfigError::EmptyForwardTarget);
+            }
+        }
+
+        // 这两项在配置里存在、但还没有任何实现。写了却不生效比报错更难查，
+        // 所以在加载时明确说一句。
+        if let Some(network) = &self.network {
+            if !network.advertise.is_empty() {
+                tracing::warn!(
+                    "[config] network.advertise 尚未实现：配置里的 {} 个网段不会对外通告",
+                    network.advertise.len()
+                );
+            }
+            if network.deny_inbound {
+                tracing::warn!("[config] network.deny_inbound 尚未实现：入站不会被拒绝");
             }
         }
 

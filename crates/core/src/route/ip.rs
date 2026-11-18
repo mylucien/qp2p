@@ -82,11 +82,25 @@ pub fn parse(buf: &[u8]) -> Option<IpPacket<'_>> {
     })
 }
 
+/// IPv4 头长度。带 options 的包 IHL 会大于 5，必须按它算传输层起点。
+fn header_len(raw: &[u8]) -> Option<usize> {
+    let ihl = usize::from(raw.first()? & 0x0f) * 4;
+    if ihl < IPV4_HEADER_LEN || raw.len() < ihl {
+        return None;
+    }
+    Some(ihl)
+}
+
 /// 这是不是一个 ICMP echo request。用于"对端直接应答 ping"。
 pub fn is_echo_request(packet: &IpPacket<'_>) -> bool {
-    packet.proto == PROTO_ICMP
-        && packet.raw.len() > IPV4_HEADER_LEN + 1
-        && packet.raw[IPV4_HEADER_LEN] == ICMP_ECHO_REQUEST
+    if packet.proto != PROTO_ICMP {
+        return false;
+    }
+    let Some(ihl) = header_len(packet.raw) else {
+        return false;
+    };
+    // echo 头至少 8 字节：type/code/checksum/id/seq
+    packet.raw.len() >= ihl + 8 && packet.raw[ihl] == ICMP_ECHO_REQUEST
 }
 
 /// 把 ICMP echo request 翻成 echo reply（交换地址、改类型、重算校验和）。
@@ -97,7 +111,11 @@ pub fn echo_reply(packet: &IpPacket<'_>) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = packet.raw.to_vec();
-    let ihl = usize::from(out[0] & 0x0f) * 4;
+    // 按 IHL 索引，不再假设头是 20 字节：带 options 的包用固定偏移会写错位置
+    let ihl = header_len(&out)?;
+    if out.len() < ihl + 8 {
+        return None;
+    }
 
     // 交换源/目的
     let (src, dst) = (out[12..16].to_vec(), out[16..20].to_vec());

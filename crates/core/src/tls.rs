@@ -42,6 +42,13 @@ pub struct TlsIdentity {
 
 impl TlsIdentity {
     /// 从磁盘加载；没有就生成一份写回去。`None` 表示不落盘（测试用）。
+    ///
+    /// 证书和私钥是两个文件，中间崩溃会留下"只有一个"的状态。旧实现遇到
+    /// 这种情况会补写缺的那个，而补写的是一对新密钥：结果磁盘上是**旧证书 +
+    /// 新私钥**，`with_single_cert` 从此永远失败，只能手删文件。
+    ///
+    /// 现在两条路都堵死：只剩一个就整对重建；两个都在则真的配一次，
+    /// 配不上（历史遗留的坏状态）也整对重建。
     pub fn load_or_create(dir: Option<&Path>) -> Result<Self> {
         let Some(dir) = dir else {
             return Self::generate();
@@ -51,18 +58,42 @@ impl TlsIdentity {
 
         let cert_path = dir.join(CERT_FILE);
         let key_path = dir.join(KEY_FILE);
+        let (has_cert, has_key) = (cert_path.exists(), key_path.exists());
 
-        if cert_path.exists() && key_path.exists() {
-            return Self::load(dir);
+        if has_cert && has_key {
+            let loaded = Self::load(dir)?;
+            if loaded.is_paired() {
+                return Ok(loaded);
+            }
+            tracing::warn!(
+                "[tls] {} 里的证书与私钥不匹配（多半是上次写入中途崩溃留下的），重建一对新的",
+                dir.display()
+            );
+        } else if has_cert || has_key {
+            tracing::warn!("[tls] {} 里证书/私钥只剩一个，清理后重建", dir.display());
+        }
+
+        if has_cert || has_key {
+            let _ = fs::remove_file(&cert_path);
+            let _ = fs::remove_file(&key_path);
         }
 
         let generated = Self::generate()?;
-        if generated.persist(dir)? {
-            Ok(generated)
-        } else {
-            // 另一个进程抢先写了证书/私钥：以磁盘上的为准，避免"证书是 A 的、私钥是 B 的"
-            Self::load(dir)
+        // 返回 false 表示另一个进程抢先写了，下面以磁盘上的为准
+        let _mine = generated.persist(dir)?;
+        let loaded = Self::load(dir)?;
+        if !loaded.is_paired() {
+            anyhow::bail!(
+                "{} 里的 TLS 证书与私钥不匹配，且无法自动修复；删掉这两个文件后重试",
+                dir.display()
+            );
         }
+        Ok(loaded)
+    }
+
+    /// 证书与私钥是不是一对。真的构建一次服务端配置，失败就是配不上。
+    fn is_paired(&self) -> bool {
+        self.server_config().is_ok()
     }
 
     fn generate() -> Result<Self> {

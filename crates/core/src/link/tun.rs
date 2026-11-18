@@ -51,7 +51,10 @@ use crate::route::{flow::FlowKey, flow::FlowTable, ip, TunLink};
 const KIND_IP: u8 = 2;
 /// 空闲多久回收一条流。
 const FLOW_IDLE: Duration = Duration::from_secs(120);
-/// 同时存在的流上限，与 quinn 的 `max_concurrent_bidi_streams` 对齐。
+/// 同时存在的流上限。
+///
+/// 刻意低于 `tls.rs` 里给对端的 `max_concurrent_bidi_streams`（256）：
+/// 自己先到 200 就开始回收空闲流，把余量留给对端发起的方向。
 const FLOW_CAPACITY: usize = 200;
 const READ_BUF: usize = 4096;
 
@@ -253,9 +256,10 @@ pub struct MeshLinks {
     /// 目标没有直连时，把对端虚拟地址丢进来，让会话循环立刻去打通它
     wake: RwLock<Option<mpsc::Sender<Ipv4Addr>>>,
     activity: Activity,
-    /// 上一次唤醒的时间（毫秒）；3 秒冷却，避免持续丢包把信令打成洪水
+    /// 每个对端上一次被唤醒的时刻（毫秒）；3 秒冷却，避免持续丢包把信令打成洪水。
+    /// 按目的地址分开记：冷却不该被别的对端用掉。
     started: Instant,
-    last_wake_ms: Arc<AtomicU64>,
+    last_wake: Arc<std::sync::Mutex<HashMap<Ipv4Addr, u64>>>,
     /// 允许对端经本机访问的目标（局域网出口）；空 = 拒绝一切端口映射请求
     allowed: Arc<Vec<SocketAddr>>,
     /// 用户可见提示（"直连已失效，正在重建"）。会话层注入，没注入就只写日志。
@@ -272,7 +276,7 @@ impl MeshLinks {
             wake: RwLock::new(None),
             activity: Activity::new(),
             started: Instant::now(),
-            last_wake_ms: Arc::new(AtomicU64::new(0)),
+            last_wake: Arc::new(std::sync::Mutex::new(HashMap::new())),
             allowed: Arc::new(allowed),
             notice: OnceLock::new(),
         })
@@ -304,11 +308,21 @@ impl MeshLinks {
     /// 换来的是打洞立刻开始，重传会补上。
     async fn wake_peer(&self, ip: Ipv4Addr) {
         let now = self.started.elapsed().as_millis() as u64;
-        let prev = self.last_wake_ms.load(Ordering::Relaxed);
-        if prev != 0 && now.saturating_sub(prev) < 3_000 {
-            return;
+        {
+            let Ok(mut last) = self.last_wake.lock() else {
+                return;
+            };
+            if let Some(prev) = last.get(&ip) {
+                if now.saturating_sub(*prev) < 3_000 {
+                    return;
+                }
+            }
+            last.insert(ip, now);
+            // 表别无限长：过了冷却期的记录没有意义
+            if last.len() > 4096 {
+                last.retain(|_, at| now.saturating_sub(*at) < 60_000);
+            }
         }
-        self.last_wake_ms.store(now, Ordering::Relaxed);
         let guard = self.wake.read().await;
         if let Some(tx) = guard.as_ref() {
             let _ = tx.try_send(ip);
@@ -320,8 +334,9 @@ impl MeshLinks {
     /// 和 [`Self::wake_peer`] 分开是因为两者语义不同：那个是"还没连上，
     /// 值得试一下"，这个是"刚判定死掉，必须马上重建"。
     async fn force_wake(&self, ip: Ipv4Addr) {
-        self.last_wake_ms
-            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_wake.lock() {
+            last.insert(ip, self.started.elapsed().as_millis() as u64);
+        }
         let guard = self.wake.read().await;
         if let Some(tx) = guard.as_ref() {
             let _ = tx.try_send(ip);
@@ -540,14 +555,6 @@ impl Route {
             Self::Mesh(links) => links.conn_for(dst).await,
         }
     }
-
-    /// 连接失效时通知会话层。单对端调试模式没有会话循环，交给调用方自己处理。
-    async fn report_dead(&self, ip: Ipv4Addr, peer: &MeshPeer, reason: &str) {
-        let Self::Mesh(links) = self else { return };
-        if peer.health.mark_dead() {
-            links.mark_dead(ip, &peer.conn, reason).await;
-        }
-    }
 }
 
 /// 流表的值：连接、发送队列、这条流所属对端的健康度。
@@ -675,28 +682,8 @@ async fn dispatch(
         return Ok(());
     }
 
-    // 4. 新开一条流。唯一还可能等的地方，用超时兜住：
-    //    流配额用尽时 open_bi 会一直挂着，不能让它拖住主循环。
-    let (send_stream, mut recv) =
-        match tokio::time::timeout(OPEN_TIMEOUT, peer.conn.open_bi()).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                peer.health.note_fail();
-                if peer.health.broken() {
-                    route.report_dead(dst, &peer, "打开流失败").await;
-                }
-                return Err(e).with_context(|| format!("向 {} 打开双向流失败", dst));
-            }
-            Err(_) => {
-                peer.health.note_fail();
-                if peer.health.broken() {
-                    route.report_dead(dst, &peer, "打开流超时").await;
-                }
-                bail!("向 {} 打开双向流超时", dst);
-            }
-        };
-
-    // 首字节和首包都交给 writer：主循环只负责建流，不承担任何写阻塞
+    // 4. 建流也交给 writer：流配额用尽时 `open_bi` 会一直挂着，
+    //    留在主循环里就等于把所有对端、所有流一起拖住。
     let (tx, rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
     let links = match route {
         Route::Mesh(links) => Some(Arc::downgrade(links)),
@@ -704,7 +691,6 @@ async fn dispatch(
     };
     tokio::spawn(
         FlowWriter {
-            send: send_stream,
             rx,
             health: peer.health.clone(),
             ip: dst,
@@ -719,12 +705,6 @@ async fn dispatch(
         peer.health.note_unqueued(1);
     }
 
-    // 对端可能主动关流：等它，顺便把错误暴露到日志
-    tokio::spawn(async move {
-        let mut buf = [0u8; 64];
-        let _ = recv.read(&mut buf).await;
-    });
-
     if let Some((old, (_, old_tx, _))) = flows.insert(key, (peer.conn, tx, peer.health), now) {
         drop(old_tx);
         tracing::debug!("[tun] 流表满，淘汰 {old:?}");
@@ -738,7 +718,6 @@ async fn dispatch(
 /// 就把这条流 `reset` 掉——内层 TCP 会因为收不到 ACK 重传，主循环下一次
 /// `try_send` 会发现队列已关，立刻重开一条新流接上。
 struct FlowWriter {
-    send: SendStream,
     rx: mpsc::Receiver<Vec<u8>>,
     health: Arc<PeerHealth>,
     ip: Ipv4Addr,
@@ -748,9 +727,31 @@ struct FlowWriter {
 
 impl FlowWriter {
     async fn run(mut self) {
+        // 建流在这里等：配额用尽时只挂住这一条流，主循环照常收包
+        let (mut send, mut recv) =
+            match tokio::time::timeout(OPEN_TIMEOUT, self.conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    tracing::debug!("[tun] {} 打开双向流失败: {e}", self.ip);
+                    self.fail(None, "打开流失败").await;
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!("[tun] {} 打开双向流超时（{OPEN_TIMEOUT:?}）", self.ip);
+                    self.fail(None, "打开流超时").await;
+                    return;
+                }
+            };
+
+        // 对端可能主动关流：等它，顺便把错误暴露到日志
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let _ = recv.read(&mut buf).await;
+        });
+
         // 首字节声明这是 IP 包流
         let mut failure: Option<&'static str> = None;
-        match tokio::time::timeout(WRITE_TIMEOUT, self.send.write_all(&[KIND_IP])).await {
+        match tokio::time::timeout(WRITE_TIMEOUT, send.write_all(&[KIND_IP])).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!("[tun] {} 写流类型失败: {e}", self.ip);
@@ -767,7 +768,7 @@ impl FlowWriter {
                 break;
             };
             let written =
-                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut self.send, &packet)).await;
+                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut send, &packet)).await;
             match written {
                 Ok(Ok(())) => self.health.note_write_ok(),
                 Ok(Err(e)) => {
@@ -782,20 +783,22 @@ impl FlowWriter {
         }
 
         match failure {
-            Some(reason) => self.fail(reason).await,
+            Some(reason) => self.fail(Some(&mut send), reason).await,
             None => {
                 // 队列被关掉（流空闲回收 / 连接被替换）：安静收尾
-                let _ = self.send.reset(0u32.into());
+                let _ = send.reset(0u32.into());
             }
         }
     }
 
     /// 写不出去：清账、关流，必要时判整个对端失效。
-    async fn fail(&mut self, reason: &'static str) {
+    async fn fail(mut self, send: Option<&mut SendStream>, reason: &'static str) {
         // 队列里还没写的 + 当前这一帧，都从积压里扣掉，别让它们继续顶着
         let left = u32::try_from(self.rx.len()).unwrap_or(u32::MAX);
         self.health.note_unqueued(left.saturating_add(1));
-        let _ = self.send.reset(0u32.into());
+        if let Some(send) = send {
+            let _ = send.reset(0u32.into());
+        }
         self.health.note_fail();
 
         if !self.health.broken() {

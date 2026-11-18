@@ -161,8 +161,15 @@ pub enum WsItem {
     Down(String),
 }
 
-type Sink = SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>;
-type Source = SplitStream<WebSocketStream<TlsStream<TcpStream>>>;
+// 底层流要能是"TLS"或"明文 TCP"两种：Worker 走 https 时是前者，
+// 本机/内网自建的 http:// Worker 是后者。以前一律 TLS + 默认 443，
+// http 部署连不上就静默降级成轮询，只留下一条看不懂的 TLS 报错。
+trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+type BoxedStream = Box<dyn AsyncReadWrite>;
+type Sink = SplitSink<WebSocketStream<BoxedStream>, Message>;
+type Source = SplitStream<WebSocketStream<BoxedStream>>;
 
 /// 一条活着的信令长连接。
 pub struct WsLink {
@@ -205,17 +212,22 @@ impl WsLink {
             .host()
             .ok_or_else(|| anyhow!("握手地址里没有主机名：{url}"))?
             .to_string();
-        let port = uri.port_u16().unwrap_or(443);
+        let secure = url.starts_with("wss://");
+        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
 
         // TCP 与 TLS 都必须设上限：对端丢包时 connect 会挂在系统默认的 ~20 秒，
         // 而调用方（后台任务）在拿到结果前不会发任何通知，主循环会误以为
         // "连接是好的，只是没有事件"——静默失联比直接报错难查得多。
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let stream: BoxedStream = tokio::time::timeout(CONNECT_TIMEOUT, async {
             let tcp = TcpStream::connect((host.as_str(), port))
                 .await
                 .with_context(|| format!("连不上 {host}:{port}"))?;
             tcp.set_nodelay(true).ok();
-            tls_connect(&host, tcp).await
+            if secure {
+                Ok::<BoxedStream, anyhow::Error>(Box::new(tls_connect(&host, tcp).await?))
+            } else {
+                Ok(Box::new(tcp) as BoxedStream)
+            }
         })
         .await
         .map_err(|_| {

@@ -19,7 +19,9 @@
 
 ```bash
 # 建网的机器（一次性，需要部署时设的 ADMIN_SECRET）
-qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+# 密钥走环境变量：写在命令行上会进 shell 历史，也会被同机进程看到
+export QP2P_ADMIN_SECRET='<ADMIN_SECRET>'
+qp2p init https://p2p.example.com
 qp2p create home          # 打印一行 qp2p join qp2p1_home_...
 
 # 其它每一台机器
@@ -88,7 +90,8 @@ export CLOUDFLARE_ACCOUNT_ID=...
 ### 4. 验收部署
 
 ```bash
-qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+export QP2P_ADMIN_SECRET='<ADMIN_SECRET>'
+qp2p init https://p2p.example.com
 ```
 
 期望看到 `✓ Worker 可达`，且 `引擎 room（支持 WebSocket 长连接）`、`存储 D1`、

@@ -17,7 +17,9 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::identity::{Identity, NodeId};
-use crate::peer::{auth, Role};
+use crate::peer::accept::AcceptHub;
+use crate::peer::auth::{self, AuthFailure};
+use crate::peer::Role;
 use crate::tls::SERVER_NAME;
 
 /// 单次握手等待上限，超时就再发一轮。
@@ -69,6 +71,7 @@ pub struct AuthHandles {
 /// 这样先启动的一方会一直等着后启动的一方。
 pub async fn execute(
     endpoint: &Endpoint,
+    hub: &Arc<AcceptHub>,
     candidates: &[SocketAddr],
     role: Role,
     timeout: Duration,
@@ -79,7 +82,7 @@ pub async fn execute(
     }
     match role {
         Role::Dialer => dial_all(endpoint, candidates, timeout, auth).await,
-        Role::Listener => listen_with_probes(endpoint, candidates, timeout, auth).await,
+        Role::Listener => listen_with_probes(endpoint, hub, candidates, timeout, auth).await,
     }
 }
 
@@ -98,14 +101,25 @@ impl AttemptError {
             Self::Transient(m) | Self::Auth(m) => m,
         }
     }
+
+    /// 补上候选地址前缀，日志里才知道是哪一条失败。
+    fn prefixed(self, peer: SocketAddr) -> Self {
+        match self {
+            Self::Transient(m) => Self::Transient(format!("{peer}: {m}")),
+            Self::Auth(m) => Self::Auth(format!("{peer}: {m}")),
+        }
+    }
 }
 
 /// 双方交换身份并互相验签；失败就关掉这条连接，当作一次失败的尝试。
+///
+/// 只有 [`AuthFailure::Identity`] 升级成 [`AttemptError::Auth`]（调用方会拉黑
+/// 这个候选）；读超时、连接被关一律是 `Transient`，下一轮还会再试。
 async fn verify_peer(
     conn: &Connection,
     handles: &Option<AuthHandles>,
     dialer: bool,
-) -> Result<(), String> {
+) -> std::result::Result<(), AttemptError> {
     let Some(handles) = handles else {
         return Ok(());
     };
@@ -123,7 +137,16 @@ async fn verify_peer(
             tracing::info!("[punch] 对端认证通过 peer={}", peer.node_id);
             Ok(())
         }
-        Err(e) => Err(format!("对端认证失败: {e:#}")),
+        Err(e) => {
+            let message = format!("对端认证失败: {e}");
+            match e.failure {
+                AuthFailure::Identity => Err(AttemptError::Auth(message)),
+                AuthFailure::Transient => {
+                    tracing::debug!("[punch] 认证未完成（可重试）：{message}");
+                    Err(AttemptError::Transient(message))
+                }
+            }
+        }
     }
 }
 
@@ -133,18 +156,9 @@ async fn dial_all(
     timeout: Duration,
     auth: Option<AuthHandles>,
 ) -> Result<Connection, PunchError> {
-    // dialer 不接收入站，但必须排空 accept 队列，否则对端探针会堆积
-    let drain = endpoint.clone();
-    let drain_task = tokio::spawn(async move {
-        while let Some(incoming) = drain.accept().await {
-            tokio::spawn(async move {
-                if let Ok(conn) = incoming.await {
-                    conn.close(0u32.into(), b"punch-probe");
-                }
-            });
-        }
-    });
-
+    // 拨号方不接收入站：对端的探针会由端点的 accept 分发中心直接 refuse。
+    // 以前这里自己起一条 drain 循环 close 掉入站连接，但它和同端点上别的
+    // 监听任务抢的是同一个 accept 队列——它会顺手把本该给 B 的连接拿走关掉。
     let deadline = Instant::now() + timeout;
     let started = Instant::now();
     let mut last_error = String::new();
@@ -189,7 +203,6 @@ async fn dial_all(
                     // 所有候选都是别人：重试只会一直失败，立刻收尾并说清原因
                     if wrong_identity.len() >= distinct.len() {
                         attempts.abort_all();
-                        drain_task.abort();
                         return Err(PunchError::Auth(auth_notes.join("；")));
                     }
                 }
@@ -225,7 +238,6 @@ async fn dial_all(
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
 
-    drain_task.abort();
     result
 }
 
@@ -256,7 +268,7 @@ async fn attempt_once(
 
     if let Err(e) = verify_peer(&conn, &auth, true).await {
         conn.close(0u32.into(), b"auth-failed");
-        return Err(AttemptError::Auth(format!("{peer}: {e}")));
+        return Err(e.prefixed(peer));
     }
 
     Ok(conn)
@@ -307,17 +319,20 @@ fn window_expired(last_auth: &Option<String>, window: Duration) -> PunchError {
 
 async fn listen_with_probes(
     endpoint: &Endpoint,
+    hub: &Arc<AcceptHub>,
     candidates: &[SocketAddr],
     timeout: Duration,
     auth: Option<AuthHandles>,
 ) -> Result<Connection, PunchError> {
     let deadline = Instant::now() + timeout;
 
-    let accept_endpoint = endpoint.clone();
-    // 按 IP 而不是 ip:port 过滤：NAT 重映射后端口会变，但 IP 不会
+    // 按 IP 而不是 ip:port 过滤：NAT 重映射后端口会变，但 IP 不会。
+    // 订阅之后，只有来自这些 IP 的入站才会投到本任务；其余由分发中心 refuse。
     let allowed_ips: Vec<std::net::IpAddr> = candidates.iter().map(|c| c.ip()).collect();
+    let subscription = hub.subscribe(allowed_ips);
     let claimed = Arc::new(AtomicBool::new(false));
     let accept_loop = async move {
+        let mut sub = subscription;
         // 握手失败的**原因**要留下来：只报"超时"等于把最有用的信息扔了，
         // 用户看到的是"连不上"，实际是"对面身份不对"。
         let mut handshakes: JoinSet<Result<Connection, String>> = JoinSet::new();
@@ -351,16 +366,11 @@ async fn listen_with_probes(
                         None => {}
                     }
                 }
-                incoming = accept_endpoint.accept(), if grace_until.is_none() => {
+                incoming = sub.recv(), if grace_until.is_none() => {
                     let Some(incoming) = incoming else {
-                        return Err(PunchError::Dial("端点已关闭".to_string()));
+                        return Err(PunchError::Dial("入站分发已停止".to_string()));
                     };
                     let remote = incoming.remote_address();
-                    // 只接受候选里出现过的 IP，避免被无关流量占位
-                    if !allowed_ips.is_empty() && !allowed_ips.contains(&remote.ip()) {
-                        tracing::debug!("[punch] 忽略未知来源 {remote}");
-                        continue;
-                    }
                     let claim = claimed.clone();
                     let auth = auth.clone();
                     handshakes.spawn(async move {
@@ -382,10 +392,13 @@ async fn listen_with_probes(
                         }
                         // 认证失败要留下痕迹：否则有人在试探时，这一侧什么都看不到
                         if let Err(e) = verify_peer(&conn, &auth, false).await {
-                            tracing::warn!("[punch] 拒绝来自 {remote} 的连接：{e}");
+                            tracing::warn!(
+                                "[punch] 拒绝来自 {remote} 的连接：{}",
+                                e.message()
+                            );
                             claim.store(false, Ordering::SeqCst);
                             conn.close(0u32.into(), b"auth-failed");
-                            return Err(format!("{remote}: {e}"));
+                            return Err(format!("{remote}: {}", e.message()));
                         }
                         Ok(conn)
                     });

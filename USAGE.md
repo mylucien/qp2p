@@ -9,7 +9,9 @@
 
 ```bash
 # ① 建网的那台机器（只做一次）
-qp2p init https://p2p.example.com --admin <ADMIN_SECRET>
+# 管理密钥走环境变量：写在命令行上会进 shell 历史，同机进程也能看到
+export QP2P_ADMIN_SECRET='<ADMIN_SECRET>'
+qp2p init https://p2p.example.com
 qp2p create home
 
 # ② 其它每一台机器（把 ① 打印出来的那行原样发过去）
@@ -59,7 +61,8 @@ SQLite 后端的 DO，必须在上传时一并声明迁移（`new_sqlite_classes
 ### 验收
 
 ```bash
-qp2p init https://<你的域名> --admin <ADMIN_SECRET>
+export QP2P_ADMIN_SECRET='<ADMIN_SECRET>'
+qp2p init https://<你的域名>
 ```
 
 期望输出：
@@ -154,7 +157,8 @@ Linux 没有图形界面，`qp2p gui` 会提示改用命令行。
 ## 4. 建网络（第一台机器）
 
 ```bash
-qp2p init https://p2p.example.com --admin <ADMIN_SECRET>   # 第 1 步做过可跳过
+export QP2P_ADMIN_SECRET='<ADMIN_SECRET>'   # 第 1 步做过可跳过
+qp2p init https://p2p.example.com
 qp2p create home
 ```
 
@@ -667,7 +671,7 @@ ssh -p 10022 root@10.78.0.5              # 就是 192.168.1.1:22
 | 现象 | 原因 / 处理 |
 |---|---|
 | `还没设置信令地址` | 先 `qp2p init https://<域名>` |
-| `建网需要管理密钥` | 用 `qp2p init <地址> --admin <密钥>` 保存一次，或 `--admin` 临时给 |
+| `建网需要管理密钥` | 设 `QP2P_ADMIN_SECRET` 后 `qp2p init <地址>`（会存进配置），或临时 `--admin <密钥>` |
 | `ADMIN_SECRET 不对` | Cloudflare 里的变量和本机保存的不一致；重新 `qp2p init` 一次 |
 | `加入密钥不正确` | 令牌被 `rotate` 换过，或网络被删了；找管理员要新的 |
 | `本机还没加入任何网络` | 先 `qp2p create` 或 `qp2p join` |
@@ -721,6 +725,23 @@ qp2p up --punch-only   # 不建网卡，只验证能不能打通
 |---|---|---|---|
 | `ADMIN_SECRET` | 只有部署者 | 建网络、换加入密钥 | 别人可以建网/换你网络的密钥 |
 | 加入令牌 `qp2p1_<网络>_<密钥>` | 网络成员 | 加入网络、登记节点 | 别人能进这个网络（`rotate` 即可踢掉） |
+
+### 成员之间是互信的
+
+同一个网络里的成员**不校验彼此的流量**：数据面收到对端发来的 IP 包后直接写进
+TUN，不检查源地址是不是这个对端自己的虚拟地址。也就是说，成员可以互相冒用
+虚拟地址。这和 WireGuard 的 cryptokey routing 不同，是有意的取舍：
+
+- 组网的前提就是"这台机器和它背后的人你信得过"（加入令牌等同于信任凭证）；
+- 严格校验源地址会切断"把对端当路由器、转发它局域网里第三方地址"的用法。
+
+所以**不要把这个网络当作跨信任域的安全边界**：只把令牌发给真正信任的人，
+换人时 `qp2p rotate` 换掉令牌。
+
+### 明文 http 的代价
+
+Worker 地址允许 `http://`（本机调试、内网自建），但加入令牌与管理员口令会
+明文经过网络，客户端在加载配置时会打一条警告。公网部署一律用 `https://`。
 
 - 服务端**只存加入密钥的 sha256**，不存明文；`ADMIN_SECRET` 推不出加入密钥
 - 换 `ADMIN_SECRET` 不会让成员掉线；换加入密钥才需要大家重新 join

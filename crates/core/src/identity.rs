@@ -94,14 +94,39 @@ impl Identity {
 
         let path = dir.join(IDENTITY_FILE);
         if path.exists() {
-            return read_identity(&path);
+            match read_identity(&path) {
+                Ok(identity) => return Ok(identity),
+                Err(e) => {
+                    // 半写（崩在 write_all 中间）或内容被改坏：这份身份已经取不回来。
+                    // 挪到一边再重建——否则此后每次启动都失败，只能靠用户手删文件。
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let backup = path.with_extension(format!("bad-{stamp}"));
+                    match fs::rename(&path, &backup) {
+                        Ok(()) => tracing::warn!(
+                            "[identity] 身份文件损坏（{e}），已备份到 {} 并重新生成；node_id 会变",
+                            backup.display()
+                        ),
+                        Err(move_err) => {
+                            return Err(anyhow::anyhow!(
+                                "身份文件损坏（{e}），且无法移走（{move_err}）：{}",
+                                path.display()
+                            ))
+                        }
+                    }
+                }
+            }
         }
 
         let identity = Self::generate();
-        // create_new：权限从创建那一刻就是 0600，且不会覆盖别人刚写好的身份
-        let created =
-            crate::secret_file::create_private(&path, hex::encode(identity.to_seed()).as_bytes())
-                .map_err(|e| anyhow::anyhow!("写入身份文件失败 {}: {e}", path.display()))?;
+        // 原子写：内容要么是完整的一份，要么根本没有这个文件
+        let created = crate::secret_file::create_private_atomic(
+            &path,
+            hex::encode(identity.to_seed()).as_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("写入身份文件失败 {}: {e}", path.display()))?;
 
         if created {
             Ok(identity)

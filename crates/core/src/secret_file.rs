@@ -36,6 +36,41 @@ pub fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     }
 }
 
+/// 同 [`create_private`]，但内容不会出现"写了一半"的中间态。
+///
+/// 先写到同目录的临时文件并 fsync，再用 `hard_link` 落到正式名字：
+/// 链接是原子的，"目标已存在" 也会明确失败（保留 `create_new` 的语义）。
+/// 硬链接不可用时退回 rename：Windows 上 rename 同样不覆盖既有文件。
+pub fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let tmp = path.with_extension("tmp-new");
+    let _ = std::fs::remove_file(&tmp);
+    if !create_private(&tmp, bytes)? {
+        return Ok(false);
+    }
+
+    match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(false)
+        }
+        Err(_) => match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                if path.exists() {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        },
+    }
+}
+
 /// 覆盖写入私密文件（配置、令牌）。
 ///
 /// 和 [`create_private`] 的区别是允许覆盖：先写到同目录的临时文件，

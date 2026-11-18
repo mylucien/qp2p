@@ -435,9 +435,9 @@ async fn cmd_create(args: &[String]) -> Result<()> {
     let worker = worker_of(&config, &flags)?;
     let admin = admin_of(&config, &flags).context(
         "建网需要管理密钥（ADMIN_SECRET）。三种给法任选一种：\n\
-         1) qp2p init <地址> --admin <密钥>   （推荐，会保存下来）\n\
-         2) qp2p create home --admin <密钥>\n\
-         3) 设置环境变量 QP2P_ADMIN_SECRET",
+         1) 设置环境变量 QP2P_ADMIN_SECRET，再 qp2p init <地址>（推荐：密钥会存在配置里）\n\
+         2) qp2p init <地址> --admin <密钥>   （会进 shell 历史，仅限临时用）\n\
+         3) qp2p create home --admin <密钥>",
     )?;
 
     let client = SignalClient::admin(&worker)?;
@@ -934,7 +934,7 @@ async fn cmd_nets(args: &[String]) -> Result<()> {
     let (config, _) = load_config(&flags)?;
     let worker = worker_of(&config, &flags)?;
     let admin = admin_of(&config, &flags)
-        .context("列网络需要管理密钥（ADMIN_SECRET）：\n  qp2p init <地址> --admin <密钥>")?;
+        .context("列网络需要管理密钥（ADMIN_SECRET）：\n  export QP2P_ADMIN_SECRET=<密钥> && qp2p init <地址>")?;
 
     let client = SignalClient::admin(&worker)?;
     let networks = client.list_networks(&admin).await?;
@@ -992,7 +992,7 @@ async fn cmd_delete(args: &[String]) -> Result<()> {
     }
 
     let admin = admin_of(&config, &flags)
-        .context("删除网络需要管理密钥（ADMIN_SECRET）：\n  qp2p init <地址> --admin <密钥>")?;
+        .context("删除网络需要管理密钥（ADMIN_SECRET）：\n  export QP2P_ADMIN_SECRET=<密钥> && qp2p init <地址>")?;
     let client = SignalClient::admin(&worker)?;
     let removed = client.delete_network(&admin, &name).await?;
 
