@@ -37,15 +37,15 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          cargo clippy --all-targets --message-format=short -- -D warnings > clippy.log 2>&1
-          code=$?
-          if [ $code -ne 0 ]; then
+          # 放在 if 条件里：GitHub 的 bash 默认 set -e，直接跑会让脚本在
+          # cargo 失败时立刻退出，后面的诊断输出根本执行不到。
+          if ! cargo clippy --all-targets --message-format=short -- -D warnings > clippy.log 2>&1; then
             grep -E "^(error|warning)" clippy.log | head -60 | while IFS= read -r line; do
               echo "::error::$line"
             done || true
             tail -40 clippy.log || true
+            exit 1
           fi
-          exit $code
 
       - name: Test
         run: cargo test --all
