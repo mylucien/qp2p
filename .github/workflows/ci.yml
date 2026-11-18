@@ -40,10 +40,10 @@ jobs:
           # 放在 if 条件里：GitHub 的 bash 默认 set -e，直接跑会让脚本在
           # cargo 失败时立刻退出，后面的诊断输出根本执行不到。
           if ! cargo clippy --all-targets --message-format=short -- -D warnings > clippy.log 2>&1; then
-            grep -E "^(error|warning)" clippy.log | head -60 | while IFS= read -r line; do
-              echo "::error::$line"
-            done || true
-            tail -40 clippy.log || true
+            # 每步最多 10 条注解，把前 30 行压成一条；换行用 %0A 转义，
+            # 百分号先转义成 %25，否则消息会被 GitHub 截断。
+            msg=$(head -30 clippy.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error::$msg"
             exit 1
           fi
 
