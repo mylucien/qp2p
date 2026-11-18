@@ -28,16 +28,25 @@
 //! 接收方向同理：`to_tun` 用 `try_send`。接收侧一旦反压，QUIC 流控窗口
 //! 就不再前进，反压会顺着流控传导到**对端**的发送循环——两个方向一起卡死。
 //!
-//! # 失效判据（A 方案）
+//! # 失效判据（A 方案，第二版）
 //!
-//! 不新增任何探测包，只借真实业务流量观察"排队的包有没有被写出去"：
-//! 单帧超时、连续几条流失败、有积压却长时间零进展。三条信号都落在
-//! [`PeerHealth`] 上，触发后摘表、关连接、叫会话循环重拨。
+//! 不新增任何探测包，判据只看 **QUIC 自己的统计**：
+//!
+//! - 我方还在发（`udp_tx` 在涨），对端却连续 [`PEER_SILENT`] 一个 UDP 包都没回
+//!   （`udp_rx` 不动）→ 链路黑洞，摘表、关连接、叫会话循环重拨。
+//! - 流级只做"废掉这一条流"，不判连接死活：单帧写超过 [`WRITE_TIMEOUT`] 就
+//!   `reset`，主循环换一条新流继续；有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死。
+//!
+//! 第一版拿"本地写成功"当判据（连败 3 条流就换连接），实测不可靠：一条流被
+//! reset 后主循环立刻在同一条连接上开新流，新流自带全新的 1.25MB 流控额度，
+//! 前几帧必然"写成功"——而它们可能一帧都没到对端，于是连败计数被反复清零，
+//! 黑洞期间一条判据都不触发，全靠 QUIC 默认的 30 秒 idle timeout 收场。
+//! 那个判据还会误杀：6 秒抖动就能凑够 3 条超时流，把本来能自愈的连接掐掉。
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -66,12 +75,24 @@ const FLOW_QUEUE: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 新建双向流的上限。正常路径瞬时返回，只有流配额用尽才会等。
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
-/// 有包排队却这么久没写出一帧 → 整条连接的流控停死。
+/// 有包排队却这么久没写出一帧 → 整条连接的流控停死（兜底，正常判据是下面那条）。
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// 同一连接连续这么多条流写失败 → 不再逐条重开，直接换连接。
-const BROKEN_STREAK: u32 = 3;
-/// 失效扫描周期。
-const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// 我方还在发，对端却这么久没回任何 UDP 包 → 判死。
+///
+/// 8 秒：够 QUIC 在丢包重传、路径切换（WiFi↔4G）里缓过来，又能把黑洞的
+/// 发现时间压到「8 秒 + 一个扫描周期」。
+const PEER_SILENT: Duration = Duration::from_secs(8);
+/// 判断"我方还在发"的回看窗口：超过这么久没发过包，就无从判断对端死活。
+///
+/// 必须**明显小于 keepalive 间隔**（15 秒），否则空闲链路会被误杀：一个
+/// keepalive 的 PING/ACK 发生在 t=0，下一次要等到 t=15，中间 8~12 秒里
+/// "rx 没动、tx 也没动"看着就像黑洞。取 4 个扫描周期。
+///
+/// 黑洞期间这个窗口不会关：未确认的数据会被 QUIC 按 RTO 重传（0.3/0.9/2.1/4.5 秒…），
+/// `udp_tx` 一直在涨，所以"还在发"始终成立。
+const SEND_WINDOW: Duration = Duration::from_secs(6);
+/// 失效扫描周期。2 秒比 5 秒多花不了什么，但直接决定判死的滞后长度。
+const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 数据面活跃度：收到/发出任何包就打一个时间戳。
 ///
@@ -109,24 +130,39 @@ impl Activity {
 
 /// 一个对端的写健康度。
 ///
-/// A 方案的全部判据都在这里，不额外发一个探测包——只看真实流量：
+/// 判据两层，**连接死活只认"对端有没有回包"**：
 ///
-/// - 单帧写超过 [`WRITE_TIMEOUT`]：这条流废了；
-/// - 连续 [`BROKEN_STREAK`] 条流都写不出去：整条连接废了；
-/// - 有包排队却 [`STALL_TIMEOUT`] 一帧都没写出去：流控停死，也废了。
+/// - 连接级（唯一可信信号）：我方还在发，对端连续 [`PEER_SILENT`] 没回任何
+///   UDP 包 → 黑洞。数据来自 `conn.stats()` 的 UDP 计数，不额外发探测包。
+/// - 流级（只废流，不判连接）：单帧写超过 [`WRITE_TIMEOUT`] 就换一条流；
+///   有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死（对端在收但不消费）。
 ///
-/// 时间戳只由**写成功**推进，不被"收到对端数据"刷新。接收正常但发送积压，
-/// 恰恰说明对端没在消费，属于要处理的异常，不能拿来掩盖。
+/// "写成功"不能当判据：一条流被 reset 后，主循环立刻在同一条连接上开新流，
+/// 新流自带全新的流控额度，前几帧必然写成功——哪怕一帧都没出过网卡。
 struct PeerHealth {
     base: Instant,
-    /// 最后一次成功写完一帧
+    /// 最后一次成功写完一帧；也用作停滞计时的起点
     last_write_ms: AtomicU64,
     /// 已入队、还没写完的帧数
     pending: AtomicU32,
-    /// 连续写失败的流数
-    fails: AtomicU32,
+    /// 对端回包的采样状态（只有扫描线程读写）
+    silence: std::sync::Mutex<Silence>,
     /// 已经判定失效（只告一次，避免多条流的 writer 同时触发重建）
     dead: AtomicBool,
+}
+
+/// 对端回包的采样状态。
+#[derive(Default)]
+struct Silence {
+    tx: u64,
+    rx: u64,
+    /// 上一次 `rx` 增长的时刻
+    rx_at_ms: u64,
+    /// 上一次 `tx` 增长的时刻
+    tx_at_ms: u64,
+    /// 采过样之后我方至少发过一个包——一个包都没发过就无从判断对端死活
+    sent: bool,
+    started: bool,
 }
 
 impl PeerHealth {
@@ -135,7 +171,7 @@ impl PeerHealth {
             base: Instant::now(),
             last_write_ms: AtomicU64::new(0),
             pending: AtomicU32::new(0),
-            fails: AtomicU32::new(0),
+            silence: std::sync::Mutex::new(Silence::default()),
             dead: AtomicBool::new(false),
         }
     }
@@ -145,7 +181,11 @@ impl PeerHealth {
     }
 
     fn note_queued(&self) {
-        self.pending.fetch_add(1, Ordering::Relaxed);
+        // 从"零积压"变成"有积压"时重启停滞计时。不重置的话，空闲很久之后
+        // 入队的第一个包会拿着几十秒前的旧时间戳，被扫描当成"停滞 30 秒"杀掉。
+        if self.pending.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.last_write_ms.store(self.now_ms(), Ordering::Relaxed);
+        }
     }
 
     /// 扣回 `n` 个入队名额，防下溢。
@@ -178,21 +218,45 @@ impl PeerHealth {
     fn note_write_ok(&self) {
         self.last_write_ms.store(self.now_ms(), Ordering::Relaxed);
         self.note_unqueued(1);
-        self.fails.store(0, Ordering::Relaxed);
     }
 
-    /// 收到对端数据：清失败计数，但**不**推进写时间戳。
-    fn note_read_ok(&self) {
-        self.fails.store(0, Ordering::Relaxed);
+    /// 采一次 QUIC 的 UDP 计数，判断对端是不是已经不理我们了。
+    ///
+    /// `tx`/`rx` 是连接建立以来的累计值（`conn.stats()` 的
+    /// `udp_tx.datagrams` / `udp_rx.datagrams`）。返回 true = 判定失效。
+    fn observe(&self, tx: u64, rx: u64) -> bool {
+        self.observe_at(tx, rx, self.now_ms())
     }
 
-    /// 记一次写失败。积压由调用方按实际剩下的帧数清账，这里只管连败计数。
-    fn note_fail(&self) {
-        self.fails.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn broken(&self) -> bool {
-        self.fails.load(Ordering::Relaxed) >= BROKEN_STREAK
+    /// 同 [`Self::observe`]，但时间戳由调用方给（单测用假时间，免得真等 8 秒）。
+    fn observe_at(&self, tx: u64, rx: u64, now_ms: u64) -> bool {
+        let mut s = self.silence.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.started {
+            *s = Silence {
+                tx,
+                rx,
+                rx_at_ms: now_ms,
+                tx_at_ms: now_ms,
+                sent: false,
+                started: true,
+            };
+            return false;
+        }
+        if rx > s.rx {
+            s.rx = rx;
+            s.rx_at_ms = now_ms;
+        }
+        if tx > s.tx {
+            s.tx = tx;
+            s.tx_at_ms = now_ms;
+            s.sent = true;
+        }
+        if !s.sent {
+            return false;
+        }
+        let sending = now_ms.saturating_sub(s.tx_at_ms) <= SEND_WINDOW.as_millis() as u64;
+        let silent = now_ms.saturating_sub(s.rx_at_ms) >= PEER_SILENT.as_millis() as u64;
+        sending && silent
     }
 
     /// 有积压，却超过 [`STALL_TIMEOUT`] 没有成功写出过一帧。
@@ -287,7 +351,6 @@ impl MeshLinks {
         *self.wake.write().await = Some(tx);
     }
 
-    /// 挂一条用户可见提示的出口。重复调用只认第一次。
     /// 挂一条用户可见提示的出口。重复调用只认第一次。
     pub fn set_notice<F>(&self, f: F)
     where
@@ -388,9 +451,8 @@ impl MeshLinks {
             let to_tun = self.to_tun.clone();
             let activity = self.activity.clone();
             let allowed = self.allowed.clone();
-            let health = health.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_inbound(conn, to_tun, allowed, activity, health).await {
+                if let Err(e) = serve_inbound(conn, to_tun, allowed, activity).await {
                     tracing::debug!("[tun] 接收循环结束: {e:#}");
                 }
             });
@@ -442,27 +504,46 @@ impl MeshLinks {
         self.force_wake(ip).await;
     }
 
-    /// 扫描所有对端：有包排队却长时间写不出去的直接判死。
+    /// 扫描所有对端：对端不回包、或有积压长时间零进展的，摘表并重拨。
     ///
-    /// 这条是 [`PeerHealth::stalled`] 的落地。它依赖主循环还活着——
-    /// 所以必须先有"主循环不许等网络"的改造，否则主循环自己卡住，
-    /// 这个扫描再也不会跑。
-    pub async fn reap_stalled(&self) {
-        let stalled: Vec<(Ipv4Addr, Connection)> = {
+    /// 依赖主循环还活着——所以必须先有"主循环不许等网络"的改造，否则主循环
+    /// 自己卡住，这个扫描再也不会跑。
+    pub async fn reap_unhealthy(&self) {
+        let unhealthy: Vec<(Ipv4Addr, Connection, &'static str)> = {
             let peers = self.peers.read().await;
             peers
                 .iter()
-                .filter(|(_, p)| !p.health.is_dead() && p.health.stalled())
-                .map(|(ip, p)| (*ip, p.conn.clone()))
+                .filter_map(|(ip, p)| {
+                    if p.health.is_dead() {
+                        return None;
+                    }
+                    // 连接级判据：我方在发、对端不回包
+                    let stats = p.conn.stats();
+                    if p.health
+                        .observe(stats.udp_tx.datagrams, stats.udp_rx.datagrams)
+                    {
+                        return Some((*ip, p.conn.clone(), "对端 8 秒没有回包"));
+                    }
+                    // 兜底：对端在收包但不消费，流控彻底停死
+                    if p.health.stalled() {
+                        return Some((*ip, p.conn.clone(), "有包排队 30 秒写不出去"));
+                    }
+                    None
+                })
                 .collect()
         };
-        for (ip, conn) in stalled {
+        for (ip, conn, reason) in unhealthy {
             let first = {
                 let peers = self.peers.read().await;
-                peers.get(&ip).is_some_and(|p| p.health.mark_dead())
+                match peers.get(&ip) {
+                    // 必须比对连接身份：快照与这里之间，这个 IP 可能已经被新连接
+                    // 顶替，点亮新连接的 dead 标记会让它永远进不了扫描（假"已连接"）
+                    Some(p) if p.conn.stable_id() == conn.stable_id() => p.health.mark_dead(),
+                    _ => false,
+                }
             };
             if first {
-                self.mark_dead(ip, &conn, "有包排队 30 秒写不出去").await;
+                self.mark_dead(ip, &conn, reason).await;
             }
         }
     }
@@ -499,9 +580,8 @@ pub async fn run(conn: Connection, link: TunLink, local: Ipv4Addr) -> Result<()>
         let activity = Activity::new();
         // 单对端调试模式不开放端口映射：白名单为空，行为与以前完全一致
         let allowed = Arc::new(Vec::new());
-        let health = health.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_inbound(conn, to_tun, allowed, activity, health).await {
+            if let Err(e) = serve_inbound(conn, to_tun, allowed, activity).await {
                 tracing::debug!("[tun] 接收循环结束: {e:#}");
             }
         })
@@ -594,7 +674,7 @@ async fn pump(
                     drop(tx);
                 }
                 if let Route::Mesh(links) = &route {
-                    links.reap_stalled().await;
+                    links.reap_unhealthy().await;
                 }
             }
         }
@@ -685,17 +765,12 @@ async fn dispatch(
     // 4. 建流也交给 writer：流配额用尽时 `open_bi` 会一直挂着，
     //    留在主循环里就等于把所有对端、所有流一起拖住。
     let (tx, rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
-    let links = match route {
-        Route::Mesh(links) => Some(Arc::downgrade(links)),
-        Route::Single { .. } => None,
-    };
     tokio::spawn(
         FlowWriter {
             rx,
             health: peer.health.clone(),
             ip: dst,
             conn: peer.conn.clone(),
-            links,
         }
         .run(),
     );
@@ -717,12 +792,14 @@ async fn dispatch(
 /// 它跑在独立任务里，所以 `write_all` 挂起时只挂住它自己。写帧超时或出错，
 /// 就把这条流 `reset` 掉——内层 TCP 会因为收不到 ACK 重传，主循环下一次
 /// `try_send` 会发现队列已关，立刻重开一条新流接上。
+///
+/// 注意它**不判连接死活**：本地写失败说明不了对端还在不在，摘连接是
+/// [`MeshLinks::reap_unhealthy`] 按 QUIC 的对端回包计数决定的。
 struct FlowWriter {
     rx: mpsc::Receiver<Vec<u8>>,
     health: Arc<PeerHealth>,
     ip: Ipv4Addr,
     conn: Connection,
-    links: Option<Weak<MeshLinks>>,
 }
 
 impl FlowWriter {
@@ -733,12 +810,12 @@ impl FlowWriter {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
                     tracing::debug!("[tun] {} 打开双向流失败: {e}", self.ip);
-                    self.fail(None, "打开流失败").await;
+                    self.fail(None).await;
                     return;
                 }
                 Err(_) => {
                     tracing::debug!("[tun] {} 打开双向流超时（{OPEN_TIMEOUT:?}）", self.ip);
-                    self.fail(None, "打开流超时").await;
+                    self.fail(None).await;
                     return;
                 }
             };
@@ -750,20 +827,20 @@ impl FlowWriter {
         });
 
         // 首字节声明这是 IP 包流
-        let mut failure: Option<&'static str> = None;
+        let mut broken = false;
         match tokio::time::timeout(WRITE_TIMEOUT, send.write_all(&[KIND_IP])).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::debug!("[tun] {} 写流类型失败: {e}", self.ip);
-                failure = Some("写流类型失败");
+                broken = true;
             }
             Err(_) => {
                 tracing::debug!("[tun] {} 写流类型超时", self.ip);
-                failure = Some("写流类型超时");
+                broken = true;
             }
         }
 
-        while failure.is_none() {
+        while !broken {
             let Some(packet) = self.rx.recv().await else {
                 break;
             };
@@ -773,42 +850,33 @@ impl FlowWriter {
                 Ok(Ok(())) => self.health.note_write_ok(),
                 Ok(Err(e)) => {
                     tracing::debug!("[tun] {} 写帧失败: {e:#}", self.ip);
-                    failure = Some("写帧失败");
+                    broken = true;
                 }
                 Err(_) => {
                     tracing::debug!("[tun] {} 写帧超时（{WRITE_TIMEOUT:?}）", self.ip);
-                    failure = Some("写帧超时");
+                    broken = true;
                 }
             }
         }
 
-        match failure {
-            Some(reason) => self.fail(Some(&mut send), reason).await,
-            None => {
-                // 队列被关掉（流空闲回收 / 连接被替换）：安静收尾
-                let _ = send.reset(0u32.into());
-            }
+        if broken {
+            self.fail(Some(&mut send)).await;
+        } else {
+            // 队列被关掉（流空闲回收 / 连接被替换）：安静收尾
+            let _ = send.reset(0u32.into());
         }
     }
 
-    /// 写不出去：清账、关流，必要时判整个对端失效。
-    async fn fail(self, send: Option<&mut SendStream>, reason: &'static str) {
+    /// 写不出去：清账、关流，等内层重传。
+    ///
+    /// 这里**不判连接死活**——见 [`PeerHealth`] 的说明：写失败只说明这条流的
+    /// 额度用完了，不能推出对端已经不在线。
+    async fn fail(self, send: Option<&mut SendStream>) {
         // 队列里还没写的 + 当前这一帧，都从积压里扣掉，别让它们继续顶着
         let left = u32::try_from(self.rx.len()).unwrap_or(u32::MAX);
         self.health.note_unqueued(left.saturating_add(1));
         if let Some(send) = send {
             let _ = send.reset(0u32.into());
-        }
-        self.health.note_fail();
-
-        if !self.health.broken() {
-            return;
-        }
-        let Some(links) = self.links.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        if self.health.mark_dead() {
-            links.mark_dead(self.ip, &self.conn, reason).await;
         }
     }
 }
@@ -830,7 +898,6 @@ async fn serve_inbound(
     to_tun: mpsc::Sender<Vec<u8>>,
     allowed: Arc<Vec<SocketAddr>>,
     activity: Activity,
-    health: Arc<PeerHealth>,
 ) -> Result<()> {
     loop {
         let (send, mut recv) = match conn.accept_bi().await {
@@ -843,7 +910,6 @@ async fn serve_inbound(
         let to_tun = to_tun.clone();
         let activity = activity.clone();
         let allowed = allowed.clone();
-        let health = health.clone();
         tokio::spawn(async move {
             let mut kind = [0u8; 1];
             if let Err(e) = recv.read_exact(&mut kind).await {
@@ -852,7 +918,7 @@ async fn serve_inbound(
             }
             match kind[0] {
                 KIND_IP => {
-                    if let Err(e) = pump_stream(&mut recv, to_tun, activity, health).await {
+                    if let Err(e) = pump_stream(&mut recv, to_tun, activity).await {
                         tracing::trace!("[tun] 流结束: {e:#}");
                     }
                     drop(send);
@@ -877,7 +943,6 @@ async fn pump_stream(
     recv: &mut RecvStream,
     to_tun: mpsc::Sender<Vec<u8>>,
     activity: Activity,
-    health: Arc<PeerHealth>,
 ) -> Result<()> {
     loop {
         let mut len = [0u8; 2];
@@ -894,7 +959,6 @@ async fn pump_stream(
         let mut buf = vec![0u8; len];
         recv.read_exact(&mut buf).await.context("读帧失败")?;
         activity.touch();
-        health.note_read_ok();
         // 绝不 await：这里的反压会顺着 QUIC 流控传导回对端的发送循环，
         // 两个方向一起卡死。队列满就丢包，内层 TCP 会重传。
         match to_tun.try_send(buf) {
@@ -947,34 +1011,115 @@ mod tests {
     }
 
     #[test]
-    fn three_failures_break_the_link() {
-        let h = PeerHealth::new();
-        h.note_fail();
-        assert!(!h.broken());
-        h.note_fail();
-        assert!(!h.broken());
-        h.note_fail();
-        assert!(h.broken(), "连续三条流失败就该换连接");
-        h.note_read_ok();
-        assert!(!h.broken(), "收到对端数据说明链路是通的，计数要清掉");
-    }
-
-    #[test]
-    fn write_success_clears_failure_streak() {
-        let h = PeerHealth::new();
-        h.note_fail();
-        h.note_fail();
-        h.note_queued();
-        h.note_write_ok();
-        assert!(!h.broken());
-        assert_eq!(h.pending.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn dead_is_reported_only_once() {
         let h = PeerHealth::new();
         assert!(h.mark_dead(), "第一个调用者拿到 true");
         assert!(!h.mark_dead(), "后续调用者拿到 false，避免重复重建");
         assert!(h.is_dead());
+    }
+
+    // --- 对端回包判据（第二版） -------------------------------------------
+    //
+    // 这几个用例都喂假时间戳，不真等 8 秒：判据的核心是"我方在发、对端不回"，
+    // 用真实时钟测就只能测到"测试挂了 8 秒还没死"。
+
+    /// 涓流：我方零星在发，对端一个包都不回 → 8 秒后判死。
+    #[test]
+    fn silence_while_sending_kills_the_link() {
+        let h = PeerHealth::new();
+        // t=0 建立连接：tx/rx 都是 100
+        assert!(!h.observe_at(100, 100, 0), "刚采样的第一轮不能判死");
+        // t=1s 我方又发了几个包（对端仍无回应）
+        assert!(!h.observe_at(106, 100, 1_000), "8 秒没到不能判死");
+        // t=7.9s 还没到阈值
+        assert!(!h.observe_at(112, 100, 7_900));
+        // t=8s：对端整整 8 秒没回任何一个包，而我方一直在发 → 判死
+        assert!(
+            h.observe_at(118, 100, 8_000),
+            "我方在发、对端 8 秒没回包，就该判死"
+        );
+    }
+
+    /// 对端一直在回包 → 永远不判死，哪怕我们发了很久。
+    #[test]
+    fn replies_keep_the_link_alive() {
+        let h = PeerHealth::new();
+        let mut tx = 0u64;
+        let mut rx = 0u64;
+        let mut t = 0u64;
+        for _ in 0..30 {
+            t += 1_000;
+            tx += 50;
+            // 每个周期都有回包（ACK/数据）
+            rx += 40;
+            assert!(!h.observe_at(tx, rx, t), "对端一直在回包，不能判死");
+        }
+    }
+
+    /// 发过一阵就彻底安静：过了 SEND_WINDOW 就不能再拿"对端没回"判死。
+    ///
+    /// 注意 8 秒那一刻判死是**对的**：我们发了包、对端一个回包都没有，
+    /// 那就是黑洞。真正的空闲是"我们自己也没在发"，见下一个用例。
+    #[test]
+    fn long_idle_after_a_burst_is_not_judged() {
+        let h = PeerHealth::new();
+        assert!(!h.observe_at(0, 0, 0));
+        assert!(!h.observe_at(5, 0, 500), "才 0.5 秒，不能判");
+        // 最后一次发送在 t=0.5s；6 秒之后（t>6.5s）就不该再判了，哪怕对端一直没回
+        for t in (8_500..300_000).step_by(5_000) {
+            assert!(
+                !h.observe_at(5, 0, t),
+                "自己 6 秒以上没发过包，就不能用'对端不回'判死（t={t}）"
+            );
+        }
+    }
+
+    /// 空闲链路：15 秒一个 keepalive，PING 与 ACK 同时发生，中间什么都不发。
+    ///
+    /// 这是最容易被判据误杀的形态——两次 keepalive 之间的 8~12 秒里，
+    /// "对端没回包"和"我们也没发包"同时成立，但链路完全健康。
+    #[test]
+    fn keepalive_spacing_is_not_a_blackhole() {
+        let h = PeerHealth::new();
+        assert!(!h.observe_at(0, 0, 0), "连接刚建立");
+        let mut tx = 0u64;
+        let mut rx = 0u64;
+        let mut t = 0u64;
+        for _ in 0..5 {
+            t += 15_000;
+            tx += 1; // keepalive PING
+            rx += 1; // 对端的 ACK
+            assert!(!h.observe_at(tx, rx, t));
+            // 之后每 2 秒扫一次，一直到下一个 keepalive 之前
+            for k in 1..7 {
+                assert!(
+                    !h.observe_at(tx, rx, t + k * 2_000),
+                    "空闲链路的 keepalive 间隔不能被当成黑洞（t+{}s）",
+                    k * 2
+                );
+            }
+        }
+    }
+
+    /// 从没发过包的新连接，无论等多久都不能判死。
+    #[test]
+    fn never_sent_never_judged() {
+        let h = PeerHealth::new();
+        assert!(!h.observe_at(0, 0, 0));
+        assert!(!h.observe_at(0, 0, 60_000), "一个包都没发过，凭什么判死");
+    }
+
+    /// 空闲很久之后入队的第一个包，不能被旧时间戳当成"停滞 30 秒"。
+    #[test]
+    fn first_packet_after_idle_is_not_stalled() {
+        let h = PeerHealth::new();
+        h.note_queued();
+        h.note_write_ok(); // 模拟很久以前写过一帧
+        std::thread::sleep(Duration::from_millis(5));
+        h.note_queued(); // 空闲之后第一个包入队：计时必须从这一刻重新开始
+        assert!(
+            !h.stalled_after(Duration::from_millis(1)),
+            "刚入队的包算停滞，会把健康连接杀掉"
+        );
     }
 }

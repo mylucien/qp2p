@@ -307,6 +307,9 @@ struct PeerState {
     name: String,
     virtual_ip: Option<Ipv4Addr>,
     connected: bool,
+    /// 当前这条直连的 `stable_id`。旧连接关闭的回调要拿它比对，
+    /// 否则刚重拨成功的新连接会被上一代的 `closed()` 误标成断开。
+    conn_id: Option<usize>,
     /// 尝试过几次（0 表示从没试过，应当立刻连）。换端口后会清零，用来驱动退避。
     attempts: u32,
     last_try: Instant,
@@ -340,6 +343,7 @@ impl PeerState {
             name,
             virtual_ip,
             connected: false,
+            conn_id: None,
             attempts: 0,
             last_try: Instant::now(),
             reported: false,
@@ -377,14 +381,32 @@ impl PeerState {
         self.fails = 0;
     }
 
-    fn mark_connected(&mut self) {
+    fn mark_connected(&mut self, conn_id: usize) {
         self.connected = true;
+        self.conn_id = Some(conn_id);
         self.online = true;
         self.attempts = 0;
         self.fails = 0;
         self.cool_until = None;
         self.cool_count = 0;
         self.reported = false;
+    }
+
+    /// 连接关闭回调：只有"关闭的这条就是当前那条"才清状态。
+    ///
+    /// 返回 false 表示这是上一代连接，已经被新连接接替，什么都不该改。
+    /// 两端同时判死各自重拨时，旧连接的 `closed()` 会晚于新连接建立才返回，
+    /// 不比对身份就会把刚连上的新连接标成断开，然后会话循环再拨一次。
+    fn drop_connection(&mut self, conn_id: usize) -> bool {
+        if self.conn_id != Some(conn_id) {
+            return false;
+        }
+        self.connected = false;
+        self.conn_id = None;
+        // attempts 归零 = 允许立刻重连，不用等退避
+        self.attempts = 0;
+        self.last_try = Instant::now();
+        true
     }
 
     /// 记一次"对端在线却没打通"。连续失败到阈值就进入冷却。
@@ -987,6 +1009,7 @@ impl Session {
                 for state in table.values_mut() {
                     if state.connected && state.virtual_ip.is_none_or(|ip| !alive.contains(&ip)) {
                         state.connected = false;
+                        state.conn_id = None;
                         state.attempts = 0;
                     }
                 }
@@ -1149,6 +1172,7 @@ impl Session {
                     let mut table = self.peers.lock().await;
                     for state in table.values_mut() {
                         state.connected = false;
+                        state.conn_id = None;
                         state.attempts = 0;
                     }
                     sleeping = true;
@@ -1261,17 +1285,27 @@ async fn answer_punch(
     if addrs.is_empty() {
         return;
     }
-    {
+    let (connected, known_ip) = {
         let mut table = peers.lock().await;
         let state = table
             .entry(from.to_string())
             .or_insert_with(|| PeerState::from_parts(label.clone(), ip, String::new()));
-        if state.connected {
-            return;
-        }
         if ip.is_some() {
             state.virtual_ip = ip;
         }
+        (state.connected, state.virtual_ip)
+    };
+    if connected {
+        // 表里说"连着"，但本机可能已经把这条直连摘掉了（判死过就摘表 + 关连接）。
+        // 那种情况下必须应答：对端正等着我们，不应答它只能等自己的超时。
+        let alive = match (mesh.as_ref(), known_ip) {
+            (Some(mesh), Some(ip)) => mesh.contains(ip).await,
+            _ => true,
+        };
+        if alive {
+            return;
+        }
+        tracing::info!("[session] {label} 请求重新打洞（本机已摘掉那条直连），照它说的办");
     }
 
     let result = {
@@ -1416,7 +1450,7 @@ async fn on_connected(
         let mut table = peers.lock().await;
         match table.get_mut(node_id.as_str()) {
             Some(state) => {
-                state.mark_connected();
+                state.mark_connected(conn.stable_id());
                 if ip.is_some() {
                     state.virtual_ip = ip;
                 }
@@ -1443,14 +1477,17 @@ async fn on_connected(
 
     // 断开后允许重新拨号
     let peers = peers.clone();
+    let conn_id = conn.stable_id();
     tokio::spawn(async move {
         let reason = conn.closed().await;
         let mut table = peers.lock().await;
         if let Some(state) = table.get_mut(node_id.as_str()) {
-            state.connected = false;
-            // attempts 归零 = 允许立刻重连，不用等退避
-            state.attempts = 0;
-            state.last_try = Instant::now();
+            // 只处理"这条连接还是当前那条"的情况：两端同时判死、各自重拨时，
+            // 上一代的 closed() 会在新连接建立之后才返回。
+            if !state.drop_connection(conn_id) {
+                tracing::debug!("[session] 与 {label} 的旧连接已关闭（已由新连接接替）: {reason}");
+                return;
+            }
         }
         tracing::info!("[session] 与 {label} 的连接断开: {reason}");
     });
@@ -1864,6 +1901,20 @@ mod tests {
         assert_eq!(s.cool_until, Some(now + COOLDOWN_MAX));
     }
 
+    /// 旧连接的关闭回调不能把新连接标成断开（两端同时重拨时会撞上）。
+    #[test]
+    fn stale_connection_close_does_not_break_new_one() {
+        let mut s = state(1);
+        s.mark_connected(7);
+        // 上一代连接（id=6）这时才关：它已经被 7 接替，状态必须保持不变
+        assert!(!s.drop_connection(6), "旧连接不该改动状态");
+        assert!(s.connected && s.conn_id == Some(7));
+
+        // 当前这条关闭：清干净，并且允许立刻重连
+        assert!(s.drop_connection(7));
+        assert!(!s.connected && s.conn_id.is_none() && s.attempts == 0);
+    }
+
     #[test]
     fn coming_online_or_connecting_clears_penalties() {
         let now = Instant::now();
@@ -1874,7 +1925,7 @@ mod tests {
         assert!(!s.cooling(now) && s.cool_count == 0 && s.attempts == 0 && s.fails == 0);
 
         s.note_failure(now, true);
-        s.mark_connected();
+        s.mark_connected(1);
         assert!(s.connected && !s.cooling(now) && s.cool_count == 0);
     }
 
