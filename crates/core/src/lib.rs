@@ -22,6 +22,7 @@ pub mod signal;
 pub mod socket;
 pub mod stun;
 pub mod stun_watch;
+pub mod sudo;
 pub mod tls;
 pub mod upnp;
 

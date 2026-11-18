@@ -119,7 +119,8 @@ object AppConfig {
     fun fromPrefs(context: Context): String? {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val worker = prefs.getString("worker", "").orEmpty().trim().trimEnd('/')
-        val token = prefs.getString("token", "").orEmpty().trim()
+        // 令牌是加密存的；这里必须走 Secrets，直接读 prefs 只会拿到 "v1:..." 密文
+        val token = Secrets.get(context, Secrets.TOKEN).trim()
         if (worker.isEmpty() || token.isEmpty()) return null
         return build(
             worker = worker,

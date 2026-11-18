@@ -896,7 +896,7 @@ class MainActivity : Activity() {
         loading = true
         // 存过就一律打码：不因为"重新打开了 App"就把明文又摆出来一次
         val worker = prefs.getString("worker", "").orEmpty().trim()
-        val token = prefs.getString("token", "").orEmpty().trim()
+        val token = Secrets.get(this, Secrets.TOKEN).trim()
         maskWorker(worker.isNotEmpty(), focus = false)
         maskToken(token.isNotEmpty(), focus = false)
         nameInput.setText(prefs.getString("name", ""))
@@ -908,16 +908,22 @@ class MainActivity : Activity() {
         syncPowerUi()
     }
 
-    private fun saveSettings() {
+    /**
+     * 配置落盘。返回 false 表示令牌没能安全保存（系统密钥库不可用）。
+     *
+     * 令牌必须单独走 [Secrets] 加密，**不能**和其他字段一起塞进同一个 `edit()`：
+     * 那样存进去的是明文。
+     */
+    private fun saveSettings(): Boolean {
         prefs.edit()
             .putString("worker", workerValue())
-            .putString("token", tokenValue())
             .putString("name", nameInput.text.toString().trim())
             .putString("virtual_ip", ipInput.text.toString().trim())
             .putBoolean("keep_online", keepSwitch.isChecked)
             .putBoolean("auto_connect", autoSwitch.isChecked)
             .putInt("idle_minutes", idleMinutes())
             .apply()
+        return Secrets.put(this, Secrets.TOKEN, tokenValue())
     }
 
     // ------------------------------------------------------------------
@@ -935,13 +941,13 @@ class MainActivity : Activity() {
         else workerInput.text.toString().trim()
 
     private fun tokenValue(): String =
-        if (tokenMasked) prefs.getString("token", "").orEmpty().trim()
+        if (tokenMasked) Secrets.get(this, Secrets.TOKEN).trim()
         else tokenInput.text.toString().trim()
 
     /** 配置已落盘：把有值的字段打成星号。保存和连接都走这里，两条路径行为一致。 */
     private fun maskSavedSecrets() {
         if (prefs.getString("worker", "").orEmpty().isNotEmpty()) maskWorker(true)
-        if (prefs.getString("token", "").orEmpty().isNotEmpty()) maskToken(true)
+        if (Secrets.get(this, Secrets.TOKEN).isNotEmpty()) maskToken(true)
     }
 
     private fun maskWorker(masked: Boolean, focus: Boolean = true) {
@@ -1121,7 +1127,10 @@ class MainActivity : Activity() {
             showValidationError(problem)
             return
         }
-        saveSettings()
+        if (!saveSettings()) {
+            showValidationError("令牌没能安全保存：系统密钥库不可用，请重启应用后重试")
+            return
+        }
         maskSavedSecrets()
         flash(if (Qp2pVpnService.connected) "已保存，下次连接生效" else "已保存")
     }
@@ -1132,7 +1141,10 @@ class MainActivity : Activity() {
             showValidationError(problem)
             return
         }
-        saveSettings()
+        if (!saveSettings()) {
+            showValidationError("令牌没能安全保存：系统密钥库不可用，请重启应用后重试")
+            return
+        }
         maskSavedSecrets()
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -1151,7 +1163,10 @@ class MainActivity : Activity() {
             showValidationError(problem)
             return
         }
-        saveSettings()
+        if (!saveSettings()) {
+            showValidationError("令牌没能安全保存：系统密钥库不可用，请重启应用后重试")
+            return
+        }
         val config = configJson()
         // 配置已进 prefs，先取好 JSON 再打码（打码只动界面，prefs 里仍是明文那次快照）
         maskSavedSecrets()

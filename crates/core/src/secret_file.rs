@@ -29,6 +29,8 @@ pub fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
         Ok(mut file) => {
             file.write_all(bytes)?;
             file.sync_all()?;
+            // sudo 下文件是 root 写的，改归原用户，否则不带 sudo 运行读不到
+            crate::sudo::adopt(path);
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -103,6 +105,8 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             return Err(first);
         }
     }
+    // rename 保留 inode 与主属，但 "先删再改名" 之后是 root 名下的新文件
+    crate::sudo::adopt(path);
     Ok(())
 }
 

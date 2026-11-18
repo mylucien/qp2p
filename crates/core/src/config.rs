@@ -260,9 +260,15 @@ impl Config {
     }
 
     /// 数据目录：`QP2P_HOME` > `~/.qp2p`（Windows 用 `USERPROFILE`）> 当前目录。
+    ///
+    /// `sudo` 下优先用**原用户**的 `~/.qp2p`（见 [`crate::sudo`]）：否则
+    /// `sudo qp2p up` 和普通用户跑的命令看的是两份配置，建过的网像丢了一样。
     pub fn default_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("QP2P_HOME") {
             return PathBuf::from(dir);
+        }
+        if let Some(dir) = crate::sudo::home() {
+            return dir;
         }
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
