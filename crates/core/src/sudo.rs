@@ -15,8 +15,6 @@
 //! - 找不到原用户的 home（容器里没有 passwd 条目、用户已删除）就什么都不做，
 //!   继续用原来的目录，绝不猜一个路径出来。
 
-use std::path::Path;
-
 #[cfg(unix)]
 mod imp {
     use std::path::{Path, PathBuf};
