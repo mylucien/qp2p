@@ -792,7 +792,7 @@ impl FlowWriter {
     }
 
     /// 写不出去：清账、关流，必要时判整个对端失效。
-    async fn fail(mut self, send: Option<&mut SendStream>, reason: &'static str) {
+    async fn fail(self, send: Option<&mut SendStream>, reason: &'static str) {
         // 队列里还没写的 + 当前这一帧，都从积压里扣掉，别让它们继续顶着
         let left = u32::try_from(self.rx.len()).unwrap_or(u32::MAX);
         self.health.note_unqueued(left.saturating_add(1));

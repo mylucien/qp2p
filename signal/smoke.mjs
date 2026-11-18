@@ -783,7 +783,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   });
   const tamperedCandidates = await call("POST", "/v1/join", {
     token,
-    body: { ...tamperBase, candidates: ["198.51.100.66:4444"] },
+    body: { ...tamperBase, candidates: ["192.168.50.66:4444"] },
   });
   check("改 candidates 后签名失效", tamperedCandidates.status === 403, tamperedCandidates.body);
 
@@ -805,7 +805,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     replayJoin.body,
   );
 
-  const candidates = ["203.0.113.7:51820", "198.51.100.9:51820"];
+  const candidates = ["192.168.1.7:51820", "10.8.0.9:51820"];
   const register = await call("POST", "/v1/register", {
     token,
     body: await signed(bob, "register", net, {
@@ -852,6 +852,21 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     "回环候选被拒",
     badCandidate.status === 400 && badCandidate.body.error === "invalid_candidates",
     badCandidate.body,
+  );
+
+  // 第三方公网地址：不挡的话，几字节请求就能让别的节点往那里发上百 KB
+  const thirdParty = await call("POST", "/v1/register", {
+    token,
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      candidates: ["203.0.113.7:51820"],
+    }),
+  });
+  check(
+    "第三方公网候选被拒",
+    thirdParty.status === 400 && thirdParty.body.error === "invalid_candidates",
+    thirdParty.body,
   );
 
   const rejoin = await call("POST", "/v1/join", {
@@ -1056,7 +1071,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       alice,
       "register",
       net,
-      { node_id: alice.nodeId, pubkey: alice.pubkey, candidates: ["203.0.113.5:51820"], extra },
+      { node_id: alice.nodeId, pubkey: alice.pubkey, candidates: ["192.168.9.5:51820"], extra },
       { canonical: lenientCanonicalJson },
     );
     const res = await call("POST", "/v1/register", { token, body });

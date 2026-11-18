@@ -170,7 +170,7 @@ async function main() {
       name: label,
       tls_fp: "bb".repeat(32),
       nat_type: "eim",
-      candidates: [`203.0.113.${label === "alice" ? 10 : 11}:9000`],
+      candidates: [`192.168.77.${label === "alice" ? 10 : 11}:9000`],
       ts,
       nonce: n,
     };

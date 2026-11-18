@@ -141,6 +141,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 原子写：内容完整落下，且"已存在"时绝不覆盖（身份文件靠这条语义）。
+    #[test]
+    fn atomic_write_lands_complete_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("qp2p-secret-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("id.hex");
+
+        assert!(create_private_atomic(&path, b"first").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert!(!create_private_atomic(&path, b"second").unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"first",
+            "已有文件不能被覆盖"
+        );
+        // 临时文件不能留在目录里
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "id.hex")
+            .collect();
+        assert!(left.is_empty(), "残留临时文件：{left:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn creates_once_then_reports_existing() {
         let dir = std::env::temp_dir().join(format!("qp2p-secret-{}", std::process::id()));

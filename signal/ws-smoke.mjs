@@ -138,6 +138,8 @@ async function main() {
 async function run() {
   const env = { ADMIN_SECRET, DB: fakeD1() };
   env.ROOM = fakeRoomBinding(env);
+  // 这些用例会在同一对上连续 connect，关掉撮合频率上限（真机默认 2 秒）
+  env.PUNCH_MIN_MS = 0;
 
   console.log("\n1. 准备工作");
   const mk = await call(env, "POST", "/v1/admin/networks", {
@@ -169,9 +171,9 @@ async function run() {
     return call(env, "POST", "/v1/join", { token, body });
   }
 
-  const aJoin = await join(alice, "alice", ["198.18.9.1:9000"]);
+  const aJoin = await join(alice, "alice", ["192.168.18.1:9000"]);
   check("alice join", aJoin.status === 200 && aJoin.body.ok === true, aJoin.body);
-  const bJoin = await join(bob, "bob", ["198.18.9.2:9000"]);
+  const bJoin = await join(bob, "bob", ["192.168.18.2:9000"]);
   check("bob join", bJoin.status === 200 && bJoin.body.ok === true, bJoin.body);
 
   const room = env.ROOM.roomOf(net.id);

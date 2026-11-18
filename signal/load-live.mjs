@@ -117,7 +117,7 @@ async function main() {
       name: `n${i}`,
       tls_fp: "cc".repeat(32),
       nat_type: "eim",
-      candidates: [`203.0.113.${(i % 200) + 20}:${9000 + i}`],
+      candidates: [`10.77.${(i % 200) + 20}.7:${9000 + i}`],
       ts,
       nonce: n,
     };

@@ -2027,7 +2027,12 @@ function isDialable(ip, clientIp) {
   if (a >= 224) return false;
   if (isPrivateV4(a, b)) return true;
   // 拿不到来源 IP（本地 wrangler / 自定义入口）时不收紧，免得连自己都连不上
-  return clientIp ? ip === clientIp : true;
+  if (!clientIp) return true;
+  // 来源是 IPv6 时两者没法直接比：候选是 IPv4、cf-connecting-ip 是 IPv6 很常见
+  // （双栈客户端优先走 IPv6，而 STUN 拿到的是 IPv4 映射）。这时只能放行，
+  // 否则一台双栈机器就永远注册不上；放大风险靠 punch_request 的频率上限兜。
+  if (clientIp.includes(":")) return true;
+  return ip === clientIp;
 }
 
 function normalizeCidr(text) {
@@ -3580,21 +3585,24 @@ export class NetworkRoom {
     }
 
     const t = now + 500;
-    // 同一对 (发起方, 目标) 两秒内只撮合一次。
-    // 一次撮合会让目标向候选连发 35 秒的 QUIC Initial（≥1200 字节 / 300ms），
-    // 不设上限的话，几字节的请求就能换来上百 KB 的放大流量。
-    const budgetKey = `${from}|${target}`;
-    const last = this.punchAt?.get(budgetKey) ?? 0;
-    if (now - last < 2000) {
-      return {
-        ok: false,
-        status: 429,
-        error: "too_many_punch",
-        detail: "撮合太频繁，两秒后再试",
-      };
-    }
-    // commit=false 只做预检：HTTP 路径要先把 nonce 占掉才允许产生副作用
+    // commit=false 只做预检：HTTP 路径要先把 nonce 占掉才允许产生副作用。
+    // 频率上限也只管真正产生副作用的那次——放进预检会让"重放"被判成 429，
+    // 把更该报出来的 nonce 复用盖掉。
     if (commit) {
+      // 同一对 (发起方, 目标) 两秒内只撮合一次：一次撮合会让目标向候选连发
+      // 35 秒的 QUIC Initial（≥1200 字节 / 300ms），不设上限的话，几字节的请求
+      // 就能换来上百 KB 的放大流量。
+      const budgetKey = `${from}|${target}`;
+      const minGap = Number(this.env.PUNCH_MIN_MS ?? 2000);
+      const last = this.punchAt?.get(budgetKey) ?? 0;
+      if (minGap > 0 && now - last < minGap) {
+        return {
+          ok: false,
+          status: 429,
+          error: "too_many_punch",
+          detail: "撮合太频繁，两秒后再试",
+        };
+      }
       if (!this.punchAt) this.punchAt = new Map();
       if (this.punchAt.size > 4096) {
         for (const [key, at] of this.punchAt) {

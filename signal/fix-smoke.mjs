@@ -197,9 +197,9 @@ async function run() {
   const alice = await identity();
   const bob = await identity();
   const carol = await identity();
-  await joinNet(env, token, net, alice, "alice", ["198.21.9.1:9000"]);
-  await joinNet(env, token, net, bob, "bob", ["198.21.9.2:9000"]);
-  await joinNet(env, token, net, carol, "carol", ["198.21.9.3:9000"]);
+  await joinNet(env, token, net, alice, "alice", ["192.168.21.1:9000"]);
+  await joinNet(env, token, net, bob, "bob", ["192.168.21.2:9000"]);
+  await joinNet(env, token, net, carol, "carol", ["192.168.21.3:9000"]);
 
   // ---------------------------------------------------------------- ① 撮合新鲜度
   console.log("\n① WS 节点空闲超过 STALE_MS 后仍可撮合");
@@ -276,7 +276,7 @@ async function run() {
   check("WS leave 的 socket 以 1000 关闭", wsLeave.webSocket.closed?.code === 1000, wsLeave.webSocket.closed);
 
   aliceSock.clear();
-  await joinNet(env, token, net, carol, "carol", ["198.21.9.3:9000"]);
+  await joinNet(env, token, net, carol, "carol", ["192.168.21.3:9000"]);
   const carolWs = await openWs(env, token, carol, net);
   const carolServer3 = serverSock(room, carol.nodeId);
   const left = await httpLeave(env, token, net, carol);
@@ -286,7 +286,7 @@ async function run() {
   check("客户端那端也看到了关闭", carolWs.webSocket.closed?.code === 1000, carolWs.webSocket.closed);
 
   aliceSock.clear();
-  await joinNet(env, token, net, carol, "carol", ["198.21.9.3:9000"]);
+  await joinNet(env, token, net, carol, "carol", ["192.168.21.3:9000"]);
   const carolWs2 = await openWs(env, token, carol, net);
   const kick = await call(env, "POST", `/v1/admin/networks/${net.id}/nodes/${carol.nodeId}/kick`, {
     admin: ADMIN,
