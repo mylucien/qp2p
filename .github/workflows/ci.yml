@@ -31,8 +31,21 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # 失败时把每条诊断打成注解：`cargo clippy` 的原始输出在 job 日志里，
+      # 而日志接口经常拉不到（重定向到 blob 需要另一次认证），注解是唯一
+      # 在 PR/提交页面上直接能看到的位置。
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: bash
+        run: |
+          cargo clippy --all-targets --message-format=short -- -D warnings > clippy.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            grep -E "^(error|warning)" clippy.log | head -60 | while IFS= read -r line; do
+              echo "::error::$line"
+            done || true
+            tail -40 clippy.log || true
+          fi
+          exit $code
 
       - name: Test
         run: cargo test --all
