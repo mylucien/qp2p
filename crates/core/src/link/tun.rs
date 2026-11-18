@@ -146,15 +146,30 @@ impl PeerHealth {
     }
 
     /// 扣回 `n` 个入队名额，防下溢。
+    ///
+    /// 用 `compare_exchange` 循环而不是 `fetch_update`：后者在新版 Rust 里
+    /// 被标成 deprecated（改名 `try_update`），而 `try_update` 在旧版工具链
+    /// 上还不存在——两个名字都会踩到一端，CAS 循环两边都兼容。
     fn note_unqueued(&self, n: u32) {
         if n == 0 {
             return;
         }
-        let _ = self
-            .pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                cur.checked_sub(n)
-            });
+        let mut cur = self.pending.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(n);
+            if next == cur {
+                return;
+            }
+            match self.pending.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     fn note_write_ok(&self) {
@@ -209,6 +224,25 @@ struct MeshPeer {
     health: Arc<PeerHealth>,
 }
 
+/// 用户可见提示的出口（"直连已失效，正在重建"）。
+///
+/// 包一层 newtype 而不是直接存 trait object：`OnceLock<Arc<dyn Fn(&str) + Send + Sync>>`
+/// 会触发 `clippy::type_complexity`，把 trait object 收进结构体就没这问题。
+pub struct Notice(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl Notice {
+    fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    fn say(&self, message: &str) {
+        (self.0)(message);
+    }
+}
+
 /// 多对端连接表：目标虚拟地址 → 已建立的直连。
 ///
 /// 组网时一台机器同时和多个节点相连，内核把一个包交给 TUN 之后，
@@ -225,7 +259,7 @@ pub struct MeshLinks {
     /// 允许对端经本机访问的目标（局域网出口）；空 = 拒绝一切端口映射请求
     allowed: Arc<Vec<SocketAddr>>,
     /// 用户可见提示（"直连已失效，正在重建"）。会话层注入，没注入就只写日志。
-    notice: OnceLock<Arc<dyn Fn(&str) + Send + Sync>>,
+    notice: OnceLock<Notice>,
 }
 
 impl MeshLinks {
@@ -251,13 +285,16 @@ impl MeshLinks {
 
     /// 挂一条用户可见提示的出口。重复调用只认第一次。
     /// 挂一条用户可见提示的出口。重复调用只认第一次。
-    pub fn set_notice(&self, f: Arc<dyn Fn(&str) + Send + Sync>) {
-        let _ = self.notice.set(f);
+    pub fn set_notice<F>(&self, f: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        let _ = self.notice.set(Notice::new(f));
     }
 
     fn say(&self, message: &str) {
-        if let Some(f) = self.notice.get() {
-            f.as_ref()(message);
+        if let Some(notice) = self.notice.get() {
+            notice.say(message);
         }
     }
 
