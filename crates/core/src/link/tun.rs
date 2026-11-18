@@ -28,20 +28,43 @@
 //! 接收方向同理：`to_tun` 用 `try_send`。接收侧一旦反压，QUIC 流控窗口
 //! 就不再前进，反压会顺着流控传导到**对端**的发送循环——两个方向一起卡死。
 //!
-//! # 失效判据（A 方案，第二版）
+//! # 失效判据（A 方案，第三版）
 //!
 //! 不新增任何探测包，判据只看 **QUIC 自己的统计**：
 //!
-//! - 我方还在发（`udp_tx` 在涨），对端却连续 [`PEER_SILENT`] 一个 UDP 包都没回
-//!   （`udp_rx` 不动）→ 链路黑洞，摘表、关连接、叫会话循环重拨。
+//! - 我方发出了**需要对方回应**的帧（`frame_tx.stream + frame_tx.ping` 在涨），
+//!   而对端连续 [`PEER_SILENT`] 一个 UDP 包都没回（`udp_rx` 不动）→ 链路黑洞。
 //! - 流级只做"废掉这一条流"，不判连接死活：单帧写超过 [`WRITE_TIMEOUT`] 就
 //!   `reset`，主循环换一条新流继续；有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死。
 //!
-//! 第一版拿"本地写成功"当判据（连败 3 条流就换连接），实测不可靠：一条流被
-//! reset 后主循环立刻在同一条连接上开新流，新流自带全新的 1.25MB 流控额度，
-//! 前几帧必然"写成功"——而它们可能一帧都没到对端，于是连败计数被反复清零，
-//! 黑洞期间一条判据都不触发，全靠 QUIC 默认的 30 秒 idle timeout 收场。
-//! 那个判据还会误杀：6 秒抖动就能凑够 3 条超时流，把本来能自愈的连接掐掉。
+//! ## 为什么不用"我方最近发过包 + 对端好久没回"
+//!
+//! 第二版就是这么写的，会误杀健康空闲连接。`silent` 量的是"距上次收到包多久"，
+//! 空闲链路上那个时间戳本来就是十几秒前的（`rx_at` 只在扫描点更新）；keepalive
+//! 的 PING 一发出，`sending` 立刻翻真，只要扫描点恰好落在"PING 已发、ACK 在途"
+//! 那一个 RTT 里，健康连接当场被摘除。周期 15 秒、扫描 2 秒，相位一直在漂，
+//! 撞上只是时间问题。
+//!
+//! 现在的判据记的是"**第一个没被回应的发包时刻**"：只有在我方发出需回应帧、
+//! 且**同一轮扫描里没有任何回包**时才开表；一旦收到任何回包就清零。空闲链路
+//! 上（哪怕只发了个 keepalive）ACK 一回来就清掉，不会累积。
+//!
+//! ## 为什么用 `frame_tx` 而不是 `udp_tx`
+//!
+//! `udp_tx.datagrams` 里混着**纯 ACK 帧**，而 QUIC 不对 ACK 回 ACK。TCP 传输
+//! 刚结束、我方只回了一个延迟 ACK 的那一刻，如果 rx 与 tx 的增长落在相邻两轮
+//! 扫描里，用 `udp_tx` 就会开出一张永远等不到回应的表，8 秒后误杀。只统计
+//! `stream`（数据帧）和 `ping`（keepalive / PTO / MTU 探测）就不会：这两类都
+//! 必须被对端 ACK。
+//!
+//! 代价是漏算 `max_data`、`reset_stream` 这类也需回应的帧 —— 方向是少判，
+//! 不会误杀，可以接受。
+//!
+//! 第一版拿"本地写成功"当判据（连败 3 条流就换连接）更不可靠：一条流被 reset
+//! 后主循环立刻在同一条连接上开新流，新流自带全新的 1.25MB 流控额度，前几帧
+//! 必然"写成功"——而它们可能一帧都没到对端，于是连败计数被反复清零，黑洞期间
+//! 一条判据都不触发，全靠 QUIC 默认的 30 秒 idle timeout 收场。那个判据还会
+//! 误杀：6 秒抖动就能凑够 3 条超时流，把本来能自愈的连接掐掉。
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -77,20 +100,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// 有包排队却这么久没写出一帧 → 整条连接的流控停死（兜底，正常判据是下面那条）。
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// 我方还在发，对端却这么久没回任何 UDP 包 → 判死。
+/// 我方发出了需要回应的帧，对端却这么久没有任何 UDP 回包 → 判死。
 ///
 /// 8 秒：够 QUIC 在丢包重传、路径切换（WiFi↔4G）里缓过来，又能把黑洞的
 /// 发现时间压到「8 秒 + 一个扫描周期」。
 const PEER_SILENT: Duration = Duration::from_secs(8);
-/// 判断"我方还在发"的回看窗口：超过这么久没发过包，就无从判断对端死活。
-///
-/// 必须**明显小于 keepalive 间隔**（15 秒），否则空闲链路会被误杀：一个
-/// keepalive 的 PING/ACK 发生在 t=0，下一次要等到 t=15，中间 8~12 秒里
-/// "rx 没动、tx 也没动"看着就像黑洞。取 4 个扫描周期。
-///
-/// 黑洞期间这个窗口不会关：未确认的数据会被 QUIC 按 RTO 重传（0.3/0.9/2.1/4.5 秒…），
-/// `udp_tx` 一直在涨，所以"还在发"始终成立。
-const SEND_WINDOW: Duration = Duration::from_secs(6);
 /// 失效扫描周期。2 秒比 5 秒多花不了什么，但直接决定判死的滞后长度。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -132,8 +146,9 @@ impl Activity {
 ///
 /// 判据两层，**连接死活只认"对端有没有回包"**：
 ///
-/// - 连接级（唯一可信信号）：我方还在发，对端连续 [`PEER_SILENT`] 没回任何
-///   UDP 包 → 黑洞。数据来自 `conn.stats()` 的 UDP 计数，不额外发探测包。
+/// - 连接级（唯一可信信号）：我方发出了需要对方回应的帧，对端连续
+///   [`PEER_SILENT`] 没回任何 UDP 包 → 黑洞。数据来自 `conn.stats()`，不额外
+///   发探测包。
 /// - 流级（只废流，不判连接）：单帧写超过 [`WRITE_TIMEOUT`] 就换一条流；
 ///   有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死（对端在收但不消费）。
 ///
@@ -152,16 +167,18 @@ struct PeerHealth {
 }
 
 /// 对端回包的采样状态。
+///
+/// 只保留一个判据：**第一个没被回应的发包时刻**。
+///
+/// 不能用"上次收到包是多久前"——空闲链路上那个时间戳本来就陈旧，keepalive
+/// 一发就会撞上，健康连接被误杀。
 #[derive(Default)]
 struct Silence {
     tx: u64,
     rx: u64,
-    /// 上一次 `rx` 增长的时刻
-    rx_at_ms: u64,
-    /// 上一次 `tx` 增长的时刻
-    tx_at_ms: u64,
-    /// 采过样之后我方至少发过一个包——一个包都没发过就无从判断对端死活
-    sent: bool,
+    /// 我方发出了需回应的帧、而对方还没回任何包的那个时刻。
+    /// `None` = 当前没有被吊着的发包，不判死。
+    unanswered_since_ms: Option<u64>,
     started: bool,
 }
 
@@ -220,10 +237,15 @@ impl PeerHealth {
         self.note_unqueued(1);
     }
 
-    /// 采一次 QUIC 的 UDP 计数，判断对端是不是已经不理我们了。
+    /// 采一次 QUIC 统计，判断对端是不是已经不理我们了。
     ///
-    /// `tx`/`rx` 是连接建立以来的累计值（`conn.stats()` 的
-    /// `udp_tx.datagrams` / `udp_rx.datagrams`）。返回 true = 判定失效。
+    /// `tx` = `conn.stats().frame_tx.stream + frame_tx.ping`，只统计**需要对方
+    /// 回应**的帧（数据帧、keepalive/PTO/MTU 探测的 PING）；故意不算 `acks`，
+    /// 因为 QUIC 不对纯 ACK 回 ACK，算进去会开出永远等不到回应的表。
+    ///
+    /// `rx` = `conn.stats().udp_rx.datagrams`，对端任何回包（含纯 ACK）都算活着。
+    ///
+    /// 返回 true = 判定失效。
     fn observe(&self, tx: u64, rx: u64) -> bool {
         self.observe_at(tx, rx, self.now_ms())
     }
@@ -232,31 +254,34 @@ impl PeerHealth {
     fn observe_at(&self, tx: u64, rx: u64, now_ms: u64) -> bool {
         let mut s = self.silence.lock().unwrap_or_else(|e| e.into_inner());
         if !s.started {
+            // 首次采样只建基线：握手阶段的帧数已经很多，拿来判死会当场误杀
             *s = Silence {
                 tx,
                 rx,
-                rx_at_ms: now_ms,
-                tx_at_ms: now_ms,
-                sent: false,
+                unanswered_since_ms: None,
                 started: true,
             };
             return false;
         }
-        if rx > s.rx {
-            s.rx = rx;
-            s.rx_at_ms = now_ms;
+        let rx_grew = rx > s.rx;
+        let tx_grew = tx > s.tx;
+        s.rx = rx;
+        s.tx = tx;
+
+        if rx_grew {
+            // 收到任何回包：清零，且**本轮不重开**。
+            // 同一轮里 rx 和 tx 一起涨，说明"上次发的、这次回的"配上了，
+            // 重新开表会让空闲链路的 keepalive 每轮都开一次，8 秒后误杀。
+            s.unanswered_since_ms = None;
+        } else if tx_grew && s.unanswered_since_ms.is_none() {
+            // 发了需要回应的帧，而这一轮一个回包都没有 → 从这一刻开始计
+            s.unanswered_since_ms = Some(now_ms);
         }
-        if tx > s.tx {
-            s.tx = tx;
-            s.tx_at_ms = now_ms;
-            s.sent = true;
+
+        match s.unanswered_since_ms {
+            Some(t) => now_ms.saturating_sub(t) >= PEER_SILENT.as_millis() as u64,
+            None => false,
         }
-        if !s.sent {
-            return false;
-        }
-        let sending = now_ms.saturating_sub(s.tx_at_ms) <= SEND_WINDOW.as_millis() as u64;
-        let silent = now_ms.saturating_sub(s.rx_at_ms) >= PEER_SILENT.as_millis() as u64;
-        sending && silent
     }
 
     /// 有积压，却超过 [`STALL_TIMEOUT`] 没有成功写出过一帧。
@@ -517,11 +542,11 @@ impl MeshLinks {
                     if p.health.is_dead() {
                         return None;
                     }
-                    // 连接级判据：我方在发、对端不回包
+                    // 连接级判据：我方发了需回应的帧、对端一个包都没回。
+                    // 只算 stream + ping：纯 ACK 不需要对端回应，算进去会误杀
                     let stats = p.conn.stats();
-                    if p.health
-                        .observe(stats.udp_tx.datagrams, stats.udp_rx.datagrams)
-                    {
+                    let asking = stats.frame_tx.stream + stats.frame_tx.ping;
+                    if p.health.observe(asking, stats.udp_rx.datagrams) {
                         return Some((*ip, p.conn.clone(), "对端 8 秒没有回包"));
                     }
                     // 兜底：对端在收包但不消费，流控彻底停死
@@ -1018,95 +1043,151 @@ mod tests {
         assert!(h.is_dead());
     }
 
-    // --- 对端回包判据（第二版） -------------------------------------------
+    // --- 对端回包判据（第三版） -------------------------------------------
     //
-    // 这几个用例都喂假时间戳，不真等 8 秒：判据的核心是"我方在发、对端不回"，
-    // 用真实时钟测就只能测到"测试挂了 8 秒还没死"。
+    // 全部喂假时间戳，不真等 8 秒。关键是**把"发包时刻"和"扫描时刻"分开**：
+    // 第二版的测试每轮都让 tx 和 rx 一起涨，正好绕开了"tx 先涨、rx 晚一个
+    // 扫描周期才涨"这个真实时序，所以两个误杀漏洞都没被发现。
 
-    /// 涓流：我方零星在发，对端一个包都不回 → 8 秒后判死。
+    /// 涓流：我方零星在发，对端一个包都不回 → 从第一个未回应的包算起 8 秒判死。
     #[test]
     fn silence_while_sending_kills_the_link() {
         let h = PeerHealth::new();
-        // t=0 建立连接：tx/rx 都是 100
-        assert!(!h.observe_at(100, 100, 0), "刚采样的第一轮不能判死");
-        // t=1s 我方又发了几个包（对端仍无回应）
-        assert!(!h.observe_at(106, 100, 1_000), "8 秒没到不能判死");
-        // t=7.9s 还没到阈值
-        assert!(!h.observe_at(112, 100, 7_900));
-        // t=8s：对端整整 8 秒没回任何一个包，而我方一直在发 → 判死
+        assert!(!h.observe_at(100, 100, 0), "首轮只建基线");
+        // t=2s 扫描发现我方发了数据帧、对端没回包：从这里开表
+        assert!(!h.observe_at(105, 100, 2_000));
+        assert!(!h.observe_at(110, 100, 6_000), "才 4 秒");
+        assert!(!h.observe_at(115, 100, 9_000), "才 7 秒");
+        // t=10s：距离开表整整 8 秒，对端一直没回 → 判死
         assert!(
-            h.observe_at(118, 100, 8_000),
+            h.observe_at(120, 100, 10_000),
             "我方在发、对端 8 秒没回包，就该判死"
         );
     }
 
-    /// 对端一直在回包 → 永远不判死，哪怕我们发了很久。
+    /// 开表之后继续发包，不能把起点往后推——否则黑洞永远攒不够 8 秒。
     #[test]
-    fn replies_keep_the_link_alive() {
-        let h = PeerHealth::new();
-        let mut tx = 0u64;
-        let mut rx = 0u64;
-        let mut t = 0u64;
-        for _ in 0..30 {
-            t += 1_000;
-            tx += 50;
-            // 每个周期都有回包（ACK/数据）
-            rx += 40;
-            assert!(!h.observe_at(tx, rx, t), "对端一直在回包，不能判死");
-        }
-    }
-
-    /// 发过一阵就彻底安静：过了 SEND_WINDOW 就不能再拿"对端没回"判死。
-    ///
-    /// 注意 8 秒那一刻判死是**对的**：我们发了包、对端一个回包都没有，
-    /// 那就是黑洞。真正的空闲是"我们自己也没在发"，见下一个用例。
-    #[test]
-    fn long_idle_after_a_burst_is_not_judged() {
+    fn later_sends_do_not_postpone_the_deadline() {
         let h = PeerHealth::new();
         assert!(!h.observe_at(0, 0, 0));
-        assert!(!h.observe_at(5, 0, 500), "才 0.5 秒，不能判");
-        // 最后一次发送在 t=0.5s；6 秒之后（t>6.5s）就不该再判了，哪怕对端一直没回
-        for t in (8_500..300_000).step_by(5_000) {
+        assert!(!h.observe_at(1, 0, 2_000));
+        assert!(!h.observe_at(2, 0, 4_000));
+        assert!(!h.observe_at(3, 0, 6_000));
+        assert!(!h.observe_at(4, 0, 8_000));
+        assert!(
+            h.observe_at(5, 0, 10_000),
+            "起点必须固定在第一次没人理的包那一刻"
+        );
+    }
+
+    /// keepalive 的 PING 已发、ACK 还在路上时被扫到 —— 不能判死。
+    ///
+    /// 这是第二版最致命的误杀：`silent` 量的是"距上次收包多久"，空闲链路上
+    /// 那个值本来就是十几秒，PING 一发就当场判死。
+    #[test]
+    fn keepalive_with_ack_in_flight_is_not_a_blackhole() {
+        let h = PeerHealth::new();
+        assert!(!h.observe_at(10, 10, 0));
+        // t=16s：keepalive PING 已发出（frame_tx.ping 涨），ACK 还没回来
+        assert!(
+            !h.observe_at(11, 10, 16_000),
+            "PING 刚发出、ACK 在途，这不是黑洞"
+        );
+        // t=18s：ACK 到了
+        assert!(!h.observe_at(11, 11, 18_000), "ACK 回来就该清零");
+        // 之后一直空闲到下一个 keepalive
+        for t in (20_000..31_000).step_by(2_000) {
+            assert!(!h.observe_at(11, 11, t), "空闲的 keepalive 间隔不是黑洞");
+        }
+        // 下一次 keepalive，同样 ABC 时序
+        assert!(!h.observe_at(12, 11, 32_000));
+        assert!(!h.observe_at(12, 12, 34_000));
+    }
+
+    /// 纯 ACK 收尾：我方只回了 ACK（`stream + ping` 不动）→ 不开表。
+    ///
+    /// 第二版用 `udp_tx.datagrams` 会把纯 ACK 算进去：对端数据到达时 rx 涨、
+    /// 我方 ACK 落在下一轮扫描，开出一张永远等不到回应的表（QUIC 不对 ACK
+    /// 回 ACK），8 秒后误杀一条健康连接。
+    #[test]
+    fn pure_ack_does_not_open_the_timer() {
+        let h = PeerHealth::new();
+        assert!(!h.observe_at(100, 100, 0));
+        // t=2s：对端发来一批数据，我方回延迟 ACK
+        assert!(!h.observe_at(100, 120, 2_000));
+        // 若这里把 tx 加 1 就代表"只发了 ACK 帧"——用 udp_tx 会误判，用
+        // frame_tx.stream + ping 则压根不涨
+        for t in (4_000..120_000).step_by(2_000) {
             assert!(
-                !h.observe_at(5, 0, t),
-                "自己 6 秒以上没发过包，就不能用'对端不回'判死（t={t}）"
+                !h.observe_at(100, 120, t),
+                "只发过纯 ACK，没有任何'需回应帧'被吊着（t={t}）"
             );
         }
     }
 
-    /// 空闲链路：15 秒一个 keepalive，PING 与 ACK 同时发生，中间什么都不发。
-    ///
-    /// 这是最容易被判据误杀的形态——两次 keepalive 之间的 8~12 秒里，
-    /// "对端没回包"和"我们也没发包"同时成立，但链路完全健康。
+    /// 6 秒抖动后恢复：开表后对端回包到达就清零，不能杀。
     #[test]
-    fn keepalive_spacing_is_not_a_blackhole() {
+    fn jitter_that_recovers_is_not_killed() {
         let h = PeerHealth::new();
-        assert!(!h.observe_at(0, 0, 0), "连接刚建立");
-        let mut tx = 0u64;
-        let mut rx = 0u64;
-        let mut t = 0u64;
-        for _ in 0..5 {
-            t += 15_000;
-            tx += 1; // keepalive PING
-            rx += 1; // 对端的 ACK
-            assert!(!h.observe_at(tx, rx, t));
-            // 之后每 2 秒扫一次，一直到下一个 keepalive 之前
-            for k in 1..7 {
-                assert!(
-                    !h.observe_at(tx, rx, t + k * 2_000),
-                    "空闲链路的 keepalive 间隔不能被当成黑洞（t+{}s）",
-                    k * 2
-                );
-            }
+        assert!(!h.observe_at(100, 100, 0));
+        assert!(!h.observe_at(105, 100, 2_000), "抖动开始，开表");
+        assert!(!h.observe_at(110, 100, 4_000));
+        assert!(!h.observe_at(115, 100, 6_000));
+        // t=8s：抖动结束，对端积压的包一次性到达 —— 还差 2 秒才判死，清零
+        assert!(!h.observe_at(115, 130, 8_000), "对端恢复回包，必须清零");
+        // 之后正常一来一回
+        for k in 1..20u64 {
+            let t = 8_000 + k * 2_000;
+            assert!(!h.observe_at(115 + k, 130 + k, t));
         }
     }
 
-    /// 从没发过包的新连接，无论等多久都不能判死。
+    /// 同一轮 rx 和 tx 一起涨，连续 60 秒：必须清零，不能重新开表。
+    ///
+    /// 这是第二版的第二个洞：先清 `None` 再立刻 `Some(now)`，等于每轮都重新
+    /// 计时。旧用例 `keepalive_spacing_is_not_a_blackhole` 就是这种形态、却
+    /// 只扫到"同时涨"之后的 6 个点，看不出问题。
+    #[test]
+    fn rx_and_tx_growing_together_never_judges() {
+        let h = PeerHealth::new();
+        let mut tx = 0u64;
+        let mut rx = 0u64;
+        let mut t = 0u64;
+        assert!(!h.observe_at(tx, rx, t));
+        for _ in 0..30 {
+            t += 2_000;
+            tx += 3;
+            rx += 3;
+            assert!(!h.observe_at(tx, rx, t), "同轮收发都有增长，不能判死");
+        }
+    }
+
+    /// 从没发过需回应的帧：无论等多久都不能判死。
     #[test]
     fn never_sent_never_judged() {
         let h = PeerHealth::new();
         assert!(!h.observe_at(0, 0, 0));
-        assert!(!h.observe_at(0, 0, 60_000), "一个包都没发过，凭什么判死");
+        assert!(!h.observe_at(0, 5, 60_000), "只收了包、没发过，凭什么判死");
+        assert!(!h.observe_at(0, 9, 600_000));
+    }
+
+    /// 单向故障判不出来：对端的重传包让 rx 一直涨。
+    ///
+    /// 这是已知取舍（假定路径对称），不是缺陷。写在这里是为了防止有人
+    /// "顺手加一条 rx 不涨的判据" —— 那会误杀所有下行单向流。
+    #[test]
+    fn one_way_failure_is_not_detected() {
+        let h = PeerHealth::new();
+        let mut tx = 0u64;
+        let mut rx = 0u64;
+        let mut t = 0u64;
+        assert!(!h.observe_at(tx, rx, t));
+        for _ in 0..120 {
+            t += 2_000;
+            tx += 5; // 我方一直在发（对方收不到）
+            rx += 2; // 对方的包我方能收到（对方的重传）
+            assert!(!h.observe_at(tx, rx, t), "rx 在涨就不判死，这是设计取舍");
+        }
     }
 
     /// 空闲很久之后入队的第一个包，不能被旧时间戳当成"停滞 30 秒"。
