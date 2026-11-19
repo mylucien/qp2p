@@ -75,6 +75,21 @@ pub struct Engine {
     accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// 打洞期间的旁路探针句柄：drop 时 abort。
+///
+/// `punch_as` 的 future 可能被上层 `select!` 直接丢弃（对端换网时，新的
+/// `punch_request` 会取消旧的应答）。这时 `JoinHandle` 只是分离、不会 abort，
+/// 探针会继续往旧候选发包到超时——监听侧最长 35 秒。用 Drop 兜底。
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 /// 把 `Bound` 里的 STUN 旁路接到保活任务上。
 fn start_stun_watch(
     bound: &mut socket::Bound,
@@ -460,12 +475,10 @@ impl Engine {
             expected,
         };
 
-        let probe = self.spawn_probe(peers, timeout);
-        let result = punch::execute(endpoint, hub, peers, role, timeout, Some(handles)).await;
-        if let Some(task) = probe {
-            task.abort();
-        }
-        result
+        // 探针必须在 `punch_as` 被取消时也停下：`select!` 丢弃 future 时
+        // 只是 drop 掉 JoinHandle，任务本身会一直发包到 `timeout` 到点。
+        let _probe = self.spawn_probe(peers, timeout).map(AbortOnDrop);
+        punch::execute(endpoint, hub, peers, role, timeout, Some(handles)).await
     }
 
     fn spawn_probe(
@@ -608,4 +621,27 @@ fn start_upnp_renewer(mapping: Option<upnp::Mapping>) -> Option<tokio::task::Joi
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 回归：`punch_as` 被 `select!` 取消时，探针任务必须跟着停。
+    ///
+    /// 直接测 Drop：任务先睡 20ms 再置标志，guard 立刻 drop，标志不能翻真。
+    /// 没有这个 guard 的话 `JoinHandle` 只是分离，任务会照常跑完。
+    #[tokio::test]
+    async fn dropping_the_probe_guard_aborts_the_probe() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let flag = hit.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        drop(AbortOnDrop(Some(task)));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!hit.load(Ordering::SeqCst), "取消后探针不该继续跑");
+    }
 }

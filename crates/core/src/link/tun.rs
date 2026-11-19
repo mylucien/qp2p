@@ -104,6 +104,13 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// 判的是"从第一次写失败起，中间一次成功的写都没有"。不能用"积压 + 零进展"
 /// 代替：`FlowWriter::fail` 会把积压清账，下一个包入队又从零开始算。
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 写失败窗口的"新鲜度"要求：最近一次失败必须落在这么久以内，窗口才算数。
+///
+/// 真停死时，一条流每 [`WRITE_TIMEOUT`] 就失败一次，`last_fail` 会被不断刷新；
+/// 反过来，失败之后一直没有新的写入，只说明这条链路没人用了，不能判死。
+/// 取 2×[`WRITE_TIMEOUT`] + 一个[`SWEEP_INTERVAL`]：留够一次重试加一轮扫描的余量，
+/// 稀疏流量（失败间隔超过它）也只是把检出推迟到下一次失败，不会漏。
+const STALL_GRACE: Duration = Duration::from_secs(8);
 /// 我方发出了需要回应的帧，对端却这么久没有任何 UDP 回包 → 判死。
 ///
 /// 8 秒：够 QUIC 在丢包重传、路径切换（WiFi↔4G）里缓过来，又能把黑洞的
@@ -166,6 +173,12 @@ struct PeerHealth {
     /// 下一个包入队又从零算起，`pending > 0 且 30 秒零进展` 这个组合
     /// 在单流下永远凑不齐（多流并发时才偶尔成立）。
     fail_since_ms: AtomicU64,
+    /// 最近一次写失败的时刻，[`NO_FAIL`] 表示当前没有在失败。
+    ///
+    /// 光有起点不够：一次写失败之后如果整段时间没有任何写入（用户停手、
+    /// 流被回收），窗口会一直挂着，30 秒后把一条健康的连接判死——对端明明
+    /// 还在好好回 keepalive 的 ACK。只有"还在持续失败"才算停死。
+    last_fail_ms: AtomicU64,
     /// 对端回包的采样状态（只有扫描线程读写）
     silence: std::sync::Mutex<Silence>,
     /// 已经判定失效（只告一次，避免多条流的 writer 同时触发重建）
@@ -207,6 +220,7 @@ impl PeerHealth {
         Self {
             base: Instant::now(),
             fail_since_ms: AtomicU64::new(NO_FAIL),
+            last_fail_ms: AtomicU64::new(NO_FAIL),
             silence: std::sync::Mutex::new(Silence::default()),
             dead: AtomicBool::new(false),
         }
@@ -221,11 +235,14 @@ impl PeerHealth {
         // 新流前几帧必然写得出去。真正的兜底要等连接级流控窗口关死、
         // 所有流都写不动时才开始计时——这正是这条判据能覆盖的场景。
         self.fail_since_ms.store(NO_FAIL, Ordering::Relaxed);
+        self.last_fail_ms.store(NO_FAIL, Ordering::Relaxed);
     }
 
-    /// 记一次写失败。只有第一个失败者能定起点，后来的失败不能把它往后推。
+    /// 记一次写失败。只有第一个失败者能定起点，后来的失败不能把它往后推；
+    /// 但每次失败都要刷新"最近一次失败"，否则持续失败会被当成空闲。
     fn note_fail(&self) {
         let now = self.now_ms();
+        self.last_fail_ms.store(now, Ordering::Relaxed);
         let _ =
             self.fail_since_ms
                 .compare_exchange(NO_FAIL, now, Ordering::Relaxed, Ordering::Relaxed);
@@ -282,6 +299,9 @@ impl PeerHealth {
     ///
     /// 覆盖"对端 ACK 但不消费"：那时连接级流控窗口会关死，所有流同时写不动，
     /// 而 QUIC 还在回 ACK，连接级判据（对端不回包）不会触发。
+    ///
+    /// 还要求窗口是**新鲜的**（最近一次失败在 [`STALL_GRACE`] 以内）：一次写
+    /// 失败之后整整 30 秒没有任何写入，只能说明这条链路没人用了，不是停死。
     fn write_failing(&self) -> bool {
         self.write_failing_for(STALL_TIMEOUT)
     }
@@ -289,7 +309,16 @@ impl PeerHealth {
     /// 同 [`Self::write_failing`]，但可指定阈值（测试用短阈值，免得真等 30 秒）。
     fn write_failing_for(&self, limit: Duration) -> bool {
         let since = self.fail_since_ms.load(Ordering::Relaxed);
-        since != NO_FAIL && self.now_ms().saturating_sub(since) > limit.as_millis() as u64
+        if since == NO_FAIL {
+            return false;
+        }
+        let last = self.last_fail_ms.load(Ordering::Relaxed);
+        let now = self.now_ms();
+        // 窗口过期：这段时间根本没有写入尝试，判不了死
+        if now.saturating_sub(last) > STALL_GRACE.as_millis() as u64 {
+            return false;
+        }
+        now.saturating_sub(since) > limit.as_millis() as u64
     }
 
     /// 抢占式标记失效：只有第一个调用者拿到 true。
@@ -1026,6 +1055,39 @@ mod tests {
         assert!(
             !h.write_failing_for(Duration::ZERO),
             "写成功过就不算连续失败"
+        );
+    }
+
+    /// 把连接的时钟往前拨：能造出"很久以前失败过"的窗口，又不用真等。
+    fn aged(age: Duration) -> PeerHealth {
+        let mut h = PeerHealth::new();
+        h.base = Instant::now() - age;
+        h
+    }
+
+    #[test]
+    fn a_failure_followed_by_idle_is_not_a_stall() {
+        // 回归：一次写超时之后用户停手、流被回收，30 秒里一次写都没有。
+        // 旧判据只看起点，会把一条对端还在回 ACK 的健康连接判死。
+        let h = aged(Duration::from_secs(60));
+        let long_ago = 1_000;
+        h.fail_since_ms.store(long_ago, Ordering::Relaxed);
+        h.last_fail_ms.store(long_ago, Ordering::Relaxed);
+        assert!(
+            !h.write_failing_for(Duration::ZERO),
+            "窗口过期 = 空闲，不是停死"
+        );
+    }
+
+    #[test]
+    fn a_repeatedly_failing_link_is_still_detected() {
+        // 真停死：起点很久以前，但一直在失败，最后一次失败就发生在刚才。
+        let h = aged(Duration::from_secs(60));
+        h.fail_since_ms.store(1_000, Ordering::Relaxed);
+        h.last_fail_ms.store(59_000, Ordering::Relaxed);
+        assert!(
+            h.write_failing_for(STALL_TIMEOUT),
+            "有流量时失败会不断刷新新鲜度"
         );
     }
 

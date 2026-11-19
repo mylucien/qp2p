@@ -578,6 +578,16 @@ struct RenewPlan {
     switch_detected: bool,
 }
 
+/// 这一轮该重绑、却被在途打洞拦下了吗？
+///
+/// `all_lost` 是"原本有直连、这一轮一条不剩"的单轮脉冲：会话循环靠 `had_links`
+/// 的跳变识别它，一旦把这个跳变消费掉，下一轮就再也报不出来。所以被推迟时
+/// 必须保留，等打洞结束再报。否则换网自愈会退化成等 `worst_streak`（监听侧
+/// 永远为 0，因为它不拨号）、`stun_misses` 或 600 秒兜底。
+fn renew_deferred(all_lost: bool, punching: usize) -> bool {
+    all_lost && punching > 0
+}
+
 /// 要不要重绑端口 + 重探 STUN。
 ///
 /// **`renew()` 会关闭端点，所有直连一起断**，所以只要还有活链路就绝不能走这条路。
@@ -594,7 +604,8 @@ fn plan_renew(i: &RenewInputs) -> RenewPlan {
     }
     // 有打洞在跑：`renew()` 会关端点，把正在打的这条一起关掉；而且它要写锁、
     // 打洞持读锁，双方互等会把会话循环卡住最长一个打洞窗口（监听侧 35 秒）。
-    // 推迟一轮没有代价——打洞本身就是"正在尝试恢复连通"。
+    // 推迟没有代价——打洞本身就是"正在尝试恢复连通"，而且 `all_lost` 这种
+    // 单轮脉冲会由 [`renew_deferred`] 留到下一轮再报，不会被吞掉。
     if i.punching > 0 {
         return none;
     }
@@ -1014,20 +1025,22 @@ impl Session {
                                         );
                                         return;
                                     };
-                                    // 新请求会 fire 旧槽位：旧任务在 select 里醒来，
+                                    // 新请求会 fire 旧槽位：旧任务在打洞窗口里醒来，
                                     // 把端点让给新候选，而不是占着 node_id 空转 35 秒。
-                                    let cancel = slot.cancel_handle();
-                                    tokio::select! {
-                                        _ = answer_punch(
-                                            engine, peers, mesh, notify, punching, from, label, ip,
-                                            addrs,
-                                        ) => {}
-                                        _ = cancel.cancelled() => {
-                                            tracing::debug!(
-                                                "[session] {key} 换了新候选，放弃上一次应答"
-                                            );
-                                        }
-                                    }
+                                    // 取消只覆盖打洞本身，`on_connected` 一旦开始就不可取消。
+                                    answer_punch(
+                                        engine,
+                                        peers,
+                                        mesh,
+                                        notify,
+                                        punching,
+                                        from,
+                                        label,
+                                        ip,
+                                        addrs,
+                                        slot.cancel_handle(),
+                                    )
+                                    .await;
                                 });
                             }
                             "peer_online" => {
@@ -1211,7 +1224,13 @@ impl Session {
             };
             // 空闲休眠造成的断开是有意的，不能当成换网去重绑端口
             let all_lost = !sleeping && had_links && live == 0;
-            had_links = live > 0 && !sleeping;
+            let punching = self.punching.load(Ordering::Relaxed);
+            // 被在途打洞推迟的这一轮**不能**把 `all_lost` 消费掉：它只在一跳为真，
+            // 清掉 `had_links` 之后就再也没有第二次，只能等 3 次拨号失败 / 3 次
+            // STUN 无回应 / 600 秒兜底——而监听侧根本不拨号，`worst_streak` 恒为 0。
+            if !renew_deferred(all_lost, punching) {
+                had_links = live > 0 && !sleeping;
+            }
             let stun_misses = self.engine.read().await.stun_misses();
             let plan = plan_renew(&RenewInputs {
                 live,
@@ -1220,7 +1239,7 @@ impl Session {
                 sleeping,
                 since_renew: last_renew.elapsed(),
                 stun_misses,
-                punching: self.punching.load(Ordering::Relaxed),
+                punching,
             });
             let mut force_register = need_register;
             if plan.clear_backoff {
@@ -1424,6 +1443,7 @@ async fn answer_punch(
     label: String,
     ip: Option<Ipv4Addr>,
     addrs: Vec<SocketAddr>,
+    cancel: Arc<Answer>,
 ) {
     if addrs.is_empty() {
         return;
@@ -1456,15 +1476,25 @@ async fn answer_punch(
     let _punching = PunchGuard::enter(&punching);
 
     let result = {
-        let engine = engine.read().await;
-        engine
-            .punch_as(
-                &addrs,
-                Role::Listener,
-                Engine::attempt_timeout(Role::Listener),
-                Some(from.clone()),
-            )
-            .await
+        // 取消只包住打洞窗口：`on_connected` 半路被丢弃会留下"表里连着、mesh 里
+        // 没有"（或者 attach 了却没挂 closed 监视）的半截状态，还得靠下一轮对账兜。
+        tokio::select! {
+            result = async {
+                let engine = engine.read().await;
+                engine
+                    .punch_as(
+                        &addrs,
+                        Role::Listener,
+                        Engine::attempt_timeout(Role::Listener),
+                        Some(from.clone()),
+                    )
+                    .await
+            } => result,
+            _ = cancel.cancelled() => {
+                tracing::debug!("[session] {label} 换了新候选，放弃上一次应答");
+                return;
+            }
+        }
     };
 
     match result {
@@ -1894,6 +1924,28 @@ mod tests {
             stun_misses: 0,
             punching: 0,
         }
+    }
+
+    #[test]
+    fn a_deferred_network_switch_is_reported_again_next_round() {
+        // 回归：`all_lost` 只在一跳为真。旧版本不管有没有被推迟都清掉
+        // `had_links`，于是"换网那一刻恰好有应答在途"会把自愈退化成等
+        // 3 次 STUN 无回应或 600 秒兜底。
+        let mut had_links = true;
+        let mut reported = Vec::new();
+        for punching in [1usize, 1, 0] {
+            let live = 0;
+            let all_lost = had_links && live == 0;
+            if !renew_deferred(all_lost, punching) {
+                had_links = live > 0;
+            }
+            reported.push(all_lost);
+        }
+        assert_eq!(
+            reported,
+            [true, true, true],
+            "打洞结束后必须还能再报出一次全断"
+        );
     }
 
     #[test]
