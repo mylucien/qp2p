@@ -1424,24 +1424,24 @@ mod tests {
         // 我是 a、对端是 b：a 拨的那条赢
         assert_eq!(
             duplicate_keeps_new(true, false, "a", "b"),
-            Some(true),
-            "新的是我拨的，我 id 小 → 新赢"
+            Some(false),
+            "新的是对端(b)拨的，b 的 id 更大 → 旧的（我 a 拨的）赢"
         );
         assert_eq!(
             duplicate_keeps_new(false, true, "a", "b"),
-            Some(false),
-            "新的是对端拨的 → 旧赢"
+            Some(true),
+            "新的是我(a)拨的，我 id 小 → 新赢"
         );
         // 我是 b、对端是 a：仍然是 a 拨的那条赢
         assert_eq!(
             duplicate_keeps_new(false, true, "b", "a"),
-            Some(true),
-            "新的是对端(a)拨的 → 新赢"
+            Some(false),
+            "新的是我(b)拨的，b 的 id 更大 → 旧的（对端 a 拨的）赢"
         );
         assert_eq!(
             duplicate_keeps_new(true, false, "b", "a"),
-            Some(false),
-            "新的是我(b)拨的 → 旧赢"
+            Some(true),
+            "新的是对端(a)拨的，a 的 id 小 → 新赢"
         );
         // 同端并发拨号：规则分不出胜负，退回后到顶替
         assert_eq!(duplicate_keeps_new(true, true, "a", "b"), None);
