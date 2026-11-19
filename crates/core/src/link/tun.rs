@@ -1448,11 +1448,14 @@ mod tests {
         assert_eq!(duplicate_keeps_new(false, false, "a", "b"), None);
     }
 
+    /// 一次 attach：到达时刻、连接编号（1 = A 拨，2 = B 拨）、是不是本机拨的。
+    type Event = (f64, u8, bool);
+
     /// 模拟一端按到达顺序挂两条重复连接，返回最后留下的那条（1 = A 拨，2 = B 拨）。
     ///
     /// `dedupe = false` 等价于旧版本：永远后到顶替。没有年龄窗口，
     /// 所以只需要到达顺序，不需要时间差。
-    fn run_side(events: &[(f64, u8, bool)], my_smaller: bool, dedupe: bool) -> u8 {
+    fn run_side(events: &[Event], my_smaller: bool, dedupe: bool) -> u8 {
         let (my_id, peer_id) = if my_smaller { ("a", "b") } else { ("b", "a") };
         let mut table: Option<(u8, bool)> = None;
         for &(_, conn, dialed_by_us) in events {
@@ -1477,7 +1480,7 @@ mod tests {
 
     /// 两端拨号起点相差 Δ，A 拨 C1、B 拨 C2。A 挂 C1 的时刻记作 0，
     /// 则 A 挂 C2 在 Δ+d、B 挂 C2 在 Δ、B 挂 C1 在 d（d = 单程时延）。
-    fn phase_events(delta: f64, d: f64) -> (Vec<(f64, u8, bool)>, Vec<(f64, u8, bool)>) {
+    fn phase_events(delta: f64, d: f64) -> (Vec<Event>, Vec<Event>) {
         let mut a = vec![(0.0f64, 1u8, true), (delta + d, 2u8, false)];
         let mut b = vec![(delta, 2u8, true), (d, 1u8, false)];
         a.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());

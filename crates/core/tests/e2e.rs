@@ -503,7 +503,9 @@ async fn ip_and_tcp_streams_share_one_connection() {
     let (to_tun, mut packets) = mpsc::channel(16);
     let links = MeshLinks::new(to_tun, vec![echo]);
     let peer_ip: std::net::Ipv4Addr = "10.99.0.2".parse().unwrap();
-    links.attach(peer_ip, listener.clone()).await;
+    links
+        .attach(peer_ip, listener.clone(), "self", "peer", false)
+        .await;
     // 给接流循环一点时间挂上
     tokio::time::sleep(Duration::from_millis(100)).await;
 
