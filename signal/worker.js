@@ -15,7 +15,7 @@
  *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
-const VERSION = "2.8.4";
+const VERSION = "2.8.5";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
