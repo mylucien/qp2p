@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -567,6 +567,8 @@ struct RenewInputs {
     sleeping: bool,
     since_renew: Duration,
     stun_misses: u32,
+    /// 在途的打洞任务数
+    punching: usize,
 }
 
 struct RenewPlan {
@@ -588,6 +590,12 @@ fn plan_renew(i: &RenewInputs) -> RenewPlan {
         switch_detected: false,
     };
     if i.live > 0 {
+        return none;
+    }
+    // 有打洞在跑：`renew()` 会关端点，把正在打的这条一起关掉；而且它要写锁、
+    // 打洞持读锁，双方互等会把会话循环卡住最长一个打洞窗口（监听侧 35 秒）。
+    // 推迟一轮没有代价——打洞本身就是"正在尝试恢复连通"。
+    if i.punching > 0 {
         return none;
     }
     let trigger = i.all_lost
@@ -615,32 +623,126 @@ pub struct Session {
     ///
     /// 服务端可能为同一个对端连着推两条 `punch_request`。两个监听任务会在
     /// 同一个端点上各抢一条连接，后建的那条把先建的顶掉——表现为"连上就断"。
-    answers: Arc<std::sync::Mutex<HashSet<String>>>,
+    answers: Arc<std::sync::Mutex<HashMap<String, Answer>>>,
+    /// 在途的打洞任务数（拨号 + 应答）。
+    ///
+    /// `renew()` 会关掉端点，正在打的这条会被一起关掉；而且它要写锁、打洞
+    /// 要读锁，双方互等会把会话循环卡住最长一个打洞窗口（监听侧 35 秒）。
+    /// 所以有打洞在跑就跳过这一轮重绑，下一轮再看。
+    punching: Arc<AtomicUsize>,
+}
+
+/// 在途打洞的 RAII 计数。drop 时自动减一，panic / 提前 return 都不会漏。
+struct PunchGuard(Arc<AtomicUsize>);
+
+impl PunchGuard {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for PunchGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 一次应答任务的取消开关。
+///
+/// 对端换了网会带着新候选再发一次 `punch_request`，而旧的应答任务还占着
+/// 那个 node_id（最长 35 秒），旧候选已经打不通了。新请求要能把旧的叫停，
+/// 而不是被"已经在应答"挡回去。
+struct Answer {
+    /// 这一轮用的候选，排序后拼成的字符串：用来判断"换网了没有"
+    sig: String,
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Answer {
+    fn new(sig: &str) -> Self {
+        Self {
+            sig: sig.to_string(),
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn fire(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn fired(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 等自己被取消；已经取消过就立即返回。
+    async fn cancelled(&self) {
+        // 先注册等待者、再检查标志。反过来的话，检查与注册之间来的
+        // `notify_waiters` 会丢失，任务就得一直睡到打洞超时。
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// 一次"我来应答"的占用。Drop 时释放，保证异常路径也不会把对端永久锁死。
 struct AnswerSlot {
-    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    set: Arc<std::sync::Mutex<HashMap<String, Answer>>>,
     key: String,
+    /// 自己的开关。Drop 时只摘自己那一条——旧任务被取消时，
+    /// 表里已经是接手的新任务了，不能把它一起摘掉。
+    me: Arc<Answer>,
+}
+
+impl AnswerSlot {
+    fn cancel_handle(&self) -> Arc<Answer> {
+        self.me.clone()
+    }
 }
 
 impl Drop for AnswerSlot {
     fn drop(&mut self) {
         if let Ok(mut set) = self.set.lock() {
-            set.remove(&self.key);
+            let mine = set.get(&self.key).is_some_and(|a| Arc::ptr_eq(a, &self.me));
+            if mine {
+                set.remove(&self.key);
+            }
         }
     }
 }
 
-/// 抢占某个对端的应答权；返回 None 表示已经有人在应答它了。
-fn claim_answer(set: &Arc<std::sync::Mutex<HashSet<String>>>, key: &str) -> Option<AnswerSlot> {
+/// 抢占某个对端的应答权。
+///
+/// - 没人在应答：占住。
+/// - 已经有人在应答、候选**没变**：返回 None。服务端偶尔会为同一批候选
+///   连推两条，重复打一遍只会互相顶掉。
+/// - 已经有人在应答、候选**变了**：叫停旧的，自己接手（对端换网了）。
+fn claim_answer(
+    set: &Arc<std::sync::Mutex<HashMap<String, Answer>>>,
+    key: &str,
+    sig: &str,
+) -> Option<AnswerSlot> {
     let mut guard = set.lock().ok()?;
-    if !guard.insert(key.to_string()) {
-        return None;
+    if let Some(old) = guard.get(key) {
+        if old.sig == sig {
+            return None;
+        }
+        old.fire();
+        tracing::debug!("[session] 对端 {key} 的候选变了，取消上一次应答");
     }
+    let me = Arc::new(Answer::new(sig));
+    guard.insert(key.to_string(), me.clone());
     Some(AnswerSlot {
         set: set.clone(),
         key: key.to_string(),
+        me,
     })
 }
 
@@ -659,7 +761,8 @@ impl Session {
             peers,
             notify,
             stop: Arc::new(AtomicBool::new(false)),
-            answers: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            answers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            punching: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -890,18 +993,39 @@ impl Session {
                                 let mesh = self.mesh.clone();
                                 let notify = self.notify.clone();
                                 let answers = self.answers.clone();
+                                let punching = self.punching.clone();
                                 let key = from.to_string();
+                                // 候选签名：同一批候选的重复请求要跳过，
+                                // 换网后的新候选要能把旧应答叫停。
+                                let sig = {
+                                    let mut v = addrs.clone();
+                                    v.sort();
+                                    v.iter()
+                                        .map(|a| a.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                };
                                 tokio::spawn(async move {
-                                    let Some(_slot) = claim_answer(&answers, &key) else {
+                                    let Some(slot) = claim_answer(&answers, &key, &sig) else {
                                         tracing::debug!(
-                                            "[session] 已经在应答 {key}，跳过重复的 punch_request"
+                                            "[session] 已经在应答 {key}（候选未变），跳过重复的 punch_request"
                                         );
                                         return;
                                     };
-                                    answer_punch(
-                                        engine, peers, mesh, notify, from, label, ip, addrs,
-                                    )
-                                    .await;
+                                    // 新请求会 fire 旧槽位：旧任务在 select 里醒来，
+                                    // 把端点让给新候选，而不是占着 node_id 空转 35 秒。
+                                    let cancel = slot.cancel_handle();
+                                    tokio::select! {
+                                        _ = answer_punch(
+                                            engine, peers, mesh, notify, punching, from, label, ip,
+                                            addrs,
+                                        ) => {}
+                                        _ = cancel.cancelled() => {
+                                            tracing::debug!(
+                                                "[session] {key} 换了新候选，放弃上一次应答"
+                                            );
+                                        }
+                                    }
                                 });
                             }
                             "peer_online" => {
@@ -1060,6 +1184,7 @@ impl Session {
                     &self.peers,
                     &self.mesh,
                     &self.notify,
+                    &self.punching,
                     forced.take(),
                     my_symmetric,
                 )
@@ -1093,6 +1218,7 @@ impl Session {
                 sleeping,
                 since_renew: last_renew.elapsed(),
                 stun_misses,
+                punching: self.punching.load(Ordering::Relaxed),
             });
             let mut force_register = need_register;
             if plan.clear_backoff {
@@ -1102,28 +1228,42 @@ impl Session {
                 }
             }
             if plan.renew {
-                last_renew = Instant::now();
-                let renewed = {
-                    let mut guard = self.engine.write().await;
-                    guard.renew().await
+                let mut guard = self.engine.write().await;
+                // 排队等锁期间可能刚有一条直连 attach 上来（打洞任务先释放了
+                // 读锁）。这时重绑会把刚建好的连接一起关掉，两端都看到
+                // `ApplicationClosed("renew")`——而这次重绑本来就是"一条都
+                // 没有"才发起的，既然有了就不必了。
+                let attached = match self.mesh.as_ref() {
+                    Some(mesh) => mesh.peer_count().await,
+                    None => 0,
                 };
-                match renewed {
-                    Ok(()) => {
-                        tracing::info!("[session] 端点已刷新（换网或长时间不通）");
-                        if plan.switch_detected {
-                            self.notify
-                                .say("· 网络可能变了：已重新探测公网地址，正在重报");
+                if attached > 0 {
+                    tracing::info!(
+                        "[session] 跳过刷新端点：等锁期间已有 {attached} 条直连，重绑会打断它们"
+                    );
+                } else {
+                    last_renew = Instant::now();
+                    let renewed = guard.renew().await;
+                    // 下面要读 generation，先把写锁放掉，否则自己把自己锁死
+                    drop(guard);
+                    match renewed {
+                        Ok(()) => {
+                            tracing::info!("[session] 端点已刷新（换网或长时间不通）");
+                            if plan.switch_detected {
+                                self.notify
+                                    .say("· 网络可能变了：已重新探测公网地址，正在重报");
+                            }
+                            // 换了端口就必须立刻上报，否则对端还拿着旧地址打空炮
+                            force_register = true;
+                            hot_until = Instant::now() + HOT_WINDOW;
+                            // renew 之后 generation 会变，这里先对齐，免得下一轮重复登记
+                            seen_generation = self.engine.read().await.stun_generation();
                         }
-                        // 换了端口就必须立刻上报，否则对端还拿着旧地址打空炮
-                        force_register = true;
-                        hot_until = Instant::now() + HOT_WINDOW;
-                        // renew 之后 generation 会变，这里先对齐，免得下一轮重复登记
-                        seen_generation = self.engine.read().await.stun_generation();
-                    }
-                    Err(e) => {
-                        tracing::debug!("[session] 端点刷新失败: {e:#}");
-                        // 没换成就没必要强制登记；定时登记照旧
-                        force_register = need_register;
+                        Err(e) => {
+                            tracing::debug!("[session] 端点刷新失败: {e:#}");
+                            // 没换成就没必要强制登记；定时登记照旧
+                            force_register = need_register;
+                        }
                     }
                 }
             }
@@ -1277,6 +1417,7 @@ async fn answer_punch(
     peers: SharedPeers,
     mesh: Option<Arc<MeshLinks>>,
     notify: Notify,
+    punching: Arc<AtomicUsize>,
     from: NodeId,
     label: String,
     ip: Option<Ipv4Addr>,
@@ -1308,6 +1449,10 @@ async fn answer_punch(
         tracing::info!("[session] {label} 请求重新打洞（本机已摘掉那条直连），照它说的办");
     }
 
+    // 从这里到函数结束都算"在途打洞"：`on_connected` 里的 attach 也要在
+    // 计数内，否则 renew 可能在 attach 前拿到写锁，把刚建好的连接关掉。
+    let _punching = PunchGuard::enter(&punching);
+
     let result = {
         let engine = engine.read().await;
         engine
@@ -1336,6 +1481,7 @@ async fn dial_round(
     peers: &SharedPeers,
     mesh: &Option<Arc<MeshLinks>>,
     notify: &Notify,
+    punching: &Arc<AtomicUsize>,
     force: Option<Ipv4Addr>,
     my_symmetric: bool,
 ) {
@@ -1370,6 +1516,7 @@ async fn dial_round(
         let peers = peers.clone();
         let mesh = mesh.clone();
         let notify = notify.clone();
+        let punching = punching.clone();
 
         // 每个对端一个任务：撮合是 HTTP，打洞要几十秒，串行会把整轮拖长
         tokio::spawn(async move {
@@ -1405,6 +1552,9 @@ async fn dial_round(
                 return;
             }
             let ip = reply.target_virtual_ip.parse::<Ipv4Addr>().ok();
+
+            // 从这里到任务结束都算"在途打洞"，`on_connected` 的 attach 也在内
+            let _punching = PunchGuard::enter(&punching);
 
             let result = {
                 let engine = engine.read().await;
@@ -1740,7 +1890,56 @@ mod tests {
             sleeping: false,
             since_renew: Duration::from_secs(120),
             stun_misses: 0,
+            punching: 0,
         }
+    }
+
+    #[test]
+    fn renew_waits_while_a_punch_is_in_flight() {
+        // 黑洞摘除后 live 归零，正常情况下会立刻重绑；但只要还有打洞在跑，
+        // 重绑就会把正在建立的连接一起关掉，还会把会话循环卡在写锁上。
+        let base = RenewInputs {
+            live: 0,
+            all_lost: true,
+            ..renew_inputs()
+        };
+        assert!(plan_renew(&base).renew, "没有打洞时该重绑");
+        let busy = RenewInputs {
+            punching: 1,
+            ..base
+        };
+        assert!(!plan_renew(&busy).renew, "有打洞在跑就推迟一轮");
+    }
+
+    #[test]
+    fn answer_slot_skips_duplicates_but_lets_new_candidates_in() {
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let old = claim_answer(&set, "node-a", "1.1.1.1:1000").expect("第一次应答");
+
+        // 服务端连推两条同样的 request：跳过，别再打一遍
+        assert!(
+            claim_answer(&set, "node-a", "1.1.1.1:1000").is_none(),
+            "候选没变就该跳过"
+        );
+
+        // 对端换网：新候选要能接手，旧任务被叫停
+        let new = claim_answer(&set, "node-a", "2.2.2.2:2000").expect("新候选要能接手");
+        assert!(old.cancel_handle().fired(), "旧应答必须被取消");
+        assert!(!new.cancel_handle().fired(), "新应答不能被自己取消");
+
+        // 旧任务的 Drop 不能把接手的新槽位一起摘掉
+        drop(old);
+        assert!(
+            claim_answer(&set, "node-a", "2.2.2.2:2000").is_none(),
+            "新槽位还在，重复请求仍应跳过"
+        );
+
+        // 新任务收尾后才真正释放
+        drop(new);
+        assert!(
+            claim_answer(&set, "node-a", "2.2.2.2:2000").is_some(),
+            "槽位释放后应能重新占用"
+        );
     }
 
     #[test]

@@ -424,6 +424,17 @@ async fn listen_with_probes(
     };
     tokio::pin!(accept_loop);
 
+    // 每 300ms 对候选各发一个"用后即弃"的 Initial，只为把本侧 NAT 的孔撑开。
+    //
+    // 这段是**冗余的**：`Engine::punch_as` 无论什么角色都已经在用 keepalive
+    // socket（端点 socket 的 try_clone，同端口）发裸 UDP 探针，NAT 孔是等价的。
+    // 之所以留着：一是不依赖上层一定调过 spawn_probe，二是删掉前应当先在
+    // 严格 NAT / 对称 NAT 环境实测（尤其是 Windows 的锥形 NAT 实现差异）。
+    //
+    // 有一点副作用：`Connecting` 被丢弃时 `ConnectionRef` 会 implicit_close，
+    // 对端如果此时也在 listener，会看到一条握手完成就关掉的连接，占住它的
+    // claim 大约一个 RTT。真实连接撞上会被 `another-winner` 拒掉，下个重试
+    // 周期就恢复——不值得为这点副作用保留更重的去重逻辑。
     let mut next_probe = Instant::now();
     loop {
         tokio::select! {

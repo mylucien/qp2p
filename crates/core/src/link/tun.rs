@@ -35,7 +35,8 @@
 //! - 我方发出了**需要对方回应**的帧（`frame_tx.stream + frame_tx.ping` 在涨），
 //!   而对端连续 [`PEER_SILENT`] 一个 UDP 包都没回（`udp_rx` 不动）→ 链路黑洞。
 //! - 流级只做"废掉这一条流"，不判连接死活：单帧写超过 [`WRITE_TIMEOUT`] 就
-//!   `reset`，主循环换一条新流继续；有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死。
+//!   `reset`，主循环换一条新流继续；连续 [`STALL_TIMEOUT`] 每一次写都失败才兜底
+//!   判死（对端 ACK 但不消费，连接级流控窗口关死）。
 //!
 //! ## 为什么不用"我方最近发过包 + 对端好久没回"
 //!
@@ -68,7 +69,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -98,7 +99,10 @@ const FLOW_QUEUE: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 新建双向流的上限。正常路径瞬时返回，只有流配额用尽才会等。
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
-/// 有包排队却这么久没写出一帧 → 整条连接的流控停死（兜底，正常判据是下面那条）。
+/// 连续写失败这么久 → 整条连接的流控停死（兜底，正常判据是下面那条）。
+///
+/// 判的是"从第一次写失败起，中间一次成功的写都没有"。不能用"积压 + 零进展"
+/// 代替：`FlowWriter::fail` 会把积压清账，下一个包入队又从零开始算。
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 我方发出了需要回应的帧，对端却这么久没有任何 UDP 回包 → 判死。
 ///
@@ -150,20 +154,36 @@ impl Activity {
 ///   [`PEER_SILENT`] 没回任何 UDP 包 → 黑洞。数据来自 `conn.stats()`，不额外
 ///   发探测包。
 /// - 流级（只废流，不判连接）：单帧写超过 [`WRITE_TIMEOUT`] 就换一条流；
-///   有积压却 [`STALL_TIMEOUT`] 零进展才兜底判死（对端在收但不消费）。
+///   连续 [`STALL_TIMEOUT`] 每一次写都失败才兜底判死（对端 ACK 但不消费）。
 ///
 /// "写成功"不能当判据：一条流被 reset 后，主循环立刻在同一条连接上开新流，
 /// 新流自带全新的流控额度，前几帧必然写成功——哪怕一帧都没出过网卡。
 struct PeerHealth {
     base: Instant,
-    /// 最后一次成功写完一帧；也用作停滞计时的起点
-    last_write_ms: AtomicU64,
-    /// 已入队、还没写完的帧数
-    pending: AtomicU32,
+    /// 连续写失败的起点，[`NO_FAIL`] 表示当前没有在失败。
+    ///
+    /// 单独记这个窗口，不复用"积压"：`FlowWriter::fail` 会把积压清账，
+    /// 下一个包入队又从零算起，`pending > 0 且 30 秒零进展` 这个组合
+    /// 在单流下永远凑不齐（多流并发时才偶尔成立）。
+    fail_since_ms: AtomicU64,
     /// 对端回包的采样状态（只有扫描线程读写）
     silence: std::sync::Mutex<Silence>,
     /// 已经判定失效（只告一次，避免多条流的 writer 同时触发重建）
     dead: AtomicBool,
+}
+
+/// `fail_since_ms` 的哨兵。`0` 是合法的时刻（连接刚建就失败），不能拿来当"没有失败"。
+const NO_FAIL: u64 = u64::MAX;
+
+/// 从 QUIC 统计里取出"对端必须回应"的发包计数。
+///
+/// 只算 `stream`（数据帧）和 `ping`（keepalive、PTO 探测、MTU 探测）——这两种
+/// 对端必须回 ACK。**不**算 `acks`：QUIC 不对纯 ACK 回 ACK，算进去就会在
+/// "我方只回了延迟 ACK"的时刻开出一张永远等不到回应的表，8 秒后误杀健康连接。
+///
+/// 抽成函数是为了能测：`observe_at` 的单测喂的是数字，测不到"取哪个计数"。
+fn needing_reply(stats: &quinn::ConnectionStats) -> u64 {
+    stats.frame_tx.stream + stats.frame_tx.ping
 }
 
 /// 对端回包的采样状态。
@@ -186,8 +206,7 @@ impl PeerHealth {
     fn new() -> Self {
         Self {
             base: Instant::now(),
-            last_write_ms: AtomicU64::new(0),
-            pending: AtomicU32::new(0),
+            fail_since_ms: AtomicU64::new(NO_FAIL),
             silence: std::sync::Mutex::new(Silence::default()),
             dead: AtomicBool::new(false),
         }
@@ -197,44 +216,19 @@ impl PeerHealth {
         self.base.elapsed().as_millis() as u64
     }
 
-    fn note_queued(&self) {
-        // 从"零积压"变成"有积压"时重启停滞计时。不重置的话，空闲很久之后
-        // 入队的第一个包会拿着几十秒前的旧时间戳，被扫描当成"停滞 30 秒"杀掉。
-        if self.pending.fetch_add(1, Ordering::Relaxed) == 0 {
-            self.last_write_ms.store(self.now_ms(), Ordering::Relaxed);
-        }
-    }
-
-    /// 扣回 `n` 个入队名额，防下溢。
-    ///
-    /// 用 `compare_exchange` 循环而不是 `fetch_update`：后者在新版 Rust 里
-    /// 被标成 deprecated（改名 `try_update`），而 `try_update` 在旧版工具链
-    /// 上还不存在——两个名字都会踩到一端，CAS 循环两边都兼容。
-    fn note_unqueued(&self, n: u32) {
-        if n == 0 {
-            return;
-        }
-        let mut cur = self.pending.load(Ordering::Relaxed);
-        loop {
-            let next = cur.saturating_sub(n);
-            if next == cur {
-                return;
-            }
-            match self.pending.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
     fn note_write_ok(&self) {
-        self.last_write_ms.store(self.now_ms(), Ordering::Relaxed);
-        self.note_unqueued(1);
+        // 写成功就清窗口。注意这会被"新流自带额度"骗一次：一条流 reset 后
+        // 新流前几帧必然写得出去。真正的兜底要等连接级流控窗口关死、
+        // 所有流都写不动时才开始计时——这正是这条判据能覆盖的场景。
+        self.fail_since_ms.store(NO_FAIL, Ordering::Relaxed);
+    }
+
+    /// 记一次写失败。只有第一个失败者能定起点，后来的失败不能把它往后推。
+    fn note_fail(&self) {
+        let now = self.now_ms();
+        let _ =
+            self.fail_since_ms
+                .compare_exchange(NO_FAIL, now, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// 采一次 QUIC 统计，判断对端是不是已经不理我们了。
@@ -284,19 +278,18 @@ impl PeerHealth {
         }
     }
 
-    /// 有积压，却超过 [`STALL_TIMEOUT`] 没有成功写出过一帧。
-    fn stalled(&self) -> bool {
-        self.stalled_after(STALL_TIMEOUT)
+    /// 连续写失败超过 [`STALL_TIMEOUT`]：每一条流都写不动，内层重传也没用。
+    ///
+    /// 覆盖"对端 ACK 但不消费"：那时连接级流控窗口会关死，所有流同时写不动，
+    /// 而 QUIC 还在回 ACK，连接级判据（对端不回包）不会触发。
+    fn write_failing(&self) -> bool {
+        self.write_failing_for(STALL_TIMEOUT)
     }
 
-    /// 同 [`Self::stalled`]，但可指定阈值（测试用短阈值，免得真等 30 秒）。
-    fn stalled_after(&self, limit: Duration) -> bool {
-        if self.pending.load(Ordering::Relaxed) == 0 {
-            return false;
-        }
-        self.now_ms()
-            .saturating_sub(self.last_write_ms.load(Ordering::Relaxed))
-            > limit.as_millis() as u64
+    /// 同 [`Self::write_failing`]，但可指定阈值（测试用短阈值，免得真等 30 秒）。
+    fn write_failing_for(&self, limit: Duration) -> bool {
+        let since = self.fail_since_ms.load(Ordering::Relaxed);
+        since != NO_FAIL && self.now_ms().saturating_sub(since) > limit.as_millis() as u64
     }
 
     /// 抢占式标记失效：只有第一个调用者拿到 true。
@@ -523,13 +516,13 @@ impl MeshLinks {
         if !removed {
             return;
         }
-        conn.close(0u32.into(), b"stalled");
+        conn.close(0u32.into(), b"unresponsive");
         tracing::warn!("[tun] 直连 {ip} 已失效（{reason}），准备重建");
         self.say(&format!("· 与 {ip} 的直连已失效，正在重建"));
         self.force_wake(ip).await;
     }
 
-    /// 扫描所有对端：对端不回包、或有积压长时间零进展的，摘表并重拨。
+    /// 扫描所有对端：对端不回包、或连续写失败的，摘表并重拨。
     ///
     /// 依赖主循环还活着——所以必须先有"主循环不许等网络"的改造，否则主循环
     /// 自己卡住，这个扫描再也不会跑。
@@ -545,13 +538,14 @@ impl MeshLinks {
                     // 连接级判据：我方发了需回应的帧、对端一个包都没回。
                     // 只算 stream + ping：纯 ACK 不需要对端回应，算进去会误杀
                     let stats = p.conn.stats();
-                    let asking = stats.frame_tx.stream + stats.frame_tx.ping;
-                    if p.health.observe(asking, stats.udp_rx.datagrams) {
+                    if p.health
+                        .observe(needing_reply(&stats), stats.udp_rx.datagrams)
+                    {
                         return Some((*ip, p.conn.clone(), "对端 8 秒没有回包"));
                     }
-                    // 兜底：对端在收包但不消费，流控彻底停死
-                    if p.health.stalled() {
-                        return Some((*ip, p.conn.clone(), "有包排队 30 秒写不出去"));
+                    // 兜底：对端在 ACK 但不消费，每一条流都写不动
+                    if p.health.write_failing() {
+                        return Some((*ip, p.conn.clone(), "连续 30 秒每次写都失败"));
                     }
                     None
                 })
@@ -749,21 +743,18 @@ async fn dispatch(
     let key = FlowKey::new(parsed.proto, parsed.src, dst, parsed.ports);
     let now = Instant::now();
     if flows.contains(&key) {
-        let (_, tx, health) = flows.get_mut(&key, now).expect("刚判断过存在");
-        health.note_queued();
+        let (_, tx, _) = flows.get_mut(&key, now).expect("刚判断过存在");
         match tx.try_send(packet) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(_)) => {
                 // 队列满说明这条流的写动作跟不上。丢包让内层 TCP 退避重传，
                 // 比让主循环等它强得多。
-                health.note_unqueued(1);
                 tracing::trace!("[tun] {key:?} 发送队列满，丢包");
                 return Ok(());
             }
             Err(TrySendError::Closed(back)) => {
                 // writer 已经退出了（写超时/出错）。这条流作废，下面重开一条，
                 // 把这个包挂在新的流上——不必等 TCP 重传。
-                health.note_unqueued(1);
                 flows.remove(&key);
                 packet = back;
             }
@@ -800,10 +791,7 @@ async fn dispatch(
         .run(),
     );
 
-    peer.health.note_queued();
-    if tx.try_send(packet).is_err() {
-        peer.health.note_unqueued(1);
-    }
+    let _ = tx.try_send(packet);
 
     if let Some((old, (_, old_tx, _))) = flows.insert(key, (peer.conn, tx, peer.health), now) {
         drop(old_tx);
@@ -892,17 +880,16 @@ impl FlowWriter {
         }
     }
 
-    /// 写不出去：清账、关流，等内层重传。
+    /// 写不出去：关流、记一笔失败，等内层重传。
     ///
     /// 这里**不判连接死活**——见 [`PeerHealth`] 的说明：写失败只说明这条流的
-    /// 额度用完了，不能推出对端已经不在线。
+    /// 额度用完了，不能推出对端已经不在线。连续失败到 [`STALL_TIMEOUT`]
+    /// 才由扫描统一判（[`PeerHealth::write_failing`]）。
     async fn fail(self, send: Option<&mut SendStream>) {
-        // 队列里还没写的 + 当前这一帧，都从积压里扣掉，别让它们继续顶着
-        let left = u32::try_from(self.rx.len()).unwrap_or(u32::MAX);
-        self.health.note_unqueued(left.saturating_add(1));
         if let Some(send) = send {
             let _ = send.reset(0u32.into());
         }
+        self.health.note_fail();
     }
 }
 
@@ -1000,39 +987,46 @@ async fn pump_stream(
 mod tests {
     use super::*;
 
-    #[test]
-    fn pending_never_underflows() {
-        let h = PeerHealth::new();
-        h.note_unqueued(5);
-        assert_eq!(h.pending.load(Ordering::Relaxed), 0);
+    // --- 连续写失败窗口（第三版的兜底判据） -------------------------------
 
-        h.note_queued();
-        h.note_write_ok();
-        assert_eq!(h.pending.load(Ordering::Relaxed), 0);
-        // 多扣几次也不能回到 u32::MAX
-        h.note_unqueued(3);
-        assert_eq!(h.pending.load(Ordering::Relaxed), 0);
+    #[test]
+    fn healthy_link_never_reports_write_failing() {
+        let h = PeerHealth::new();
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(!h.write_failing_for(Duration::ZERO), "从没失败过就不能判");
     }
 
     #[test]
-    fn no_pending_means_no_stall() {
+    fn continuous_write_failures_are_detected() {
         let h = PeerHealth::new();
-        // 从建立到现在一帧都没发过，但也没有包排队：不能判死
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(!h.stalled(), "没积压就不是停滞");
-    }
-
-    #[test]
-    fn queued_but_never_written_is_stalled() {
-        let h = PeerHealth::new();
-        h.note_queued();
+        h.note_fail();
         std::thread::sleep(Duration::from_millis(2));
-        // 有积压、零进展：阈值放到 0 就能立刻观测到
-        assert!(h.stalled_after(Duration::ZERO), "有积压且零进展就该判停滞");
+        // 阈值放到 0 就能立刻观测到：起点已经记下
+        assert!(
+            h.write_failing_for(Duration::ZERO),
+            "连续写失败超过阈值就该判死"
+        );
+    }
 
-        // 写成功一帧后积压清零，即使阈值是 0 也不能再报停滞
+    #[test]
+    fn late_failures_do_not_postpone_the_deadline() {
+        let h = PeerHealth::new();
+        h.note_fail();
+        std::thread::sleep(Duration::from_millis(2));
+        h.note_fail(); // 后来的失败不能把起点往后推
+        assert!(h.write_failing_for(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn one_successful_write_clears_the_window() {
+        let h = PeerHealth::new();
+        h.note_fail();
         h.note_write_ok();
-        assert!(!h.stalled_after(Duration::ZERO));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            !h.write_failing_for(Duration::ZERO),
+            "写成功过就不算连续失败"
+        );
     }
 
     #[test]
@@ -1125,6 +1119,22 @@ mod tests {
         }
     }
 
+    /// 调用处的取值口径：纯 ACK 不能让"需回应帧"计数增长。
+    ///
+    /// 上一条测的是状态机（喂的是数字），真正防住纯 ACK 的是"取哪个统计量"
+    /// 那一行。把调用处改回 `udp_tx.datagrams`、或把 `acks` 加进来，这条立刻失败。
+    #[test]
+    fn pure_ack_is_not_a_reply_demanding_frame() {
+        let mut stats = quinn::ConnectionStats::default();
+        stats.udp_tx.datagrams = 50; // 发了很多 UDP 包
+        stats.frame_tx.acks = 20; // 其中 20 帧是纯 ACK
+        assert_eq!(needing_reply(&stats), 0, "纯 ACK 不需要对端回应");
+
+        stats.frame_tx.stream = 3;
+        stats.frame_tx.ping = 1;
+        assert_eq!(needing_reply(&stats), 4, "数据帧 + PING 都要对端回 ACK");
+    }
+
     /// 6 秒抖动后恢复：开表后对端回包到达就清零，不能杀。
     #[test]
     fn jitter_that_recovers_is_not_killed() {
@@ -1188,19 +1198,5 @@ mod tests {
             rx += 2; // 对方的包我方能收到（对方的重传）
             assert!(!h.observe_at(tx, rx, t), "rx 在涨就不判死，这是设计取舍");
         }
-    }
-
-    /// 空闲很久之后入队的第一个包，不能被旧时间戳当成"停滞 30 秒"。
-    #[test]
-    fn first_packet_after_idle_is_not_stalled() {
-        let h = PeerHealth::new();
-        h.note_queued();
-        h.note_write_ok(); // 模拟很久以前写过一帧
-        std::thread::sleep(Duration::from_millis(5));
-        h.note_queued(); // 空闲之后第一个包入队：计时必须从这一刻重新开始
-        assert!(
-            !h.stalled_after(Duration::from_millis(1)),
-            "刚入队的包算停滞，会把健康连接杀掉"
-        );
     }
 }
