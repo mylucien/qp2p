@@ -588,6 +588,26 @@ fn renew_deferred(all_lost: bool, punching: usize) -> bool {
     all_lost && punching > 0
 }
 
+/// 算下一轮的 `had_links`。
+///
+/// 正常情况就是"这轮还有活链路吗"；但被在途打洞推迟的那一轮**不能**把
+/// `all_lost` 消费掉——它只在一跳为真，清掉之后再也没有第二次，自愈只能退化成
+/// 等 3 次拨号失败 / 3 次 STUN 无回应 / 600 秒兜底（监听侧不拨号，
+/// `worst_streak` 恒为 0）。所以推迟时保持原值，让下一轮再报一次。
+fn next_had_links(
+    prev: bool,
+    all_lost: bool,
+    live: usize,
+    sleeping: bool,
+    punching: usize,
+) -> bool {
+    if renew_deferred(all_lost, punching) {
+        prev
+    } else {
+        live > 0 && !sleeping
+    }
+}
+
 /// 要不要重绑端口 + 重探 STUN。
 ///
 /// **`renew()` 会关闭端点，所有直连一起断**，所以只要还有活链路就绝不能走这条路。
@@ -1225,12 +1245,7 @@ impl Session {
             // 空闲休眠造成的断开是有意的，不能当成换网去重绑端口
             let all_lost = !sleeping && had_links && live == 0;
             let punching = self.punching.load(Ordering::Relaxed);
-            // 被在途打洞推迟的这一轮**不能**把 `all_lost` 消费掉：它只在一跳为真，
-            // 清掉 `had_links` 之后就再也没有第二次，只能等 3 次拨号失败 / 3 次
-            // STUN 无回应 / 600 秒兜底——而监听侧根本不拨号，`worst_streak` 恒为 0。
-            if !renew_deferred(all_lost, punching) {
-                had_links = live > 0 && !sleeping;
-            }
+            had_links = next_had_links(had_links, all_lost, live, sleeping, punching);
             let stun_misses = self.engine.read().await.stun_misses();
             let plan = plan_renew(&RenewInputs {
                 live,
@@ -1931,14 +1946,16 @@ mod tests {
         // 回归：`all_lost` 只在一跳为真。旧版本不管有没有被推迟都清掉
         // `had_links`，于是"换网那一刻恰好有应答在途"会把自愈退化成等
         // 3 次 STUN 无回应或 600 秒兜底。
+        //
+        // 这里调的是主循环真正用的 `next_had_links`，不是三行逻辑的拷贝：
+        // 谁把它改回无条件清零，这条测试就会红。
         let mut had_links = true;
+        let sleeping = false;
         let mut reported = Vec::new();
         for punching in [1usize, 1, 0] {
             let live = 0;
-            let all_lost = had_links && live == 0;
-            if !renew_deferred(all_lost, punching) {
-                had_links = live > 0;
-            }
+            let all_lost = !sleeping && had_links && live == 0;
+            had_links = next_had_links(had_links, all_lost, live, sleeping, punching);
             reported.push(all_lost);
         }
         assert_eq!(
@@ -1946,6 +1963,10 @@ mod tests {
             [true, true, true],
             "打洞结束后必须还能再报出一次全断"
         );
+        // 没有被推迟时必须照常清零，否则每轮都会重报全断、反复重绑
+        assert!(!next_had_links(true, true, 0, false, 0));
+        // 还有活链路时不受影响
+        assert!(next_had_links(true, false, 2, false, 0));
     }
 
     #[test]

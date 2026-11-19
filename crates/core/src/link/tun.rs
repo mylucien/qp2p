@@ -240,9 +240,20 @@ impl PeerHealth {
 
     /// 记一次写失败。只有第一个失败者能定起点，后来的失败不能把它往后推；
     /// 但每次失败都要刷新"最近一次失败"，否则持续失败会被当成空闲。
+    ///
+    /// 起点唯一的例外是**过期**：上一个窗口已经作废（最近一次失败早于
+    /// [`STALL_GRACE`]）或已被写成功清掉时，这次失败要重新起表。否则
+    /// "t=1s 失败一次 → 空闲 300 秒 → t=300s 又瞬时失败一次"会让 1 秒前
+    /// 的旧起点当场满足 30 秒条件，把一条健康连接判死。
     fn note_fail(&self) {
         let now = self.now_ms();
+        let prev = self.last_fail_ms.load(Ordering::Relaxed);
         self.last_fail_ms.store(now, Ordering::Relaxed);
+        let expired = prev == NO_FAIL || now.saturating_sub(prev) > STALL_GRACE.as_millis() as u64;
+        if expired {
+            self.fail_since_ms.store(now, Ordering::Relaxed);
+            return;
+        }
         let _ =
             self.fail_since_ms
                 .compare_exchange(NO_FAIL, now, Ordering::Relaxed, Ordering::Relaxed);
@@ -313,6 +324,11 @@ impl PeerHealth {
             return false;
         }
         let last = self.last_fail_ms.load(Ordering::Relaxed);
+        if last == NO_FAIL {
+            // 读 since 之后、读 last 之前被 `note_write_ok` 清掉了：
+            // `now - NO_FAIL` 会饱和成 0，看起来像"刚刚失败过"，必须显式挡掉。
+            return false;
+        }
         let now = self.now_ms();
         // 窗口过期：这段时间根本没有写入尝试，判不了死
         if now.saturating_sub(last) > STALL_GRACE.as_millis() as u64 {
@@ -1088,6 +1104,35 @@ mod tests {
         assert!(
             h.write_failing_for(STALL_TIMEOUT),
             "有流量时失败会不断刷新新鲜度"
+        );
+    }
+
+    #[test]
+    fn a_failure_after_a_long_idle_period_restarts_the_window() {
+        // 回归：第 1 秒瞬时失败一次，之后 5 分钟没有任何写入；用户恢复使用后
+        // 又瞬时失败一次。起点必须重置成"现在"，否则旧起点直接满足 30 秒
+        // 条件，一条还在正常回 ACK 的连接被无故重建。
+        let h = aged(Duration::from_secs(300));
+        h.fail_since_ms.store(1_000, Ordering::Relaxed);
+        h.last_fail_ms.store(1_000, Ordering::Relaxed);
+        h.note_fail();
+        assert!(
+            !h.write_failing_for(STALL_TIMEOUT),
+            "过期窗口之后的第一次失败要重新起表"
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_the_grace_window_keeps_the_original_start() {
+        // 反向保证：窗口还新鲜时，后来的失败仍然不能把起点往后推，
+        // 否则持续失败会被无限续命、永远判不出来。
+        let h = aged(Duration::from_secs(4));
+        h.fail_since_ms.store(1_000, Ordering::Relaxed);
+        h.last_fail_ms.store(3_000, Ordering::Relaxed);
+        h.note_fail();
+        assert!(
+            h.write_failing_for(Duration::from_millis(1_500)),
+            "起点还是 1 秒前的那个，阈值 1.5 秒就该判死"
         );
     }
 
