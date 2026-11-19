@@ -623,7 +623,7 @@ pub struct Session {
     ///
     /// 服务端可能为同一个对端连着推两条 `punch_request`。两个监听任务会在
     /// 同一个端点上各抢一条连接，后建的那条把先建的顶掉——表现为"连上就断"。
-    answers: Arc<std::sync::Mutex<HashMap<String, Answer>>>,
+    answers: Arc<std::sync::Mutex<HashMap<String, Arc<Answer>>>>,
     /// 在途的打洞任务数（拨号 + 应答）。
     ///
     /// `renew()` 会关掉端点，正在打的这条会被一起关掉；而且它要写锁、打洞
@@ -694,7 +694,7 @@ impl Answer {
 
 /// 一次"我来应答"的占用。Drop 时释放，保证异常路径也不会把对端永久锁死。
 struct AnswerSlot {
-    set: Arc<std::sync::Mutex<HashMap<String, Answer>>>,
+    set: Arc<std::sync::Mutex<HashMap<String, Arc<Answer>>>>,
     key: String,
     /// 自己的开关。Drop 时只摘自己那一条——旧任务被取消时，
     /// 表里已经是接手的新任务了，不能把它一起摘掉。
@@ -725,7 +725,7 @@ impl Drop for AnswerSlot {
 ///   连推两条，重复打一遍只会互相顶掉。
 /// - 已经有人在应答、候选**变了**：叫停旧的，自己接手（对端换网了）。
 fn claim_answer(
-    set: &Arc<std::sync::Mutex<HashMap<String, Answer>>>,
+    set: &Arc<std::sync::Mutex<HashMap<String, Arc<Answer>>>>,
     key: &str,
     sig: &str,
 ) -> Option<AnswerSlot> {
