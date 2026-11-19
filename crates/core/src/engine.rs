@@ -80,13 +80,11 @@ pub struct Engine {
 /// `punch_as` 的 future 可能被上层 `select!` 直接丢弃（对端换网时，新的
 /// `punch_request` 会取消旧的应答）。这时 `JoinHandle` 只是分离、不会 abort，
 /// 探针会继续往旧候选发包到超时——监听侧最长 35 秒。用 Drop 兜底。
-struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
+        self.0.abort();
     }
 }
 
@@ -640,7 +638,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             flag.store(true, Ordering::SeqCst);
         });
-        drop(AbortOnDrop(Some(task)));
+        drop(AbortOnDrop(task));
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(!hit.load(Ordering::SeqCst), "取消后探针不该继续跑");
     }
