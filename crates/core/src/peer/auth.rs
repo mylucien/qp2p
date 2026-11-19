@@ -43,6 +43,13 @@ const CONCLUDE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const AUTH_TAG: &str = "QP2P-AUTH-3";
 
+/// 能力位：两端同时重拨时按"拨号方 node_id 较小"选边。
+///
+/// 老版本不认识这个字段——serde 默认忽略未知字段，它读到的就是 0。所以
+/// **不要**为了加能力位去升 [`AUTH_VERSION`]：那会让老客户端直接认证失败，
+/// 而这里要的恰恰是"不认识就退回旧行为"。
+pub const CAP_DEDUPE: u32 = 1;
+
 /// TLS keying material exporter 的标签与上下文。
 /// 两端必须一致；改了就要同时升 `AUTH_VERSION` 和 `AUTH_TAG`。
 const BINDING_LABEL: &[u8] = b"EXPORTER-qp2p-auth-v3";
@@ -54,6 +61,9 @@ struct Hello {
     node_id: String,
     pubkey: String,
     nonce: String,
+    /// 见 [`CAP_DEDUPE`]。老版本没有这个字段，缺省 0。
+    #[serde(default)]
+    caps: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +133,8 @@ impl std::error::Error for AuthError {}
 pub struct PeerIdentity {
     pub node_id: NodeId,
     pub pubkey: [u8; 32],
+    /// 对端声明的能力位，见 [`CAP_DEDUPE`]
+    pub caps: u32,
 }
 
 /// dialer 侧：开一条流发起认证，并校验对端。
@@ -145,6 +157,7 @@ pub async fn authenticate_dialer(
         node_id: identity.node_id().as_str().to_string(),
         pubkey: hex::encode(identity.public_key()),
         nonce: my_nonce.clone(),
+        caps: CAP_DEDUPE,
     };
     write_frame(&mut send, &hello)
         .await
@@ -252,6 +265,7 @@ pub async fn authenticate_listener(
         node_id: identity.node_id().as_str().to_string(),
         pubkey: hex::encode(identity.public_key()),
         nonce: my_nonce.clone(),
+        caps: CAP_DEDUPE,
     };
     write_frame(&mut send, &reply)
         .await
@@ -359,6 +373,7 @@ fn check_hello(hello: &Hello) -> Result<PeerIdentity> {
     Ok(PeerIdentity {
         node_id: claimed,
         pubkey,
+        caps: hello.caps,
     })
 }
 
@@ -456,7 +471,23 @@ mod tests {
         PeerIdentity {
             node_id: id.node_id(),
             pubkey: id.public_key(),
+            caps: 0,
         }
+    }
+
+    /// 老版本发来的 Hello 没有 `caps`：必须当成 0（不认识 = 不支持），
+    /// 而不是解析失败——解析失败会把老客户端直接挡在门外。
+    #[test]
+    fn hello_without_caps_is_an_old_peer() {
+        let id = Identity::generate();
+        let body = format!(
+            r#"{{"v":{AUTH_VERSION},"node_id":"{}","pubkey":"{}","nonce":"00"}}"#,
+            id.node_id(),
+            hex::encode(id.public_key())
+        );
+        let hello: Hello = serde_json::from_str(&body).expect("老格式必须能解析");
+        assert_eq!(hello.caps, 0);
+        assert!(check_hello(&hello).is_ok());
     }
 
     #[test]
@@ -479,6 +510,7 @@ mod tests {
             node_id: id.node_id().as_str().to_string(),
             pubkey: hex::encode(id.public_key()),
             nonce: "00".into(),
+            caps: CAP_DEDUPE,
         };
         assert!(check_hello(&ok).is_ok());
 
@@ -488,6 +520,7 @@ mod tests {
             node_id: id.node_id().as_str().to_string(),
             pubkey: hex::encode(other.public_key()),
             nonce: "00".into(),
+            caps: CAP_DEDUPE,
         };
         assert!(check_hello(&forged).is_err());
     }

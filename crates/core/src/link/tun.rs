@@ -74,7 +74,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use quinn::{Connection, ReadExactError, RecvStream, SendStream};
+use quinn::{Connection, ReadExactError, RecvStream, SendStream, Side};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::RwLock;
 
@@ -352,6 +352,49 @@ impl PeerHealth {
 struct MeshPeer {
     conn: Connection,
     health: Arc<PeerHealth>,
+    /// 这条是本机拨的还是对端拨的（`Connection::side()`），选边用
+    dialed_by_us: bool,
+    /// 对端在认证里声明了 [`crate::peer::auth::CAP_DEDUPE`]
+    dedupe: bool,
+}
+
+/// [`MeshLinks::attach`] 的结果。
+pub enum Attach {
+    /// 挂上了。`replaced` 是被顶掉的旧连接——调用方必须在**标记新连接之后**
+    /// 再关它，否则旧连接的 `closed()` 回调会抢在标记前匹配上当时的
+    /// `conn_id`，把 `connected` 短暂清成 false。
+    Accepted { replaced: Option<Connection> },
+    /// 输给了表里那条重复连接：调用方直接关掉这条，不要动状态。
+    Rejected,
+}
+
+/// 选边只在**两端都声明**了能力、且表里那条还活着时才生效。
+///
+/// 只升一端时必须整体退回旧行为：新版单方面选边、旧版仍旧"后到顶替"，
+/// 两者在很宽的相位区间里会选出不同的一条——那比升级前更糟（失败率从
+/// 个位数升到约一半）。
+fn dedupe_enabled(old_alive: bool, old_dedupe: bool, new_dedupe: bool) -> bool {
+    old_alive && old_dedupe && new_dedupe
+}
+
+/// 两条重复连接里该不该保留**新到的那条**。
+///
+/// 规则：**拨号方 node_id 较小**的那条赢。两端各自用同一个规则判断，不论
+/// 到达顺序如何都会留下同一条——这正是它比"后到顶替"强的地方。
+///
+/// `None` = 两条都是同一端拨的（同端并发拨号），规则分不出胜负，
+/// 退回"后到顶替"。
+fn duplicate_keeps_new(
+    old_dialed_by_us: bool,
+    new_dialed_by_us: bool,
+    my_id: &str,
+    peer_id: &str,
+) -> Option<bool> {
+    if old_dialed_by_us == new_dialed_by_us {
+        return None;
+    }
+    // 新连接是拨号方拨的 → 它赢当且仅当拨号方 id 更小
+    Some(new_dialed_by_us == (my_id < peer_id))
 }
 
 /// 用户可见提示的出口（"直连已失效，正在重建"）。
@@ -492,23 +535,70 @@ impl MeshLinks {
 
     /// 挂上一个刚打通的直连：开始接收它的入站包，断开时自动摘除。
     ///
-    /// 同一个虚拟 IP 已有旧连接时直接替换（对端重启或 NAT 重新映射都会这样），
-    /// 旧连接关掉即可——它的流会在写失败后自然淘汰。
-    pub async fn attach(self: &Arc<Self>, ip: Ipv4Addr, conn: Connection) {
-        let health = Arc::new(PeerHealth::new());
+    /// 同一个虚拟 IP 已有旧连接时直接替换（对端重启或 NAT 重新映射都会这样）。
+    /// 唯一的例外是**两端同时重拨**：它在同一时刻各建一条，如果不选边，
+    /// 两端会各留一条、又互相把对方那条关掉，直连全灭。所以两条都是新建立
+    /// 的重复连接时，按 [`duplicate_keeps_new`] 选边。
+    ///
+    /// 选边和插入必须在**同一个写锁**里完成：先只读判断、再单独插入的话，
+    /// 两个 `on_connected` 同时到达会各自看到"表里没有旧连接"，两条都留下。
+    ///
+    /// **没有年龄窗口**：任何一次打洞都是从"mesh 里没有这个对端"开始的
+    /// （`should_dial` 与 `answer_punch` 都先看 `connected`），所以走到这里时
+    /// 表里若已有一条，只可能是这次打洞期间新建立的重复连接。加窗口反而会在
+    /// 两端各自判定"是否新鲜"的边界上制造不对称，重新引入同类失败。
+    pub async fn attach(
+        self: &Arc<Self>,
+        ip: Ipv4Addr,
+        conn: Connection,
+        my_id: &str,
+        peer_id: &str,
+        dedupe: bool,
+    ) -> Attach {
+        let dialed_by_us = conn.side() == Side::Client;
         let peer = MeshPeer {
             conn: conn.clone(),
-            health: health.clone(),
+            health: Arc::new(PeerHealth::new()),
+            dialed_by_us,
+            dedupe,
         };
-        let old = { self.peers.write().await.insert(ip, peer) };
-        if let Some(old) = old {
-            if old.conn.stable_id() != conn.stable_id() {
-                tracing::debug!("[tun] {ip} 的连接已刷新，关闭旧连接");
-                old.health.mark_dead();
-                old.conn.close(0u32.into(), b"replaced");
-            }
-        }
 
+        let replaced = {
+            let mut peers = self.peers.write().await;
+            match peers.insert(ip, peer) {
+                None => None,
+                Some(old) => {
+                    // 同一条连接被重复挂上：把旧表项放回去，别重置它的健康统计
+                    if old.conn.stable_id() == conn.stable_id() {
+                        let _ = peers.insert(ip, old);
+                        return Attach::Accepted { replaced: None };
+                    }
+                    // 已经关掉的旧连接不是竞争者：两端"关连接"和"摘表"是两个
+                    // 监视任务，中间有极短的错位，别把新连接判给一条死连接。
+                    let old_alive = old.conn.close_reason().is_none();
+                    let verdict = if dedupe_enabled(old_alive, old.dedupe, dedupe) {
+                        duplicate_keeps_new(old.dialed_by_us, dialed_by_us, my_id, peer_id)
+                    } else {
+                        None
+                    };
+                    if verdict == Some(false) {
+                        // 输家：表项换回去，新连接交给调用方关掉
+                        let _ = peers.insert(ip, old);
+                        return Attach::Rejected;
+                    }
+                    tracing::debug!("[tun] {ip} 的连接已刷新，关闭旧连接");
+                    old.health.mark_dead();
+                    Some(old.conn)
+                }
+            }
+        };
+
+        self.spawn_reader(ip, conn);
+        Attach::Accepted { replaced }
+    }
+
+    /// 为刚挂上的连接起接收循环与摘表监视。
+    fn spawn_reader(self: &Arc<Self>, ip: Ipv4Addr, conn: Connection) {
         {
             let conn = conn.clone();
             let to_tun = self.to_tun.clone();
@@ -523,7 +613,7 @@ impl MeshLinks {
 
         // 断开后把表项清掉，否则新包会一直往死连接里塞
         let weak = Arc::downgrade(self);
-        let watch = conn.clone();
+        let watch = conn;
         tokio::spawn(async move {
             let reason = watch.closed().await;
             let Some(links) = weak.upgrade() else { return };
@@ -695,6 +785,9 @@ impl Route {
             Self::Single { conn, health } => Some(MeshPeer {
                 conn: conn.clone(),
                 health: health.clone(),
+                // 单连接模式不走 `attach`，选边相关的两个字段用不到
+                dialed_by_us: false,
+                dedupe: false,
             }),
             Self::Mesh(links) => links.conn_for(dst).await,
         }
@@ -1305,5 +1398,143 @@ mod tests {
             rx += 2; // 对方的包我方能收到（对方的重传）
             assert!(!h.observe_at(tx, rx, t), "rx 在涨就不判死，这是设计取舍");
         }
+    }
+
+    // ---- 两端同时重拨的选边 ----
+
+    #[test]
+    fn the_duplicate_rule_needs_both_sides_and_a_live_old_connection() {
+        assert!(dedupe_enabled(true, true, true));
+        assert!(
+            !dedupe_enabled(false, true, true),
+            "表里那条已经关了，它没有资格参与选边"
+        );
+        assert!(
+            !dedupe_enabled(true, false, true),
+            "表里那条是旧版本建的（对端没声明能力）"
+        );
+        assert!(
+            !dedupe_enabled(true, true, false),
+            "这次的对端没声明能力：单方面选边会让混版本更糟"
+        );
+    }
+
+    #[test]
+    fn the_smaller_dialer_wins_whichever_one_arrives_last() {
+        // 我是 a、对端是 b：a 拨的那条赢
+        assert_eq!(
+            duplicate_keeps_new(true, false, "a", "b"),
+            Some(true),
+            "新的是我拨的，我 id 小 → 新赢"
+        );
+        assert_eq!(
+            duplicate_keeps_new(false, true, "a", "b"),
+            Some(false),
+            "新的是对端拨的 → 旧赢"
+        );
+        // 我是 b、对端是 a：仍然是 a 拨的那条赢
+        assert_eq!(
+            duplicate_keeps_new(false, true, "b", "a"),
+            Some(true),
+            "新的是对端(a)拨的 → 新赢"
+        );
+        assert_eq!(
+            duplicate_keeps_new(true, false, "b", "a"),
+            Some(false),
+            "新的是我(b)拨的 → 旧赢"
+        );
+        // 同端并发拨号：规则分不出胜负，退回后到顶替
+        assert_eq!(duplicate_keeps_new(true, true, "a", "b"), None);
+        assert_eq!(duplicate_keeps_new(false, false, "a", "b"), None);
+    }
+
+    /// 模拟一端按到达顺序挂两条重复连接，返回最后留下的那条（1 = A 拨，2 = B 拨）。
+    ///
+    /// `dedupe = false` 等价于旧版本：永远后到顶替。没有年龄窗口，
+    /// 所以只需要到达顺序，不需要时间差。
+    fn run_side(events: &[(f64, u8, bool)], my_smaller: bool, dedupe: bool) -> u8 {
+        let (my_id, peer_id) = if my_smaller { ("a", "b") } else { ("b", "a") };
+        let mut table: Option<(u8, bool)> = None;
+        for &(_, conn, dialed_by_us) in events {
+            let Some((old_conn, old_dialed)) = table else {
+                table = Some((conn, dialed_by_us));
+                continue;
+            };
+            if old_conn == conn {
+                continue;
+            }
+            let keep_new = if dedupe {
+                duplicate_keeps_new(old_dialed, dialed_by_us, my_id, peer_id).unwrap_or(true)
+            } else {
+                true
+            };
+            if keep_new {
+                table = Some((conn, dialed_by_us));
+            }
+        }
+        table.map(|t| t.0).unwrap_or(0)
+    }
+
+    /// 两端拨号起点相差 Δ，A 拨 C1、B 拨 C2。A 挂 C1 的时刻记作 0，
+    /// 则 A 挂 C2 在 Δ+d、B 挂 C2 在 Δ、B 挂 C1 在 d（d = 单程时延）。
+    fn phase_events(delta: f64, d: f64) -> (Vec<(f64, u8, bool)>, Vec<(f64, u8, bool)>) {
+        let mut a = vec![(0.0f64, 1u8, true), (delta + d, 2u8, false)];
+        let mut b = vec![(delta, 2u8, true), (d, 1u8, false)];
+        a.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        b.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        (a, b)
+    }
+
+    #[test]
+    fn both_ends_keep_the_same_connection_at_every_phase() {
+        // Δ ∈ [-10s, 10s]、RTT 50ms~1s：两端都支持时，任何相位都必须收敛到同一条，
+        // 而且是"拨号方 node_id 较小"的那条。带年龄窗口的实现过不了这条：
+        // 窗口边界上一端按规则、另一端按后到顶替，会重新选出两条不同的。
+        for rtt_ms in [50i64, 100, 300, 600, 1000] {
+            let d = rtt_ms as f64 / 2000.0;
+            for step in -400..=400 {
+                let delta = 10.0 * step as f64 / 400.0;
+                for a_smaller in [true, false] {
+                    let (a, b) = phase_events(delta, d);
+                    let ka = run_side(&a, a_smaller, true);
+                    let kb = run_side(&b, !a_smaller, true);
+                    assert_eq!(ka, kb, "RTT={rtt_ms}ms Δ={delta:.2}s a_smaller={a_smaller}");
+                    assert_eq!(
+                        ka,
+                        if a_smaller { 1 } else { 2 },
+                        "留下的必须是拨号方 id 小的那条"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 混版本：两端都退回后到顶替，结果与升级前一致——并且确实有相位会失败。
+    ///
+    /// 这条测试的作用是钉住"为什么必须做能力协商"：只要有一端不声明能力，
+    /// 新版就不能单方面启用规则，否则失败率会从个位数升到约一半。
+    #[test]
+    fn without_the_capability_both_ends_fall_back_to_last_arrival() {
+        let d = 0.15; // RTT 300ms
+        let mut broken = 0;
+        let mut total = 0;
+        for step in -400..=400 {
+            let delta = 2.0 * step as f64 / 400.0;
+            for a_smaller in [true, false] {
+                let (a, b) = phase_events(delta, d);
+                total += 1;
+                if run_side(&a, a_smaller, false) != run_side(&b, !a_smaller, false) {
+                    broken += 1;
+                }
+            }
+        }
+        assert!(
+            broken > 0,
+            "关掉规则后必须还能复现互关：说明混版本只能靠能力协商兜住"
+        );
+        assert!(
+            broken * 100 / total < 20,
+            "旧行为的失败率应当是个位数（单程时延窗口），实际 {broken}/{total}"
+        );
     }
 }

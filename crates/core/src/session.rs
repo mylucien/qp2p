@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::engine::Engine;
 use crate::identity::{Identity, NodeId};
-use crate::link::tun::MeshLinks;
+use crate::link::tun::{Attach, MeshLinks};
+use crate::peer::punch::Punched;
 use crate::peer::Role;
 use crate::route::Cidr;
 use crate::signal::client::{Event, PeerInfo, SignalClient, SignalError};
@@ -1027,6 +1028,7 @@ impl Session {
                                 let notify = self.notify.clone();
                                 let answers = self.answers.clone();
                                 let punching = self.punching.clone();
+                                let my_id = node_id.to_string();
                                 let key = from.to_string();
                                 // 候选签名：同一批候选的重复请求要跳过，
                                 // 换网后的新候选要能把旧应答叫停。
@@ -1054,6 +1056,7 @@ impl Session {
                                         mesh,
                                         notify,
                                         punching,
+                                        my_id,
                                         from,
                                         label,
                                         ip,
@@ -1454,6 +1457,7 @@ async fn answer_punch(
     mesh: Option<Arc<MeshLinks>>,
     notify: Notify,
     punching: Arc<AtomicUsize>,
+    my_id: String,
     from: NodeId,
     label: String,
     ip: Option<Ipv4Addr>,
@@ -1513,7 +1517,7 @@ async fn answer_punch(
     };
 
     match result {
-        Ok(conn) => on_connected(&peers, &mesh, &notify, from, label, ip, conn).await,
+        Ok(punched) => on_connected(&peers, &mesh, &notify, &my_id, from, label, ip, punched).await,
         Err(e) => tracing::debug!("[session] 应答 {label} 的打洞失败: {e}"),
     }
 }
@@ -1553,6 +1557,7 @@ async fn dial_round(
         out
     };
 
+    let my_id = node_id.to_string();
     for (target_id, label, hopeless) in targets {
         let Some(target) = NodeId::parse(&target_id) else {
             continue;
@@ -1564,6 +1569,7 @@ async fn dial_round(
         let mesh = mesh.clone();
         let notify = notify.clone();
         let punching = punching.clone();
+        let my_id = my_id.clone();
 
         // 每个对端一个任务：撮合是 HTTP，打洞要几十秒，串行会把整轮拖长
         tokio::spawn(async move {
@@ -1616,7 +1622,9 @@ async fn dial_round(
             };
 
             match result {
-                Ok(conn) => on_connected(&peers, &mesh, &notify, target, label, ip, conn).await,
+                Ok(punched) => {
+                    on_connected(&peers, &mesh, &notify, &my_id, target, label, ip, punched).await
+                }
                 Err(e) => {
                     report_failure(
                         &peers,
@@ -1634,20 +1642,26 @@ async fn dial_round(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_connected(
     peers: &SharedPeers,
     mesh: &Option<Arc<MeshLinks>>,
     notify: &Notify,
+    my_id: &str,
     node_id: NodeId,
     label: String,
     ip: Option<Ipv4Addr>,
-    conn: quinn::Connection,
+    punched: Punched,
 ) {
+    let dedupe = punched.dedupe();
+    let conn = punched.conn;
+
+    // 1. 先只解析地址，不改状态：选边输了的话这条连接整个丢弃，
+    //    连 `connected` 都不该被它碰一下。
     let ip = {
         let mut table = peers.lock().await;
         match table.get_mut(node_id.as_str()) {
             Some(state) => {
-                state.mark_connected(conn.stable_id());
                 if ip.is_some() {
                     state.virtual_ip = ip;
                 }
@@ -1657,8 +1671,36 @@ async fn on_connected(
         }
     };
 
+    // 2. 选边 + 插入在 mesh 的同一个写锁里完成。两个 on_connected 同时到达时，
+    //    先只读判断再单独插入会让双方都看到"表里没有旧连接"，选边失效。
+    let mut replaced = None;
     if let (Some(mesh), Some(ip)) = (mesh, ip) {
-        mesh.attach(ip, conn.clone()).await;
+        match mesh
+            .attach(ip, conn.clone(), my_id, node_id.as_str(), dedupe)
+            .await
+        {
+            Attach::Accepted { replaced: old } => replaced = old,
+            Attach::Rejected => {
+                // 两端同时重拨，这条是输家。对端会独立算出同一个结论并留下赢家，
+                // 所以这里直接关掉，不碰状态、不报"连接断开"。
+                tracing::info!("[session] 与 {label} 的重复连接让位给另一条，丢弃这条");
+                conn.close(0u32.into(), b"duplicate");
+                return;
+            }
+        }
+    }
+
+    // 3. 先标记新连接，再关被顶掉的旧连接。反过来旧连接的 `closed()` 回调
+    //    可能抢在标记前拿到锁、匹配上当时的 `conn_id`，把 `connected`
+    //    短暂清成 false，主循环就会白拨一轮。
+    {
+        let mut table = peers.lock().await;
+        if let Some(state) = table.get_mut(node_id.as_str()) {
+            state.mark_connected(conn.stable_id());
+        }
+    }
+    if let Some(old) = replaced {
+        old.close(0u32.into(), b"replaced");
     }
 
     match ip {

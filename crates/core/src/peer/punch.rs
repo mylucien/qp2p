@@ -65,6 +65,22 @@ pub struct AuthHandles {
     pub expected: Option<NodeId>,
 }
 
+/// 打洞成功的产物：连接 + 对端在认证里声明的能力位。
+///
+/// 能力位必须一路带到 `on_connected`：两端同时重拨时按"拨号方 node_id 较小"
+/// 选边，只有在**双方都声明**支持时才允许启用，否则混版本会比现状更糟。
+pub struct Punched {
+    pub conn: Connection,
+    /// 见 [`auth::CAP_DEDUPE`]；没走认证时是 0（当作不支持）
+    pub caps: u32,
+}
+
+impl Punched {
+    pub fn dedupe(&self) -> bool {
+        self.caps & auth::CAP_DEDUPE != 0
+    }
+}
+
 /// 在给定时间内尝试建立直连。
 ///
 /// `timeout` 由调用方决定：dialer 短（十几秒），listener 长（几十秒），
@@ -76,7 +92,7 @@ pub async fn execute(
     role: Role,
     timeout: Duration,
     auth: Option<AuthHandles>,
-) -> Result<Connection, PunchError> {
+) -> Result<Punched, PunchError> {
     if candidates.is_empty() {
         return Err(PunchError::NoCandidates);
     }
@@ -115,13 +131,15 @@ impl AttemptError {
 ///
 /// 只有 [`AuthFailure::Identity`] 升级成 [`AttemptError::Auth`]（调用方会拉黑
 /// 这个候选）；读超时、连接被关一律是 `Transient`，下一轮还会再试。
+///
+/// 返回对端声明的能力位；没走认证（`handles` 为空）当作 0 = 不支持任何可选行为。
 async fn verify_peer(
     conn: &Connection,
     handles: &Option<AuthHandles>,
     dialer: bool,
-) -> std::result::Result<(), AttemptError> {
+) -> std::result::Result<u32, AttemptError> {
     let Some(handles) = handles else {
-        return Ok(());
+        return Ok(0);
     };
     let identity = &handles.identity;
     let expected = handles.expected.as_ref();
@@ -135,7 +153,7 @@ async fn verify_peer(
     match result {
         Ok(peer) => {
             tracing::info!("[punch] 对端认证通过 peer={}", peer.node_id);
-            Ok(())
+            Ok(peer.caps)
         }
         Err(e) => {
             let message = format!("对端认证失败: {e}");
@@ -155,7 +173,7 @@ async fn dial_all(
     candidates: &[SocketAddr],
     timeout: Duration,
     auth: Option<AuthHandles>,
-) -> Result<Connection, PunchError> {
+) -> Result<Punched, PunchError> {
     // 拨号方不接收入站：对端的探针会由端点的 accept 分发中心直接 refuse。
     // 以前这里自己起一条 drain 循环 close 掉入站连接，但它和同端点上别的
     // 监听任务抢的是同一个 accept 队列——它会顺手把本该给 B 的连接拿走关掉。
@@ -180,7 +198,7 @@ async fn dial_all(
         // 每个候选只发一条连接，让 QUIC 自己重传 Initial；
         // 以前每 150ms 新建一条，10 秒就是几百次握手，还会让两端各自
         // 选中不同的连接（已复现：一端拿到连接后立刻被对端关掉）。
-        let mut attempts: JoinSet<(SocketAddr, Result<Connection, AttemptError>)> = JoinSet::new();
+        let mut attempts: JoinSet<(SocketAddr, Result<Punched, AttemptError>)> = JoinSet::new();
         for addr in distinct.iter().filter(|a| !wrong_identity.contains(a)) {
             let endpoint = endpoint.clone();
             let addr = *addr;
@@ -246,7 +264,7 @@ async fn attempt_once(
     peer: SocketAddr,
     deadline: Instant,
     auth: Option<AuthHandles>,
-) -> Result<Connection, AttemptError> {
+) -> Result<Punched, AttemptError> {
     let connecting = endpoint
         .connect(peer, SERVER_NAME)
         .map_err(|e| AttemptError::Transient(format!("{peer}: 发起连接失败 {e}")))?;
@@ -266,12 +284,15 @@ async fn attempt_once(
         )));
     }
 
-    if let Err(e) = verify_peer(&conn, &auth, true).await {
-        conn.close(0u32.into(), b"auth-failed");
-        return Err(e.prefixed(peer));
-    }
+    let caps = match verify_peer(&conn, &auth, true).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            conn.close(0u32.into(), b"auth-failed");
+            return Err(e.prefixed(peer));
+        }
+    };
 
-    Ok(conn)
+    Ok(Punched { conn, caps })
 }
 
 /// dialer 侧：开一条流发 HELLO，等 listener 回 ACK。
@@ -323,7 +344,7 @@ async fn listen_with_probes(
     candidates: &[SocketAddr],
     timeout: Duration,
     auth: Option<AuthHandles>,
-) -> Result<Connection, PunchError> {
+) -> Result<Punched, PunchError> {
     let deadline = Instant::now() + timeout;
 
     // 按 IP 而不是 ip:port 过滤：NAT 重映射后端口会变，但 IP 不会。
@@ -335,7 +356,7 @@ async fn listen_with_probes(
         let mut sub = subscription;
         // 握手失败的**原因**要留下来：只报"超时"等于把最有用的信息扔了，
         // 用户看到的是"连不上"，实际是"对面身份不对"。
-        let mut handshakes: JoinSet<Result<Connection, String>> = JoinSet::new();
+        let mut handshakes: JoinSet<Result<Punched, String>> = JoinSet::new();
         let mut last_auth: Option<String> = None;
         // 窗口到点后仍在飞的握手的最晚收尾时刻。
         // 两端的窗口起点几乎不可能对齐（对端往往比我们晚上线），
@@ -348,9 +369,9 @@ async fn listen_with_probes(
                 // 并发握手：一个卡住的连接不能堵住真正的 dialer
                 joined = handshakes.join_next(), if !handshakes.is_empty() => {
                     match joined {
-                        Some(Ok(Ok(conn))) => {
+                        Some(Ok(Ok(punched))) => {
                             handshakes.abort_all();
-                            return Ok(conn);
+                            return Ok(punched);
                         }
                         Some(Ok(Err(msg))) => {
                             if !msg.is_empty() {
@@ -391,16 +412,19 @@ async fn listen_with_probes(
                             return Err(String::new());
                         }
                         // 认证失败要留下痕迹：否则有人在试探时，这一侧什么都看不到
-                        if let Err(e) = verify_peer(&conn, &auth, false).await {
-                            tracing::warn!(
-                                "[punch] 拒绝来自 {remote} 的连接：{}",
-                                e.message()
-                            );
-                            claim.store(false, Ordering::SeqCst);
-                            conn.close(0u32.into(), b"auth-failed");
-                            return Err(format!("{remote}: {}", e.message()));
-                        }
-                        Ok(conn)
+                        let caps = match verify_peer(&conn, &auth, false).await {
+                            Ok(caps) => caps,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[punch] 拒绝来自 {remote} 的连接：{}",
+                                    e.message()
+                                );
+                                claim.store(false, Ordering::SeqCst);
+                                conn.close(0u32.into(), b"auth-failed");
+                                return Err(format!("{remote}: {}", e.message()));
+                            }
+                        };
+                        Ok(Punched { conn, caps })
                     });
                 }
                 _ = tokio::time::sleep_until(wake) => {

@@ -446,8 +446,10 @@ impl Engine {
         role: Role,
         timeout: Duration,
     ) -> Result<Connection, punch::PunchError> {
-        self.punch_as(peers, role, timeout, self.expected_peer.clone())
-            .await
+        Ok(self
+            .punch_as(peers, role, timeout, self.expected_peer.clone())
+            .await?
+            .conn)
     }
 
     /// 同 [`Engine::punch`]，但本次调用单独指定"必须是对面这个 node_id"。
@@ -460,7 +462,7 @@ impl Engine {
         role: Role,
         timeout: Duration,
         expected: Option<NodeId>,
-    ) -> Result<Connection, punch::PunchError> {
+    ) -> Result<punch::Punched, punch::PunchError> {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return Err(punch::PunchError::Dial("端点不可用".to_string()));
         };
