@@ -674,6 +674,8 @@ impl Answer {
         self.notify.notify_waiters();
     }
 
+    /// 只给单测用：生产路径靠 [`Self::cancelled`] 等通知。
+    #[cfg(test)]
     fn fired(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
