@@ -99,8 +99,6 @@ pub struct Limits {
     #[serde(default)]
     pub offline_ms: u64,
     #[serde(default)]
-    pub heartbeat_ms: u64,
-    #[serde(default)]
     pub max_nodes: i64,
     #[serde(default)]
     pub max_events: i64,
@@ -113,7 +111,6 @@ impl Default for Limits {
             pong_timeout_ms: 10_000,
             ws_grace_ms: 75_000,
             offline_ms: 150_000,
-            heartbeat_ms: 55_000,
             max_nodes: 0,
             max_events: 0,
         }

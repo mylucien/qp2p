@@ -15,7 +15,7 @@
  *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
-const VERSION = "2.8.5";
+const VERSION = "2.8.6";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -1972,7 +1972,16 @@ async function usedCidrs(env) {
 // 工具
 // ---------------------------------------------------------------------------
 
-function publicNode(node, now) {
+/**
+ * 对外的节点视图。
+ *
+ * `online` 与 `last_seen` 的判据必须由调用方通过 `live`（liveness 结果）传入：
+ * 纯长连接节点不写 `last_seen`，只看它会把这个节点永久标成离线——成员快照
+ * 曾经就这么错过一次，客户端拿这份快照当拨号前提，于是对端"离线"就再也不拨。
+ * 不传 `live` 的老调用点保留旧的 last_seen 判据（它们只用于广播单个节点，
+ * 调用方已经确认过它在线）。
+ */
+function publicNode(node, now, live = null) {
   return {
     node_id: node.node_id,
     name: node.name,
@@ -1982,8 +1991,10 @@ function publicNode(node, now) {
     tls_fp: node.tls_fp,
     first_seen: Number(node.first_seen ?? 0) || node.last_seen,
     candidates: safeParseArray(node.candidates),
-    last_seen: node.last_seen,
-    online: now - node.last_seen <= OFFLINE_MS,
+    // 长连接节点的真实存活证据是自动应答时间戳，把它折算成"多久之前有过动静"，
+    // 这样快照里"离线 54 分钟"这类显示也跟着对
+    last_seen: live ? now - live.idleMs : node.last_seen,
+    online: live ? live.online : now - node.last_seen <= OFFLINE_MS,
   };
 }
 
@@ -2888,7 +2899,6 @@ const LIMITS = {
   pong_timeout_ms: 10_000,
   ws_grace_ms: WS_GRACE_MS,
   offline_ms: OFFLINE_MS,
-  heartbeat_ms: HEARTBEAT_MS,
   max_nodes: MAX_NODES,
   max_events: MAX_EVENTS,
 };
@@ -3530,7 +3540,19 @@ export class NetworkRoom {
    * 无 socket：沿用 last_seen 与 OFFLINE_MS，与 legacy 一致。
    */
   liveness(node, now) {
-    const ws = this.socketIndex().get(node.node_id);
+    return this.livenessWith(node, now, this.socketIndex());
+  }
+
+  /**
+   * 带预建索引的 `liveness`。
+   *
+   * 批量组装（成员快照、管理面）必须传同一个 `idx`：逐节点调 `liveness()` 会让
+   * 每个节点各建一次 socket 索引，256 个节点的网络就是 O(n²) 次 attachment
+   * 反序列化。更重要的是**判据只能有一份实现**——分散成第二份就会像成员快照
+   * 那样漏掉长连接节点。
+   */
+  livenessWith(node, now, idx) {
+    const ws = idx.get(node.node_id);
     if (ws) {
       const stamp = this.autoResponseAt(ws) ?? this.attachment(ws).joinedAt ?? now;
       const idleMs = Math.max(0, now - stamp);
@@ -3785,13 +3807,20 @@ export class NetworkRoom {
       return err(409, "virtual_ip_taken", `地址 ${virtualIp} 刚被占用，重试一次：${e instanceof Error ? e.message : String(e)}`);
     }
 
-    const wasOnline = existing !== null && now - existing.last_seen <= OFFLINE_MS;
+    // 判据走 liveness：纯长连接节点不写 last_seen，只看它会让"注册一次就广播
+    // 一次 peer_online"变成常态，也会让下面的成员快照把在线节点标成离线。
+    const idx = this.socketIndex();
+    const wasOnline = existing !== null && this.livenessWith(existing, now, idx).online;
     const moved = existing !== null && existing.candidates !== record.candidates;
     if ((!wasOnline || moved) && safeParseArray(record.candidates).length > 0) {
       this.emit(BROADCAST, "peer_online", publicNode(record, now));
     }
 
-    const peers = others.filter((n) => n.node_id !== nodeId).map((n) => publicNode(n, now));
+    // 成员快照：这里曾经直接用 publicNode 的 last_seen 判据，强制长连接模式下
+    // 注册后 150 秒就把所有对端标成离线，客户端据此停止主动拨号。
+    const peers = others
+      .filter((n) => n.node_id !== nodeId)
+      .map((n) => publicNode(n, now, this.livenessWith(n, now, idx)));
 
     return json({
       ok: true,
@@ -4283,19 +4312,13 @@ export class NetworkRoom {
     const idx = this.socketIndex();
     const rows = this.listNodes()
       .map((n) => {
-        const ws = idx.get(n.node_id);
-        // 有 socket 就看自动应答时间戳；没有才退回 last_seen
-        const idleMs = ws
-          ? now - (this.autoResponseAt(ws) ?? this.attachment(ws).joinedAt ?? now)
-          : now - n.last_seen;
+        const live = this.livenessWith(n, now, idx);
         return {
-          ...publicNode(n, now),
+          ...publicNode(n, now, live),
           node_id: n.node_id,
           advertised: safeParseArray(n.advertise),
           reserved: reservations.some((r) => r.ip === n.virtual_ip && r.node_id === n.node_id),
-          // publicNode 的 online 只看 last_seen，对长连接节点是错的，这里覆盖掉
-          online: idleMs <= (ws ? WS_GRACE_MS : OFFLINE_MS),
-          via: ws ? "ws" : "poll",
+          via: live.via,
         };
       })
       .sort((a, b) => ipv4ToInt(a.virtual_ip) - ipv4ToInt(b.virtual_ip));

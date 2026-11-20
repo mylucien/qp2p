@@ -863,6 +863,9 @@ impl Session {
         let mut ws_retry_delay = WS_RETRY;
         // "服务端没有 DO"只提示一次，之后每轮探测失败不再刷屏
         let mut ws_unsupported_notified = false;
+        // 长连接当前是否连着。只用来把"首次断开 / 恢复"打成 info：
+        // 反复重连时每次都打会把日志淹掉，但完全静默会让故障变成黑盒。
+        let mut ws_up = false;
         // 休眠起始时刻：满 60 秒断长连接
         let mut sleeping_since: Option<Instant> = None;
 
@@ -936,6 +939,10 @@ impl Session {
                         match item {
                             WsFeed::Event(event) => batch.push(event),
                             WsFeed::Online => {
+                                if !ws_up {
+                                    ws_up = true;
+                                    tracing::info!("[session] 信令长连接已建立");
+                                }
                                 ws_failed.clear();
                                 // 连上了就把探测间隔复位，下次断了还从 5 分钟起
                                 ws_retry_delay = WS_RETRY;
@@ -948,15 +955,30 @@ impl Session {
                             }
                             WsFeed::Closed { code, reason } => {
                                 ws_failure = Some(format!("连接被关闭 code={code}"));
-                                tracing::debug!("[session] WS 关闭 code={code} {reason}");
+                                if ws_up {
+                                    ws_up = false;
+                                    tracing::info!(
+                                        "[session] 信令长连接断开（code={code} {reason}），后台自动重连"
+                                    );
+                                } else {
+                                    tracing::debug!("[session] WS 关闭 code={code} {reason}");
+                                }
                             }
                             WsFeed::Down(message) => {
                                 ws_failure = Some(message.clone());
-                                tracing::debug!("[session] WS 断开：{message}");
+                                if ws_up {
+                                    ws_up = false;
+                                    tracing::info!(
+                                        "[session] 信令长连接断开：{message}，后台自动重连"
+                                    );
+                                } else {
+                                    tracing::debug!("[session] WS 断开：{message}");
+                                }
                             }
                             WsFeed::Unsupported(message) => {
                                 ws_unsupported = true;
                                 ws_failure = Some(message.clone());
+                                ws_up = false;
                             }
                             WsFeed::Fatal(message) => {
                                 // 令牌被换掉 / 网络被删：和轮询模式的处理保持一致
@@ -1155,6 +1177,8 @@ impl Session {
                     // drop 会 abort 后台任务，别让它在轮询期间继续重连
                     ws_run = None;
                     ws_early = None;
+                    // 轮询期间没有长连接；不置位的话下次超时恢复时不会打"已建立"
+                    ws_up = false;
                     ws_retry_at = Some(Instant::now() + ws_retry_delay);
                     ws_retry_delay = (ws_retry_delay * 2).min(Duration::from_secs(3600));
                     ws_failed.clear();
@@ -1369,8 +1393,9 @@ impl Session {
                     Some(t) if t.elapsed() >= WS_SLEEP_AFTER && ws_run.is_some() => {
                         ws_run = None;
                         ws_early = None;
-                        tracing::debug!(
-                            "[session] 休眠满 {} 秒，断开长连接",
+                        ws_up = false;
+                        tracing::info!(
+                            "[session] 空闲满 {} 秒，断开信令长连接（有流量会自动重连）",
                             WS_SLEEP_AFTER.as_secs()
                         );
                     }
