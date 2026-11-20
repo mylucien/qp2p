@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-android"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "jni",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-cli"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "qp2p-core",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "qp2p-deploy"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "hex",
