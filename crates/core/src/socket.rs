@@ -238,8 +238,43 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
         .bind(&addr.into())
         .with_context(|| format!("绑定 {addr} 失败"))?;
     tune_buffers(&socket);
+    tune_busy_poll(&socket);
     Ok(socket.into())
 }
+
+/// 按配置打开 `SO_BUSY_POLL`。
+///
+/// 只对 Linux 有意义，且需要进程有 `CAP_NET_ADMIN`（root 或带该 capability）；
+/// 内核还要编进 `CONFIG_NET_RX_BUSY_POLL`。任何一步不满足就安静跳过——
+/// 这是个低延迟优化，不是功能依赖。
+#[cfg(target_os = "linux")]
+fn tune_busy_poll(socket: &socket2::Socket) {
+    use std::os::fd::AsRawFd;
+
+    let micros = crate::tls::current_tuning().busy_poll_us;
+    if micros == 0 {
+        return;
+    }
+    let value = micros as libc::c_int;
+    // SAFETY: fd 有效；value 是栈上的 c_int，长度与内核期望的类型一致
+    let ok = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
+    };
+    if ok {
+        tracing::info!("[socket] SO_BUSY_POLL = {micros} us（忙轮询会增加 CPU 占用）");
+    } else {
+        tracing::info!("[socket] SO_BUSY_POLL 设置失败（需要 CAP_NET_ADMIN 与内核支持），已忽略");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_busy_poll(_socket: &socket2::Socket) {}
 
 /// 把收发缓冲放大到 [`WANT_BUFFER`]。
 ///

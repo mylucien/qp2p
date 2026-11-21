@@ -85,6 +85,12 @@ pub struct Config {
     /// 共享出口上会比 Cubic 抢得更多，所以默认关闭。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub congestion: Option<String>,
+    /// Linux 的 `SO_BUSY_POLL`（微秒）；不填或 0 = 关闭。
+    ///
+    /// 忙轮询能把收包延迟压掉几十微秒，代价是烧 CPU。弱核设备上
+    /// 开了可能反而更慢，所以必须显式配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_poll: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
     #[serde(default, rename = "forward")]
@@ -248,6 +254,7 @@ impl Default for Config {
             upnp: true,
             signal_transport: None,
             congestion: None,
+            busy_poll: None,
             network: None,
             forwards: Vec::new(),
         }
@@ -259,6 +266,7 @@ impl Config {
     pub fn link_tuning(&self) -> crate::tls::LinkTuning {
         crate::tls::LinkTuning {
             bbr: self.congestion.as_deref() == Some("bbr"),
+            busy_poll_us: self.busy_poll.unwrap_or(0),
             ..Default::default()
         }
     }

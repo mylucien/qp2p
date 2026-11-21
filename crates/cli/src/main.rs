@@ -789,6 +789,20 @@ fn print_config(config: &Config, path: &std::path::Path) {
         }
     );
     println!("STUN     : {}", config.stun.join(", "));
+    println!(
+        "拥塞控制 : {}",
+        match config.congestion.as_deref() {
+            Some("bbr") => "bbr（实验性，丢包不退让）",
+            _ => "cubic（默认）",
+        }
+    );
+    println!(
+        "忙轮询   : {}",
+        match config.busy_poll {
+            Some(us) => format!("{us} us"),
+            None => "关（默认）".to_string(),
+        }
+    );
     match &config.network {
         Some(net) => {
             println!(
@@ -805,7 +819,7 @@ fn print_config(config: &Config, path: &std::path::Path) {
         None => println!("网络     : 未加入（qp2p create / qp2p join）"),
     }
     println!("\n改一项：qp2p config set <项> <值>   撤销：qp2p config unset <项>");
-    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / ip");
+    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / busy_poll / ip");
 }
 
 fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
@@ -859,6 +873,15 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             }
             config.congestion = Some(choice);
         }
+        "busy_poll" | "busy-poll" => {
+            let micros: u32 = value
+                .parse()
+                .with_context(|| format!("busy_poll 不是数字（微秒）：{value}"))?;
+            if micros > 1000 {
+                bail!("busy_poll 最多 1000 微秒（再大就是长时间忙等，白烧 CPU）");
+            }
+            config.busy_poll = if micros == 0 { None } else { Some(micros) };
+        }
         "routes" | "route" => {
             let list = split_list(value);
             for raw in &list {
@@ -887,7 +910,7 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         other => bail!(
             "不认识的配置项：{other}\n\
-             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / ip"
+             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / busy_poll / ip"
         ),
     }
     Ok(())
@@ -905,6 +928,7 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         "stun" => config.stun = Config::default().stun,
         "transport" | "signal_transport" => config.signal_transport = None,
         "congestion" | "cc" => config.congestion = None,
+        "busy_poll" | "busy-poll" => config.busy_poll = None,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {
             if let Some(network) = config.network.as_mut() {

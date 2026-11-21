@@ -258,6 +258,11 @@ pub struct LinkTuning {
     pub bbr: bool,
     /// 请求对端每 N 个 ack-eliciting 包回一次 ACK；0 表示保持 quinn 默认。
     pub ack_threshold: u32,
+    /// Linux 的 `SO_BUSY_POLL`（微秒）；0 表示关闭。
+    ///
+    /// 收包在中断上下文之外忙轮询，能把唤醒延迟压掉几十微秒。
+    /// 代价是烧 CPU，弱核上可能反而更慢，所以默认关。
+    pub busy_poll_us: u32,
 }
 
 impl Default for LinkTuning {
@@ -268,6 +273,8 @@ impl Default for LinkTuning {
             // 放宽 ACK 阈值是纯收益，默认开：每 10 个包回一次，
             // 而 max_ack_delay 保持默认，不拖慢丢包判定
             ack_threshold: 10,
+            // 忙轮询要显式配置才开
+            busy_poll_us: 0,
         }
     }
 }
@@ -281,6 +288,11 @@ pub fn configure(tuning: LinkTuning) {
 
 fn tuning() -> LinkTuning {
     TUNING.get().copied().unwrap_or_default()
+}
+
+/// 当前生效的链路调优。没调用过 [`configure`] 时就是默认值。
+pub fn current_tuning() -> LinkTuning {
+    tuning()
 }
 
 /// 客户端配置。`pin` 为 Some 时校验证书指纹，否则跳过校验
