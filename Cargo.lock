@@ -869,6 +869,7 @@ name = "qp2p-core"
 version = "0.1.16"
 dependencies = [
  "anyhow",
+ "bytes",
  "ed25519-dalek",
  "futures-util",
  "hex",

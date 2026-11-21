@@ -31,6 +31,8 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["h
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 webpki-roots = "0.26"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# 引用计数的字节缓冲：接收侧切帧时可以让每个包共享同一块内存，不做二次拷贝
+bytes = "1"
 libc = "0.2"
 libloading = "0.8"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

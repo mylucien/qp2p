@@ -8,9 +8,10 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 
 pub mod flow;
 pub mod ip;
@@ -200,6 +201,13 @@ pub fn add_route(device: &str, cidr: &Cidr) -> Result<()> {
     }
 }
 
+/// 往 TUN 写一个包。失败只记日志：内核侧的问题不该让写线程退出。
+fn write_into_tun(device: &dyn TunDevice, packet: &[u8]) {
+    if let Err(e) = device.write_packet(packet) {
+        tracing::debug!("[tun] 写入失败: {e}");
+    }
+}
+
 /// 把同步的设备读写搬到两个独立线程，转成异步通道。
 ///
 /// TUN 设备的读写是阻塞的，放进 tokio 任务里会卡住整个运行时；
@@ -208,14 +216,14 @@ pub struct TunLink {
     /// 从内核收到的包（要发往对端）。
     pub from_tun: mpsc::Receiver<Vec<u8>>,
     /// 要写进内核的包（从对端收到的）。
-    pub to_tun: mpsc::Sender<Vec<u8>>,
+    pub to_tun: mpsc::Sender<Bytes>,
     pub mtu: usize,
 }
 
 pub fn spawn_io(device: Box<dyn TunDevice>, mtu: u16) -> TunLink {
     // 容量取 MTU 量级的几倍：太小会频繁阻塞读线程，太大等于把内核的丢包挪到用户态
     let (tx_out, from_tun) = mpsc::channel::<Vec<u8>>(512);
-    let (to_tun, mut rx_in) = mpsc::channel::<Vec<u8>>(512);
+    let (to_tun, mut rx_in) = mpsc::channel::<Bytes>(512);
 
     let device: std::sync::Arc<dyn TunDevice> = std::sync::Arc::from(device);
     let reader = device.clone();
@@ -249,9 +257,16 @@ pub fn spawn_io(device: Box<dyn TunDevice>, mtu: u16) -> TunLink {
     std::thread::Builder::new()
         .name("qp2p-tun-write".into())
         .spawn(move || {
-            while let Some(packet) = rx_in.blocking_recv() {
-                if let Err(e) = writer.write_packet(&packet) {
-                    tracing::debug!("[tun] 写入失败: {e}");
+            // 醒来后把队列里已经排好的包一次写完：每包一次阻塞唤醒太贵，
+            // syscall 数量不变（TUN 一次只能写一个包），省的是 futex 唤醒。
+            'outer: while let Some(packet) = rx_in.blocking_recv() {
+                write_into_tun(writer.as_ref(), &packet);
+                loop {
+                    match rx_in.try_recv() {
+                        Ok(more) => write_into_tun(writer.as_ref(), &more),
+                        Err(TryRecvError::Empty) => continue 'outer,
+                        Err(TryRecvError::Disconnected) => break 'outer,
+                    }
                 }
             }
             tracing::debug!("[tun] 写线程退出");

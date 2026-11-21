@@ -74,7 +74,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use quinn::{Connection, ReadExactError, RecvStream, SendStream, Side};
+use bytes::{Buf, Bytes, BytesMut};
+use quinn::{Connection, RecvStream, SendStream, Side};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{Notify, RwLock};
 
@@ -429,7 +430,7 @@ impl Notice {
 /// 我们只能靠**目标地址**判断该从哪条连接发出去。
 pub struct MeshLinks {
     peers: RwLock<HashMap<Ipv4Addr, MeshPeer>>,
-    to_tun: mpsc::Sender<Vec<u8>>,
+    to_tun: mpsc::Sender<Bytes>,
     /// 目标没有直连时，把对端虚拟地址丢进来，让会话循环立刻去打通它
     wake: RwLock<Option<mpsc::Sender<Ipv4Addr>>>,
     activity: Activity,
@@ -446,7 +447,7 @@ pub struct MeshLinks {
 impl MeshLinks {
     /// `allowed` 非空时，同一条连接上除了 IP 包流，还会处理对端发起的
     /// 端口映射流（`KIND_TCP`）——安卓当局域网出口就是靠它。
-    pub fn new(to_tun: mpsc::Sender<Vec<u8>>, allowed: Vec<SocketAddr>) -> Arc<Self> {
+    pub fn new(to_tun: mpsc::Sender<Bytes>, allowed: Vec<SocketAddr>) -> Arc<Self> {
         Arc::new(Self {
             peers: RwLock::new(HashMap::new()),
             to_tun,
@@ -939,7 +940,7 @@ type FlowValue = (Connection, Arc<FlowQueue>, Arc<PeerHealth>);
 async fn pump(
     route: Route,
     mut from_tun: mpsc::Receiver<Vec<u8>>,
-    to_tun: mpsc::Sender<Vec<u8>>,
+    to_tun: mpsc::Sender<Bytes>,
     local: Ipv4Addr,
     mtu: usize,
 ) -> Result<()> {
@@ -995,7 +996,7 @@ async fn pump(
 async fn dispatch(
     route: &Route,
     flows: &mut FlowTable<FlowValue>,
-    to_tun: &mpsc::Sender<Vec<u8>>,
+    to_tun: &mpsc::Sender<Bytes>,
     local: Ipv4Addr,
     mut packet: Vec<u8>,
     mtu: usize,
@@ -1018,7 +1019,8 @@ async fn dispatch(
     //    为了一个 ICMP 把整条转发循环堵住不值得。
     if dst == local && ip::is_echo_request(&parsed) {
         if let Some(reply) = ip::echo_reply(&parsed) {
-            let _ = to_tun.try_send(reply);
+            // Vec<u8> -> Bytes 是移动，不复制
+            let _ = to_tun.try_send(Bytes::from(reply));
         }
         return Ok(());
     }
@@ -1230,7 +1232,7 @@ async fn write_frame(send: &mut SendStream, frame: &mut Vec<u8>, packet: &[u8]) 
 /// 否则两个循环会互相抢流，抢到不认识的类型只能丢弃。
 async fn serve_inbound(
     conn: Connection,
-    to_tun: mpsc::Sender<Vec<u8>>,
+    to_tun: mpsc::Sender<Bytes>,
     allowed: Arc<Vec<SocketAddr>>,
     activity: Activity,
 ) -> Result<()> {
@@ -1276,33 +1278,56 @@ async fn serve_inbound(
 
 async fn pump_stream(
     recv: &mut RecvStream,
-    to_tun: mpsc::Sender<Vec<u8>>,
+    to_tun: mpsc::Sender<Bytes>,
     activity: Activity,
 ) -> Result<()> {
+    // 一次读一大片再自己切帧：每包只剩「从 quinn 缓冲拷进 BytesMut」，
+    // 切出来的 Bytes 与那块内存共享，不再为每个包单独 malloc 一次。
+    // 原来每包两次 read_exact + 一次 vec![0u8; len]。
+    let mut buf = BytesMut::with_capacity(READ_BUF);
     loop {
-        let mut len = [0u8; 2];
-        match recv.read_exact(&mut len).await {
-            Ok(()) => {}
+        // 帧头
+        while buf.len() < 2 {
             // 读到 0 字节就是正常结束：对端把这条流关了
-            Err(ReadExactError::FinishedEarly(0)) => return Ok(()),
-            Err(e) => return Err(e).context("读帧长度失败"),
+            if !fill(recv, &mut buf).await? {
+                return Ok(());
+            }
         }
-        let len = usize::from(u16::from_be_bytes(len));
+        let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
         if len == 0 || len > READ_BUF * 16 {
             bail!("帧长度非法：{len}");
         }
-        let mut buf = vec![0u8; len];
-        recv.read_exact(&mut buf).await.context("读帧失败")?;
+        while buf.len() < 2 + len {
+            if !fill(recv, &mut buf).await? {
+                bail!("流在一帧中间结束");
+            }
+        }
+        // 跳过帧头，把包体整段切出来；split_to 只移动指针，不复制
+        buf.advance(2);
+        let frame = buf.split_to(len).freeze();
+
         activity.touch();
         // 绝不 await：这里的反压会顺着 QUIC 流控传导回对端的发送循环，
         // 两个方向一起卡死。队列满就丢包，内层 TCP 会重传。
-        match to_tun.try_send(buf) {
+        match to_tun.try_send(frame) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 tracing::trace!("[tun] 回程队列满，丢包");
             }
             Err(TrySendError::Closed(_)) => return Ok(()),
         }
+    }
+}
+
+/// 往缓冲里补一块数据；返回 false 表示对端把流关了。
+async fn fill(recv: &mut RecvStream, buf: &mut BytesMut) -> Result<bool> {
+    match recv.read_chunk(usize::MAX, true).await {
+        Ok(Some(chunk)) => {
+            buf.extend_from_slice(&chunk.bytes);
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(e).context("读帧失败"),
     }
 }
 
