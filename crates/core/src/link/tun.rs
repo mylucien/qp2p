@@ -67,16 +67,16 @@
 //! 一条判据都不触发，全靠 QUIC 默认的 30 秒 idle timeout 收场。那个判据还会
 //! 误杀：6 秒抖动就能凑够 3 条超时流，把本来能自愈的连接掐掉。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use quinn::{Connection, ReadExactError, RecvStream, SendStream, Side};
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::route::{flow::FlowKey, flow::FlowTable, ip, TunLink};
 
@@ -93,10 +93,15 @@ const FLOW_IDLE: Duration = Duration::from_secs(120);
 const FLOW_CAPACITY: usize = 256;
 const READ_BUF: usize = 4096;
 
-/// 单条流排队待写的包数上限。满了丢包，让内层 TCP 重传。
+/// 单条流排队待写的字节上限。满了丢包，让内层 TCP 重传。
 ///
-/// 64 帧约 90KB：够吸收一个 RTT 内的突发，又不至于让卡死的流囤积太多。
-const FLOW_QUEUE: usize = 64;
+/// 按字节而不是按包数：64 个 1450 字节的包是 93 KB，64 个 64 字节的
+/// ICMP 只有 4 KB，包数上限给不出确定的抖动吸收窗口。256 KB 在 20 Mbps
+/// 下约 100 ms，比原来的 37 ms 宽裕得多，又不至于让卡死的流囤积太多。
+const FLOW_QUEUE_BYTES: usize = 256 * 1024;
+/// 所有流加起来的上限。256 条流各自吃满 256 KB 是 64 MB，
+/// 对 438 MB 的光猫太狠，所以再压一层全局预算。
+const FLOW_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// 一帧写出去的上限。超过说明这条流的发送窗口已经不动了。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 新建双向流的上限。正常路径瞬时返回，只有流配额用尽才会等。
@@ -796,10 +801,139 @@ impl Route {
     }
 }
 
+/// 一条流的发送队列：按字节限，所有流再共享一个全局预算。
+///
+/// 用 `Mutex<VecDeque>` 而不是 `mpsc::channel`，因为 tokio 的通道只能按
+/// 条数限容，而包长从 40 字节到 1450 字节差 36 倍。锁只在入队/出队各持
+/// 一次、不跨 await，和通道内部的锁开销同量级。
+struct FlowQueue {
+    inner: Mutex<FlowQueueInner>,
+    /// 所有流共享的字节预算；队列为空时额度归还
+    budget: Arc<AtomicUsize>,
+    notify: Notify,
+}
+
+struct FlowQueueInner {
+    packets: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+/// 入队失败。两种情况都要把包还给调用方：满了直接丢，
+/// 关了要挂到新开的流上，不能凭空少一个包。
+enum PushError {
+    Full(Vec<u8>),
+    Closed(Vec<u8>),
+}
+
+impl FlowQueue {
+    fn new(budget: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: Mutex::new(FlowQueueInner {
+                packets: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            budget,
+            notify: Notify::new(),
+        }
+    }
+
+    /// 非阻塞入队。绝不在主循环里等：队列满就让内层 TCP 重传。
+    fn try_push(&self, packet: Vec<u8>) -> Result<(), PushError> {
+        let len = packet.len();
+        // 先占全局额度：满了连队列锁都不用拿
+        if !reserve(&self.budget, len) {
+            return Err(PushError::Full(packet));
+        }
+
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            drop(inner);
+            self.budget.fetch_sub(len, Ordering::Relaxed);
+            return Err(PushError::Closed(packet));
+        }
+        if inner.bytes + len > FLOW_QUEUE_BYTES {
+            drop(inner);
+            self.budget.fetch_sub(len, Ordering::Relaxed);
+            return Err(PushError::Full(packet));
+        }
+        inner.bytes += len;
+        inner.packets.push_back(packet);
+        drop(inner);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// 取一个包；队列空了就等，直到有新包或队列被关。
+    async fn recv(&self) -> Option<Vec<u8>> {
+        loop {
+            // 先创建 future 再检查队列：即使 push 落在"检查为空"之后，
+            // `notify_one` 存下的 permit 也会让这次 await 立刻返回。
+            let notified = self.notify.notified();
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(packet) = inner.packets.pop_front() {
+                    inner.bytes -= packet.len();
+                    drop(inner);
+                    // 弹出来就不再算"排队中"，额度立刻归还
+                    self.budget.fetch_sub(packet.len(), Ordering::Relaxed);
+                    return Some(packet);
+                }
+                if inner.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// 关掉队列并清空积压，唤醒正在等的 writer。重复调用无副作用。
+    fn close(&self) {
+        let packets = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.closed {
+                return;
+            }
+            inner.closed = true;
+            inner.bytes = 0;
+            std::mem::take(&mut inner.packets)
+        };
+        let freed: usize = packets.iter().map(Vec::len).sum();
+        self.budget.fetch_sub(freed, Ordering::Relaxed);
+        drop(packets);
+        self.notify.notify_one();
+    }
+}
+
+impl Drop for FlowQueue {
+    /// 兜底归还全局预算：任何删除路径漏调 `close` 都不会让额度永久泄漏。
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// CAS 占额度。失败说明全局预算已经用满，调用方丢包等重传。
+fn reserve(budget: &AtomicUsize, len: usize) -> bool {
+    let mut cur = budget.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = cur.checked_add(len) else {
+            return false;
+        };
+        if next > FLOW_TOTAL_BYTES {
+            return false;
+        }
+        match budget.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// 流表的值：连接、发送队列、这条流所属对端的健康度。
 ///
 /// 队列而不是 `SendStream`：写动作交给 [`FlowWriter`]，主循环只入队。
-type FlowValue = (Connection, mpsc::Sender<Vec<u8>>, Arc<PeerHealth>);
+type FlowValue = (Connection, Arc<FlowQueue>, Arc<PeerHealth>);
 
 async fn pump(
     route: Route,
@@ -809,6 +943,8 @@ async fn pump(
     mtu: usize,
 ) -> Result<()> {
     let mut flows: FlowTable<FlowValue> = FlowTable::new(FLOW_IDLE, FLOW_CAPACITY);
+    // 所有流的排队字节共享这一个预算，避免 256 条流各自吃满 256 KB
+    let queue_budget = Arc::new(AtomicUsize::new(0));
 
     // 用固定 deadline 而不是每轮重建的新 sleep：后者会被源源不断的包
     // 反复取消重建，大流量时扫描永远不跑，空闲流永远回收不掉。
@@ -822,15 +958,25 @@ async fn pump(
                 let Some(packet) = packet else { break };
                 // 这里不许出现无限等待：入队是 try_send，写帧在独立任务里带超时。
                 // 任何一条流卡住都只能拖累它自己，不能停住整个转发循环。
-                if let Err(e) = dispatch(&route, &mut flows, &to_tun, local, packet, mtu).await {
+                if let Err(e) = dispatch(
+                    &route,
+                    &mut flows,
+                    &to_tun,
+                    local,
+                    packet,
+                    mtu,
+                    &queue_budget,
+                )
+                .await
+                {
                     tracing::debug!("[tun] 转发失败: {e:#}");
                 }
             }
             _ = sweep.tick() => {
-                for (key, (_, tx, _)) in flows.sweep(Instant::now()) {
+                for (key, (_, queue, _)) in flows.sweep(Instant::now()) {
                     tracing::trace!("[tun] 回收空闲流 {key:?}");
-                    // 关掉队列，writer 收尾时自己 reset
-                    drop(tx);
+                    // 关队列、清积压，writer 收尾时自己 reset
+                    queue.close();
                 }
                 if let Route::Mesh(links) = &route {
                     links.reap_unhealthy().await;
@@ -839,8 +985,8 @@ async fn pump(
         }
     }
 
-    for (_, (_, tx, _)) in flows.drain() {
-        drop(tx);
+    for (_, (_, queue, _)) in flows.drain() {
+        queue.close();
     }
     Ok(())
 }
@@ -852,6 +998,7 @@ async fn dispatch(
     local: Ipv4Addr,
     mut packet: Vec<u8>,
     mtu: usize,
+    queue_budget: &Arc<AtomicUsize>,
 ) -> Result<()> {
     let Some(parsed) = ip::parse(&packet) else {
         return Ok(());
@@ -884,16 +1031,16 @@ async fn dispatch(
     let now = Instant::now();
     // 一次 get_mut 同时完成"存在性判断 + 刷新活跃时间 + 取队列"，
     // 不再先 contains 再 get_mut 各查一遍哈希表
-    if let Some((_, tx, _)) = flows.get_mut(&key, now) {
-        match tx.try_send(packet) {
+    if let Some((_, queue, _)) = flows.get_mut(&key, now) {
+        match queue.try_push(packet) {
             Ok(()) => return Ok(()),
-            Err(TrySendError::Full(_)) => {
+            Err(PushError::Full(_)) => {
                 // 队列满说明这条流的写动作跟不上。丢包让内层 TCP 退避重传，
                 // 比让主循环等它强得多。
                 tracing::trace!("[tun] {key:?} 发送队列满，丢包");
                 return Ok(());
             }
-            Err(TrySendError::Closed(back)) => {
+            Err(PushError::Closed(back)) => {
                 // writer 已经退出了（写超时/出错）。这条流作废，下面重开一条，
                 // 把这个包挂在新的流上——不必等 TCP 重传。
                 flows.remove(&key);
@@ -921,10 +1068,10 @@ async fn dispatch(
 
     // 4. 建流也交给 writer：流配额用尽时 `open_bi` 会一直挂着，
     //    留在主循环里就等于把所有对端、所有流一起拖住。
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
+    let queue = Arc::new(FlowQueue::new(queue_budget.clone()));
     tokio::spawn(
         FlowWriter {
-            rx,
+            queue: queue.clone(),
             health: peer.health.clone(),
             ip: dst,
             conn: peer.conn.clone(),
@@ -932,10 +1079,11 @@ async fn dispatch(
         .run(),
     );
 
-    let _ = tx.try_send(packet);
+    let _ = queue.try_push(packet);
 
-    if let Some((old, (_, old_tx, _))) = flows.insert(key, (peer.conn, tx, peer.health), now) {
-        drop(old_tx);
+    if let Some((old, (_, old_queue, _))) = flows.insert(key, (peer.conn, queue, peer.health), now)
+    {
+        old_queue.close();
         tracing::debug!("[tun] 流表满，淘汰 {old:?}");
     }
     Ok(())
@@ -950,7 +1098,7 @@ async fn dispatch(
 /// 注意它**不判连接死活**：本地写失败说明不了对端还在不在，摘连接是
 /// [`MeshLinks::reap_unhealthy`] 按 QUIC 的对端回包计数决定的。
 struct FlowWriter {
-    rx: mpsc::Receiver<Vec<u8>>,
+    queue: Arc<FlowQueue>,
     health: Arc<PeerHealth>,
     ip: Ipv4Addr,
     conn: Connection,
@@ -998,7 +1146,7 @@ impl FlowWriter {
         // 不再为每个包单独分配一次
         let mut frame = Vec::with_capacity(2048);
         while !broken {
-            let Some(packet) = self.rx.recv().await else {
+            let Some(packet) = self.queue.recv().await else {
                 break;
             };
             let written =
@@ -1551,5 +1699,73 @@ mod tests {
             broken * 100 / total < 20,
             "旧行为的失败率应当是个位数（单程时延窗口），实际 {broken}/{total}"
         );
+    }
+
+    // --- 按字节计的发送队列 ---------------------------------------------
+
+    #[test]
+    fn flow_queue_stops_at_the_byte_limit_not_a_packet_count() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = FlowQueue::new(budget.clone());
+        // 2048 字节 × 128 个正好 256 KB；再多一个就该被拒
+        let packet = vec![0u8; 2048];
+        for i in 0..128 {
+            assert!(q.try_push(packet.clone()).is_ok(), "第 {i} 个不该被拒");
+        }
+        match q.try_push(packet) {
+            Err(PushError::Full(p)) => assert_eq!(p.len(), 2048, "包要原样退回"),
+            _ => panic!("超过字节上限必须拒绝"),
+        }
+        assert_eq!(budget.load(Ordering::Relaxed), FLOW_QUEUE_BYTES);
+        q.close();
+        assert_eq!(budget.load(Ordering::Relaxed), 0, "close 要归还全部额度");
+    }
+
+    #[test]
+    fn flow_queue_shares_one_global_budget_across_flows() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        // 每条流上限 256 KB；这里用 64 KB 的包，四条流各推 4 个就是 1 MB，
+        // 一直推到全局 32 MB 满为止，验证的是"总额度会被别的流吃掉"
+        let q1 = FlowQueue::new(budget.clone());
+        let q2 = FlowQueue::new(budget.clone());
+        let packet = vec![0u8; 64 * 1024];
+        for _ in 0..4 {
+            assert!(q1.try_push(packet.clone()).is_ok());
+        }
+        assert_eq!(budget.load(Ordering::Relaxed), 256 * 1024);
+        // q1 已满（单流上限），q2 还能继续占别人的额度
+        assert!(matches!(
+            q1.try_push(packet.clone()),
+            Err(PushError::Full(_))
+        ));
+        assert!(q2.try_push(packet).is_ok());
+        q1.close();
+        q2.close();
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn flow_queue_wakes_the_writer_and_returns_budget_on_pop() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = Arc::new(FlowQueue::new(budget.clone()));
+        let writer = {
+            let q = q.clone();
+            tokio::spawn(async move { q.recv().await })
+        };
+        // 让 writer 先进入等待，再入队，验证 notify 不丢
+        tokio::task::yield_now().await;
+        q.try_push(vec![7u8; 100]).expect("入队");
+        assert_eq!(budget.load(Ordering::Relaxed), 100, "排队中要占额度");
+
+        let packet = writer
+            .await
+            .expect("writer 不该 panic")
+            .expect("应当拿到包");
+        assert_eq!(packet.len(), 100);
+        assert_eq!(budget.load(Ordering::Relaxed), 0, "弹出即归还");
+
+        // 关掉之后 recv 立刻返回 None，不会挂住
+        q.close();
+        assert!(q.recv().await.is_none(), "close 之后 recv 返回 None");
     }
 }
