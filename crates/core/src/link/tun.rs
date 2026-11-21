@@ -88,7 +88,9 @@ const FLOW_IDLE: Duration = Duration::from_secs(120);
 ///
 /// 刻意低于 `tls.rs` 里给对端的 `max_concurrent_bidi_streams`（256）：
 /// 自己先到 200 就开始回收空闲流，把余量留给对端发起的方向。
-const FLOW_CAPACITY: usize = 200;
+/// 流表容量。与 `max_concurrent_bidi_streams(256)` 对齐：
+/// 小了就白白浪费对端给的流配额，大了也开不出来。
+const FLOW_CAPACITY: usize = 256;
 const READ_BUF: usize = 4096;
 
 /// 单条流排队待写的包数上限。满了丢包，让内层 TCP 重传。
@@ -880,8 +882,9 @@ async fn dispatch(
     // 2. 已有流：入队即返回，绝不等网络
     let key = FlowKey::new(parsed.proto, parsed.src, dst, parsed.ports);
     let now = Instant::now();
-    if flows.contains(&key) {
-        let (_, tx, _) = flows.get_mut(&key, now).expect("刚判断过存在");
+    // 一次 get_mut 同时完成"存在性判断 + 刷新活跃时间 + 取队列"，
+    // 不再先 contains 再 get_mut 各查一遍哈希表
+    if let Some((_, tx, _)) = flows.get_mut(&key, now) {
         match tx.try_send(packet) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(_)) => {
@@ -991,12 +994,16 @@ impl FlowWriter {
             }
         }
 
+        // 复用同一个缓冲：每次 write_frame 只做 clear + 两次 extend，
+        // 不再为每个包单独分配一次
+        let mut frame = Vec::with_capacity(2048);
         while !broken {
             let Some(packet) = self.rx.recv().await else {
                 break;
             };
             let written =
-                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut send, &packet)).await;
+                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut send, &mut frame, &packet))
+                    .await;
             match written {
                 Ok(Ok(())) => self.health.note_write_ok(),
                 Ok(Err(e)) => {
@@ -1031,10 +1038,15 @@ impl FlowWriter {
     }
 }
 
-async fn write_frame(send: &mut SendStream, packet: &[u8]) -> Result<()> {
+async fn write_frame(send: &mut SendStream, frame: &mut Vec<u8>, packet: &[u8]) -> Result<()> {
     let len = u16::try_from(packet.len()).context("单个 IP 包超过 64KB")?;
-    send.write_all(&len.to_be_bytes()).await?;
-    send.write_all(packet).await?;
+    // 合成一次 write_all：拆成两次会各自推进一次 send 状态机，
+    // 每包多一次 poll_write，而且中途可能各返回一次 Pending。
+    frame.clear();
+    frame.reserve(2 + packet.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(packet);
+    send.write_all(frame).await?;
     Ok(())
 }
 

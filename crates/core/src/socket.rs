@@ -223,6 +223,10 @@ impl quinn::AsyncUdpSocket for ObservingSocket {
     }
 }
 
+/// 期望的 UDP 缓冲。默认 208 KB 在 20 Mbps 下只够缓冲 83 ms，
+/// CPU 稍有抖动内核就静默丢包，QUIC 只能靠重传补救。
+const WANT_BUFFER: usize = 2 * 1024 * 1024;
+
 fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -233,7 +237,57 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     socket
         .bind(&addr.into())
         .with_context(|| format!("绑定 {addr} 失败"))?;
+    tune_buffers(&socket);
     Ok(socket.into())
+}
+
+/// 把收发缓冲放大到 [`WANT_BUFFER`]。
+///
+/// Linux 上优先用 `SO_*BUFFORCE`：它能越过 `net.core.rmem_max`，但要求
+/// `CAP_NET_ADMIN`（root 或带该 capability 的进程）。设不上就退回普通
+/// `SO_*BUF`，内核会按 `rmem_max` 截断——有总比 208 KB 强。
+///
+/// 注意 Linux 的 `SO_RCVBUF` 语义：内核返回的实际值约是设置值的两倍，
+/// 所以日志里看到 4 MB 是正常的。
+fn tune_buffers(socket: &socket2::Socket) {
+    #[cfg(target_os = "linux")]
+    {
+        if force_buffer(socket, libc::SO_RCVBUFFORCE) && force_buffer(socket, libc::SO_SNDBUFFORCE)
+        {
+            log_buffers(socket, "force");
+            return;
+        }
+    }
+
+    let _ = socket.set_recv_buffer_size(WANT_BUFFER);
+    let _ = socket.set_send_buffer_size(WANT_BUFFER);
+    log_buffers(socket, "normal");
+}
+
+#[cfg(target_os = "linux")]
+fn force_buffer(socket: &socket2::Socket, opt: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+    let value = WANT_BUFFER as libc::c_int;
+    // SAFETY: fd 有效；value 是栈上的 c_int，长度与内核期望的类型一致
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
+    }
+}
+
+fn log_buffers(socket: &socket2::Socket, mode: &str) {
+    let recv = socket.recv_buffer_size().unwrap_or(0);
+    let send = socket.send_buffer_size().unwrap_or(0);
+    tracing::info!(
+        "[socket] UDP 缓冲（{mode}）：收 {} KB / 发 {} KB",
+        recv / 1024,
+        send / 1024
+    );
 }
 
 /// 启动探测的结果。

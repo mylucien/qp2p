@@ -26,11 +26,74 @@ pub const SERVER_NAME: &str = "qp2p.local";
 const CERT_FILE: &str = "tls.crt.der";
 const KEY_FILE: &str = "tls.key.der";
 
+/// 本机有没有 AES 硬件加速。
+///
+/// ring 在 aarch64 上要求 AES + PMULL 同时具备才走硬件路径（GCM 的 GHASH
+/// 靠 PMULL 加速），而 ARMv8 的现实实现里两者基本同进同退：Cortex-A53 /
+/// A55 / A72 / A76 要么都有、要么都没有。x86 侧同理，有 AES-NI 的机器
+/// 几乎都有 PCLMULQDQ。这里按主流情况判断；万一误判，代价只是选错套件，
+/// 不影响正确性。
+fn has_aes_hw() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        true
+    }
+}
+
+/// TLS 套件提供者：没有 AES 硬件时把 ChaCha20 提到最前。
+///
+/// rustls 的默认顺序是 AES-256-GCM 第一。在没有 AES 指令的 ARM 上，ring
+/// 会落到 NEON 比特切片的软件实现，比同样走 NEON 的 ChaCha20 慢数倍。
+/// `sort_by_key` 是稳定排序，其余套件的相对顺序保持不变。
+fn provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = default_provider();
+    if !has_aes_hw() {
+        tracing::info!("[tls] 本机无 AES 硬件加速，优先 ChaCha20-Poly1305");
+        prefer_chacha(&mut provider);
+    }
+    provider
+}
+
+/// 把 ChaCha20-Poly1305 挪到第一位，其余套件相对顺序不变。
+///
+/// 单独抽出来是为了能测排序本身——`has_aes_hw()` 依赖运行环境，
+/// 而排序逻辑与硬件无关。
+fn prefer_chacha(provider: &mut rustls::crypto::CryptoProvider) {
+    provider.cipher_suites.sort_by_key(|suite| {
+        if suite.suite() == rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 {
+            0
+        } else {
+            1
+        }
+    });
+}
+
 fn transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_concurrent_bidi_streams(256u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
+
+    // 单流 2 MB：40 ms RTT 下单流上限从 250 Mbps 提到 400 Mbps。
+    // 这是"愿意为这条流缓冲多少"，不是预分配，空闲时不占内存。
+    transport.stream_receive_window((2 * 1024 * 1024u32).into());
+    // 连接级总上限 16 MB：兜住 256 条流的理论最坏值（256 × 2 MB = 512 MB）。
+    // 按 8 条满窗流设计；每对端一份，10 个对端最坏 160 MB。
+    transport.receive_window((16 * 1024 * 1024u32).into());
+
+    // 初始 MTU 1400：PPPoE（1492）和以太网（1500）都能过。
+    // quinn 自己会往上爬到路径 MTU；PMTUD 被 ICMP 过滤阻断时也不会卡在 1200。
+    transport.initial_mtu(1400);
+    transport.min_mtu(1200);
+
     transport
 }
 
@@ -137,13 +200,18 @@ impl TlsIdentity {
     }
 
     pub fn server_config(&self) -> Result<quinn::ServerConfig> {
-        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .context("TLS 1.3 不可用")?
             .with_no_client_auth()
             .with_single_cert(vec![self.cert.clone()], self.key.clone_key())
             .context("加载自签证书失败")?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
+        // 本机没有 AES 硬件时强制自己的套件偏好：否则客户端 offer 的
+        // AES-256 顺序会被照单全收，本机就得软件解密。本机有 AES 时保持
+        // false（尊重客户端偏好）——反过来强制 AES 反而会拖慢没有 AES
+        // 指令的对端。
+        tls.ignore_client_order = !has_aes_hw();
 
         let crypto = QuicServerConfig::try_from(tls).context("构建 QUIC 服务端配置失败")?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -160,7 +228,7 @@ pub fn client_config(pin: Option<[u8; 32]>) -> Result<quinn::ClientConfig> {
         None => Arc::new(SkipVerify),
     };
 
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("TLS 1.3 不可用")?
         .dangerous()
@@ -317,5 +385,36 @@ mod tests {
         assert!(client_config(Some(pinned)).is_ok());
         assert!(client_config(None).is_ok());
         assert!(mine.server_config().is_ok());
+    }
+
+    #[test]
+    fn chacha_moves_to_front() {
+        let mut p = default_provider();
+        prefer_chacha(&mut p);
+        assert_eq!(
+            p.cipher_suites[0].suite(),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            "无 AES 时 ChaCha20 必须排第一"
+        );
+    }
+
+    #[test]
+    fn prefer_chacha_keeps_other_suites_in_order() {
+        let original: Vec<_> = default_provider()
+            .cipher_suites
+            .iter()
+            .map(|s| s.suite())
+            .collect();
+        let mut p = default_provider();
+        prefer_chacha(&mut p);
+        let after: Vec<_> = p.cipher_suites.iter().map(|s| s.suite()).collect();
+
+        let mut expected: Vec<_> = original
+            .iter()
+            .copied()
+            .filter(|s| *s != rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+            .collect();
+        expected.insert(0, rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256);
+        assert_eq!(after, expected, "其余套件的相对顺序不能变");
     }
 }
