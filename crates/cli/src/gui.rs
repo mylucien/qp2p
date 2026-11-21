@@ -201,8 +201,10 @@ fn save_config(state: &State, body: &Value) -> Result<String> {
     }
 
     if let Some(mtu) = body.get("mtu").and_then(Value::as_u64) {
-        if !(576..=1500).contains(&mtu) {
-            bail!("MTU 需要在 576~1500 之间");
+        // 上限跟 core 的 MAX_TUN_MTU 对齐：再大的包在 QUIC 层发不出去
+        let max = u64::from(qp2p_core::route::MAX_TUN_MTU);
+        if !(576..=max).contains(&mtu) {
+            bail!("MTU 需要在 576~{max} 之间");
         }
         config.mtu = Some(mtu as u16);
     }

@@ -102,13 +102,29 @@ fn mask_of(prefix: u8) -> u32 {
     }
 }
 
-/// 虚拟网卡的配置。
 /// 虚拟网卡 MTU 的上限。
 ///
 /// quinn 的 MTU 发现上限默认 1452（以太网 1500 减去 IPv4 20 + UDP 8），
 /// 内层 IP 包再套自己的 20 字节头就是 1424。超过这个值的包在 QUIC 层
 /// 发不出去，只能在这里分片或丢弃。
 pub const MAX_TUN_MTU: u16 = 1424;
+
+/// 把 MTU 夹到隧道能承受的上限，超出时打一条 warn。
+///
+/// 必须夹在**配置源头**，不能只夹在 `open()` 里：内核按网卡 MTU 组包，
+/// 设成 1500 就真的会收到 1500 字节的包，而数据面拿到同一个 1500 时
+/// `packet.len() > mtu` 不成立，不会去分片——结果是每个满包在 QUIC 流里
+/// 被切成两段，丢一段就要重传整个内层包。设成 9000 更夸张，一刀切七段。
+pub fn clamp_mtu(mtu: u16) -> u16 {
+    if mtu > MAX_TUN_MTU {
+        tracing::warn!(
+            "[tun] MTU {mtu} 超过隧道上限，已夹到 {MAX_TUN_MTU}（QUIC 的 MTU 发现上限 1452 减 28）"
+        );
+        MAX_TUN_MTU
+    } else {
+        mtu
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TunConfig {
@@ -123,28 +139,6 @@ pub struct TunConfig {
 }
 
 impl TunConfig {
-    /// 按 node_id 派生的虚拟地址加上网段，拼出一份配置。
-    pub fn for_network(network: Cidr, address: Ipv4Addr, mtu: u16) -> Self {
-        // 大于这个值的包在 QUIC 层发不出去：quinn 的 MTU 发现上限是 1452，
-        // 减去 IPv4 头 20 和 UDP 头 8 就只剩 1424 给内层 IP 包。
-        // 交给内核一个更大的 MTU，它会按 1500 组包，然后每一个满包都在
-        // 这里被分片或丢掉——表现为"能 ping 通、大流量全废"。
-        let mtu = if mtu > MAX_TUN_MTU {
-            tracing::warn!(
-                "[tun] MTU {mtu} 超过隧道上限，已夹到 {MAX_TUN_MTU}（QUIC 的 MTU 发现上限 1452 减 28）"
-            );
-            MAX_TUN_MTU
-        } else {
-            mtu
-        };
-        Self {
-            name: "qp2p0".to_string(),
-            address,
-            prefix: network.prefix,
-            mtu,
-        }
-    }
-
     pub fn cidr(&self) -> Result<Cidr> {
         Cidr::new(self.address, self.prefix)
     }
@@ -160,7 +154,13 @@ pub trait TunDevice: Send + Sync + 'static {
 }
 
 /// 打开平台对应的虚拟网卡，并配好地址、MTU、以及到虚拟网段的直连路由。
+///
+/// 这里再夹一次 MTU 是兜底：调用方通常已经夹过（见 [`clamp_mtu`]），
+/// 但设备 MTU 设错了代价很大（内核按它组包），所以在唯一的建卡入口再兜一次。
 pub fn open(config: &TunConfig) -> Result<Box<dyn TunDevice>> {
+    let mut config = config.clone();
+    config.mtu = clamp_mtu(config.mtu);
+    let config = &config;
     #[cfg(target_os = "linux")]
     {
         Ok(Box::new(tun_linux::LinuxTun::open(config)?))
@@ -312,5 +312,15 @@ mod tests {
     fn prefix_zero_matches_everything() {
         let c: Cidr = "0.0.0.0/0".parse().unwrap();
         assert!(c.contains(Ipv4Addr::new(203, 0, 113, 9)));
+    }
+
+    #[test]
+    fn mtu_is_clamped_to_tunnel_limit() {
+        // 边界：1424 合法，1425 与 9000 都要夹
+        assert_eq!(clamp_mtu(1280), 1280);
+        assert_eq!(clamp_mtu(MAX_TUN_MTU), MAX_TUN_MTU);
+        assert_eq!(clamp_mtu(MAX_TUN_MTU + 1), MAX_TUN_MTU);
+        assert_eq!(clamp_mtu(1500), MAX_TUN_MTU);
+        assert_eq!(clamp_mtu(9000), MAX_TUN_MTU);
     }
 }

@@ -370,7 +370,15 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     } else {
         config.stun.clone()
     };
-    let mtu = if config.mtu < 576 { 1280 } else { config.mtu };
+    // 太小的值兜到 1280（移动网络友好），太大的夹到隧道上限 1424。
+    // 这个值同时喂给 VpnService.Builder.setMtu() 和数据面，所以必须在这里夹：
+    // 交给内核一个 1500 的 MTU，它就会按 1500 组包，而数据面拿到的也是 1500，
+    // 判不出"超长"，每个满包都被 QUIC 切成两段。
+    let mtu = if config.mtu < 576 {
+        1280
+    } else {
+        qp2p_core::route::clamp_mtu(config.mtu)
+    };
     // 保持在线时不设超时：会话里 `idle_timeout = None` 既不会断开直连，
     // 也不会进入休眠，长连接自然一直挂着。关掉时才按选定的档位休眠。
     let idle = idle_timeout(config.keep_online, config.idle_secs);

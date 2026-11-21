@@ -534,7 +534,13 @@ fn apply_form(ui: &Ui) -> Result<String> {
     let token = text_of(ui.token);
     let name = text_of(ui.name);
     let ip = text_of(ui.ip);
-    let mtu = text_of(ui.mtu).parse::<u64>().unwrap_or(1400);
+    // MTU 上限跟 core 保持一致：超过 1424 的包在 QUIC 流里会被切断，
+    // 这里夹一次并把输入框改回来，免得用户以为填的 1500 生效了
+    let raw_mtu = text_of(ui.mtu).parse::<u64>().unwrap_or(1400);
+    let mtu = raw_mtu.min(u64::from(qp2p_core::route::MAX_TUN_MTU));
+    if mtu != raw_mtu {
+        set_text(ui.mtu, &mtu.to_string());
+    }
     let idle = text_of(ui.idle).parse::<u64>().unwrap_or(0);
     gui::apply_form(&ui.state, &worker, &token, &name, &ip, mtu, idle)
 }

@@ -432,7 +432,8 @@ class AdvancedActivity : Activity() {
                     1 -> saveMtu(view, 1360)
                     2 -> saveMtu(view, 1420)
                     else -> askNumber("MTU", prefs.getInt(AppConfig.KEY_MTU, AppConfig.MTU_DEFAULT)) { n ->
-                        if (n in 576..9000) saveMtu(view, n) else toast("MTU 应在 576–9000 之间")
+                        // 上限 1424：再大的包在 QUIC 流里会被切成多段，反而更慢
+                        if (n in 576..1424) saveMtu(view, n) else toast("MTU 应在 576–1424 之间")
                     }
                 }
             }

@@ -130,7 +130,7 @@ qp2p1_<network_id>_<secret>
 |---|---|---|
 | `stream_receive_window` | 2 MB | 40 ms RTT 下单流上限约 400 Mbps；1.25 MB 只有 250 Mbps |
 | `receive_window` | 16 MB | **连接级必须有上限**：原来是 `VarInt::MAX`，`256 流 × 2 MB` 理论最坏 512 MB，能打死 256 MB 的设备。按「8 条满窗流」设计，10 个对端最坏 160 MB |
-| `initial_mtu` / `min_mtu` | 1400 / 1200 | PMTUD 被 ICMP 过滤阻断时不会退化到 1200；上限 1424 在 `TunConfig::for_network` 夹紧 |
+| `initial_mtu` / `min_mtu` | 1400 / 1200 | PMTUD 被 ICMP 过滤阻断时不会退化到 1200；内层上限 1424 由 `route::clamp_mtu` 在**配置源头**夹紧（见下） |
 | `keep_alive_interval` | 15 秒 | 空闲链路上也要周期性发出**需要对端回应**的 PING，`tun.rs` 的失效判据才有依据，同时兼顾 NAT 映射不被回收 |
 | ACK 频率阈值 | 10 | 收到 10 个包才回一次 ACK，省对端中断；`max_ack_delay` **刻意保持默认**——放宽它会直接抬高本端观测到的 RTT |
 | `initial_rtt` | 20 ms（内网候选）/ 默认 333 ms | 两个私网地址之间的 RTT 不可能几百毫秒，333 ms 会让 PTO 白等 1 秒 |
@@ -152,6 +152,17 @@ qp2p1_<network_id>_<secret>
 `app_limited = 发送缓冲空 && 未被拥塞卡住` 时直接返回，而隧道转发的流量恰好长期就是这个状态，
 永远退不出 Startup。三处叠加 = 窗口无上限 + 丢包不压窗口，对着有损链路就是一轮轮自伤。
 这些都在 quinn 内部，改不了，所以不对外暴露这个选项。
+
+**MTU 必须在配置源头夹，不能只夹在建卡处**：同一个 MTU 值有两个消费者——内核按它决定
+组多大的包，数据面按它判断要不要分片。只在 `route::open()` 里夹，会出现「内核发 1500、
+数据面也拿到 1500，`len > mtu` 不成立」的情况，于是每个满包在 QUIC 流里被切成两段，
+丢一段就要重传整个内层包。所以 `route::clamp_mtu()` 在三个源头各调一次：
+CLI（`up` 与 `tun` 两条路径）、Android（`prepared.mtu`，同时喂给
+`VpnService.setMtu()`）、Windows GUI（保存前）。`route::open()` 里再兜一次，
+防止以后新增调用方漏掉。
+
+历史上这处夹紧只写在 `TunConfig::for_network()` 里，而那个函数**没有任何调用点**，
+等于三端都没夹过——2026-11-22 核实后删掉死代码、改成上面的写法。
 
 刻意**没做**的两项：FlowTable 换哈希（实测查找只占 3% 的转发耗时，改哈希要动 key
 语义）；`dispatch` 同步化（会阻塞主循环，与懒打洞的 await 语义冲突，等于回到"一条流

@@ -833,6 +833,12 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             if mtu < 576 {
                 bail!("MTU 太小（{mtu}），隧道内层至少 576");
             }
+            if mtu > qp2p_core::route::MAX_TUN_MTU {
+                bail!(
+                    "MTU 最多 {}（超过的包在 QUIC 层被切断，反而更慢）",
+                    qp2p_core::route::MAX_TUN_MTU
+                );
+            }
             config.mtu = Some(mtu);
         }
         "dev" => config.dev = Some(value.to_string()),
@@ -1305,6 +1311,11 @@ fn open_tun(
         .parse()
         .with_context(|| format!("服务端给的网段不合法：{network_cidr}"))?;
 
+    // 必须在这里夹：同一个值既交给内核（决定它按多大组包），又交给数据面
+    // （决定超长包要不要分片）。只夹一处就会出现"内核发 1500、数据面按 1500
+    // 判不超长"，于是每个满包在 QUIC 流里被切成两段。
+    let mtu = qp2p_core::route::clamp_mtu(mtu);
+
     let config = qp2p_core::route::TunConfig {
         name: dev.to_string(),
         address: virtual_ip,
@@ -1467,6 +1478,7 @@ async fn cmd_tun(args: &[String]) -> Result<()> {
         .unwrap_or("1400")
         .parse()
         .context("--mtu 不是数字")?;
+    let mtu = qp2p_core::route::clamp_mtu(mtu);
 
     println!("本端 node_id: {}", engine.node_id());
     println!("虚拟地址   : {address}/{}", net.prefix);
