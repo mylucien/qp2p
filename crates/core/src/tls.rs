@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -76,7 +76,12 @@ fn prefer_chacha(provider: &mut rustls::crypto::CryptoProvider) {
     });
 }
 
-fn transport() -> quinn::TransportConfig {
+/// `initial_rtt` 为 None 时用 quinn 的默认值（333 ms，QUIC 规范的保守值）。
+///
+/// 局域网直连的真实 RTT 只有 1~10 ms，用 333 ms 起步会让初始 pacing 和
+/// PTO 都过于保守，建连后头几百毫秒跑不满。第一个 RTT 样本到手后
+/// quinn 会自己校正，所以这个值只影响建连初期。
+fn transport(initial_rtt: Option<Duration>) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_concurrent_bidi_streams(256u32.into());
@@ -93,6 +98,27 @@ fn transport() -> quinn::TransportConfig {
     // quinn 自己会往上爬到路径 MTU；PMTUD 被 ICMP 过滤阻断时也不会卡在 1200。
     transport.initial_mtu(1400);
     transport.min_mtu(1200);
+
+    if let Some(rtt) = initial_rtt {
+        transport.initial_rtt(rtt);
+    }
+
+    let tune = tuning();
+    if tune.bbr {
+        // quinn 的 BBR 是 BBRv1，标注 Experimental。它把丢包当随机噪声，
+        // 只进 Conservation（在途压到约 1 个 BDP），不像 Cubic 那样砍半。
+        // 共享出口（家庭宽带上行）上会比其他 TCP 流抢得更多，也会把
+        // bufferbloat 严重的链路队列周期性推满——所以默认关。
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        tracing::warn!("[tls] 拥塞控制已切到 BBR（实验性）：丢包不退让，共享出口时会影响其他流量");
+    }
+    if tune.ack_threshold > 0 {
+        let mut ack = quinn::AckFrequencyConfig::default();
+        ack.ack_eliciting_threshold(quinn::VarInt::from_u32(tune.ack_threshold));
+        // max_ack_delay 刻意不动：调大它会让丢包重传判定变慢，
+        // 对直播这种低延迟场景是负作用。只减少 ACK 数量。
+        transport.ack_frequency_config(Some(ack));
+    }
 
     transport
 }
@@ -215,14 +241,59 @@ impl TlsIdentity {
 
         let crypto = QuicServerConfig::try_from(tls).context("构建 QUIC 服务端配置失败")?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(Arc::new(transport()));
+        config.transport_config(Arc::new(transport(None)));
         Ok(config)
     }
+}
+
+/// 链路调优参数。
+///
+/// 放在进程级全局槽里，是为了不把配置一路穿到每个 TLS 构造函数——
+/// `transport()` 被 `client_config` / `server_config` 两条路径共用，
+/// 而它们的调用点遍布引擎、测试和 Android 外壳。一个进程只有一个
+/// 有效配置，正好适合全局设置一次。
+#[derive(Clone, Copy, Debug)]
+pub struct LinkTuning {
+    /// 用 BBR 代替默认的 Cubic。
+    pub bbr: bool,
+    /// 请求对端每 N 个 ack-eliciting 包回一次 ACK；0 表示保持 quinn 默认。
+    pub ack_threshold: u32,
+}
+
+impl Default for LinkTuning {
+    fn default() -> Self {
+        Self {
+            // BBR 是实验性的，而且在共享出口上比其他流抢得更多，默认必须关
+            bbr: false,
+            // 放宽 ACK 阈值是纯收益，默认开：每 10 个包回一次，
+            // 而 max_ack_delay 保持默认，不拖慢丢包判定
+            ack_threshold: 10,
+        }
+    }
+}
+
+static TUNING: OnceLock<LinkTuning> = OnceLock::new();
+
+/// 设置链路调优。重复调用只有第一次生效——配置在进程生命周期内不变。
+pub fn configure(tuning: LinkTuning) {
+    let _ = TUNING.set(tuning);
+}
+
+fn tuning() -> LinkTuning {
+    TUNING.get().copied().unwrap_or_default()
 }
 
 /// 客户端配置。`pin` 为 Some 时校验证书指纹，否则跳过校验
 /// （身份认证由 `peer::auth` 在连接建立后完成）。
 pub fn client_config(pin: Option<[u8; 32]>) -> Result<quinn::ClientConfig> {
+    client_config_with(pin, None)
+}
+
+/// 同上，但可以指定 `initial_rtt`（毫秒）。内网候选走这个版本。
+pub fn client_config_with(
+    pin: Option<[u8; 32]>,
+    initial_rtt_ms: Option<u64>,
+) -> Result<quinn::ClientConfig> {
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match pin {
         Some(expected) => Arc::new(PinnedVerify { expected }),
         None => Arc::new(SkipVerify),
@@ -238,7 +309,9 @@ pub fn client_config(pin: Option<[u8; 32]>) -> Result<quinn::ClientConfig> {
 
     let crypto = QuicClientConfig::try_from(tls).context("构建 QUIC 客户端配置失败")?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport()));
+    config.transport_config(Arc::new(transport(
+        initial_rtt_ms.map(Duration::from_millis),
+    )));
     Ok(config)
 }
 

@@ -33,6 +33,13 @@ const LISTEN_ATTEMPT: Duration = Duration::from_secs(35);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// 失败期间的保活间隔。家用 NAT 的 UDP 映射常见 30s~120s 回收。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// 内网候选的初始 RTT 估计（毫秒）。
+///
+/// 同一个交换机下的真实 RTT 是 1~10 ms，quinn 默认的 333 ms 会让初始
+/// pacing 和 PTO 都过于保守。只影响建连头几百毫秒，第一个 RTT 样本
+/// 到手后就按实测校正。取 20 而不是 5：留一点余量，避免起点太低
+/// 触发不必要的伪重传。
+const LAN_INITIAL_RTT_MS: u64 = 20;
 /// 保活包：3 字节魔数 + 类型，对端 quinn 会当作无效 QUIC 包丢弃。
 const KEEPALIVE_MAGIC: &[u8] = b"\x00QP2K";
 /// 打洞期间的开孔间隔。
@@ -60,6 +67,8 @@ pub struct Engine {
     tls: TlsIdentity,
     /// 钉扎对端证书的指纹；刷新端点后要重新应用
     pin_fp: Option<[u8; 32]>,
+    /// 内网候选专用：`initial_rtt` 贴着局域网实际值，而不是 quinn 的 333 ms
+    client_lan: Option<quinn::ClientConfig>,
     /// UPnP 映射句柄，退出/刷新时负责删除
     mapping: Option<upnp::Mapping>,
     renewer: Option<tokio::task::JoinHandle<()>>,
@@ -144,6 +153,7 @@ impl Engine {
         let renewer = start_upnp_renewer(mapping.clone());
         let (stun_shared, stun_task) = start_stun_watch(&mut bound, stun_servers, 0);
         let (accept, accept_task) = AcceptHub::spawn(bound.endpoint.clone());
+        let client_lan = crate::tls::client_config_with(None, Some(LAN_INITIAL_RTT_MS)).ok();
 
         Ok(Self {
             endpoint: Some(bound.endpoint),
@@ -157,6 +167,7 @@ impl Engine {
             identity,
             expected_peer: None,
             pin_fp: None,
+            client_lan,
             tls,
             mapping,
             renewer,
@@ -188,6 +199,7 @@ impl Engine {
         };
         self.pin_fp = pin;
         let config = crate::tls::client_config(pin)?;
+        self.client_lan = crate::tls::client_config_with(pin, Some(LAN_INITIAL_RTT_MS)).ok();
         // quinn 的 set_default_client_config 需要 &mut Endpoint，取出来改再放回
         if let Some(mut endpoint) = self.endpoint.take() {
             endpoint.set_default_client_config(config);
@@ -415,6 +427,8 @@ impl Engine {
                 endpoint.set_default_client_config(config);
             }
         }
+        self.client_lan =
+            crate::tls::client_config_with(self.pin_fp, Some(LAN_INITIAL_RTT_MS)).ok();
         self.endpoint = Some(endpoint.clone());
         let (accept, accept_task) = AcceptHub::spawn(endpoint);
         self.accept = Some(accept);
@@ -478,7 +492,16 @@ impl Engine {
         // 探针必须在 `punch_as` 被取消时也停下：`select!` 丢弃 future 时
         // 只是 drop 掉 JoinHandle，任务本身会一直发包到 `timeout` 到点。
         let _probe = self.spawn_probe(peers, timeout).map(AbortOnDrop);
-        punch::execute(endpoint, hub, peers, role, timeout, Some(handles)).await
+        punch::execute(
+            endpoint,
+            hub,
+            peers,
+            role,
+            timeout,
+            Some(handles),
+            self.client_lan.as_ref(),
+        )
+        .await
     }
 
     fn spawn_probe(

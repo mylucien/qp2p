@@ -271,6 +271,8 @@ fn config_path(flags: &Flags) -> PathBuf {
 fn load_config(flags: &Flags) -> Result<(Config, PathBuf)> {
     let path = config_path(flags);
     let config = Config::load(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // 链路调优只在这里设置一次：所有会建 Engine 的命令都先走 load_config
+    qp2p_core::tls::configure(config.link_tuning());
     Ok((config, path))
 }
 
@@ -803,7 +805,7 @@ fn print_config(config: &Config, path: &std::path::Path) {
         None => println!("网络     : 未加入（qp2p create / qp2p join）"),
     }
     println!("\n改一项：qp2p config set <项> <值>   撤销：qp2p config unset <项>");
-    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / ip");
+    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / ip");
 }
 
 fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
@@ -850,6 +852,13 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             }
             config.signal_transport = Some(choice);
         }
+        "congestion" | "cc" => {
+            let choice = value.trim().to_lowercase();
+            if !matches!(choice.as_str(), "cubic" | "bbr") {
+                bail!("拥塞控制只能是 cubic / bbr，你给的是 {value:?}");
+            }
+            config.congestion = Some(choice);
+        }
         "routes" | "route" => {
             let list = split_list(value);
             for raw in &list {
@@ -878,7 +887,7 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         other => bail!(
             "不认识的配置项：{other}\n\
-             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / ip"
+             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / ip"
         ),
     }
     Ok(())
@@ -895,6 +904,7 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         "dev" => config.dev = None,
         "stun" => config.stun = Config::default().stun,
         "transport" | "signal_transport" => config.signal_transport = None,
+        "congestion" | "cc" => config.congestion = None,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {
             if let Some(network) = config.network.as_mut() {

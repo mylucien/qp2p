@@ -7,12 +7,12 @@
 //! 而重试间隔是 30 秒起——手动开两个终端基本打不通。
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -21,6 +21,32 @@ use crate::peer::accept::AcceptHub;
 use crate::peer::auth::{self, AuthFailure};
 use crate::peer::Role;
 use crate::tls::SERVER_NAME;
+
+/// 内网地址：真实 RTT 只有几毫秒，值得用更贴近的 `initial_rtt` 起步。
+fn is_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// 发起连接。内网候选用低 `initial_rtt` 的配置，公网保持 quinn 默认。
+///
+/// 候选列表里没有类型字段（信令里就是纯地址），所以按地址判断：
+/// 私网/回环/链路本地必然是局域网，其余按公网处理。判断错了的代价
+/// 只是初始 pacing 保守或激进一点，第一个 RTT 样本到手就自动校正。
+fn connect(
+    endpoint: &Endpoint,
+    peer: SocketAddr,
+    lan: Option<&ClientConfig>,
+) -> Result<quinn::Connecting, quinn::ConnectError> {
+    match lan {
+        Some(config) if is_lan(peer.ip()) => {
+            endpoint.connect_with(config.clone(), peer, SERVER_NAME)
+        }
+        _ => endpoint.connect(peer, SERVER_NAME),
+    }
+}
 
 /// 单次握手等待上限，超时就再发一轮。
 const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
@@ -92,13 +118,14 @@ pub async fn execute(
     role: Role,
     timeout: Duration,
     auth: Option<AuthHandles>,
+    lan: Option<&ClientConfig>,
 ) -> Result<Punched, PunchError> {
     if candidates.is_empty() {
         return Err(PunchError::NoCandidates);
     }
     match role {
-        Role::Dialer => dial_all(endpoint, candidates, timeout, auth).await,
-        Role::Listener => listen_with_probes(endpoint, hub, candidates, timeout, auth).await,
+        Role::Dialer => dial_all(endpoint, candidates, timeout, auth, lan).await,
+        Role::Listener => listen_with_probes(endpoint, hub, candidates, timeout, auth, lan).await,
     }
 }
 
@@ -173,6 +200,7 @@ async fn dial_all(
     candidates: &[SocketAddr],
     timeout: Duration,
     auth: Option<AuthHandles>,
+    lan: Option<&ClientConfig>,
 ) -> Result<Punched, PunchError> {
     // 拨号方不接收入站：对端的探针会由端点的 accept 分发中心直接 refuse。
     // 以前这里自己起一条 drain 循环 close 掉入站连接，但它和同端点上别的
@@ -193,6 +221,8 @@ async fn dial_all(
     }
     let mut wrong_identity: HashSet<SocketAddr> = HashSet::new();
     let mut auth_notes: Vec<String> = Vec::new();
+    // spawn 出去的 future 必须是 'static，先把引用变成可克隆的持有值
+    let lan = lan.cloned();
 
     let result = loop {
         // 每个候选只发一条连接，让 QUIC 自己重传 Initial；
@@ -203,8 +233,13 @@ async fn dial_all(
             let endpoint = endpoint.clone();
             let addr = *addr;
             let auth = auth.clone();
-            attempts
-                .spawn(async move { (addr, attempt_once(&endpoint, addr, deadline, auth).await) });
+            let lan = lan.clone();
+            attempts.spawn(async move {
+                (
+                    addr,
+                    attempt_once(&endpoint, addr, deadline, auth, lan.as_ref()).await,
+                )
+            });
         }
 
         let mut winner = None;
@@ -264,9 +299,9 @@ async fn attempt_once(
     peer: SocketAddr,
     deadline: Instant,
     auth: Option<AuthHandles>,
+    lan: Option<&ClientConfig>,
 ) -> Result<Punched, AttemptError> {
-    let connecting = endpoint
-        .connect(peer, SERVER_NAME)
+    let connecting = connect(endpoint, peer, lan)
         .map_err(|e| AttemptError::Transient(format!("{peer}: 发起连接失败 {e}")))?;
 
     // 单个候选最多等 ATTEMPT_CAP，失败就进入下一轮，不拖住其他候选
@@ -344,6 +379,7 @@ async fn listen_with_probes(
     candidates: &[SocketAddr],
     timeout: Duration,
     auth: Option<AuthHandles>,
+    lan: Option<&ClientConfig>,
 ) -> Result<Punched, PunchError> {
     let deadline = Instant::now() + timeout;
 
@@ -466,7 +502,7 @@ async fn listen_with_probes(
             result = &mut accept_loop => return result,
             _ = tokio::time::sleep_until(next_probe) => {
                 for peer in candidates {
-                    if let Ok(connecting) = endpoint.connect(*peer, SERVER_NAME) {
+                    if let Ok(connecting) = connect(endpoint, *peer, lan) {
                         // 用后即弃的 Initial，只为打通自己这侧的 NAT
                         tokio::spawn(async move {
                             let _ = tokio::time::timeout(ATTEMPT_TIMEOUT, connecting).await;
