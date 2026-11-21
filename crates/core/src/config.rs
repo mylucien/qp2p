@@ -79,12 +79,6 @@ pub struct Config {
     /// （自动降级在下一步做）。不填时保持原有轮询行为，升级不影响现有使用者。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_transport: Option<String>,
-    /// QUIC 拥塞控制：`bbr` 开启 BBR，其它值或不填 = Cubic（默认）。
-    ///
-    /// BBR 是 quinn 的实验性实现，且丢包时不退让（只进 Conservation），
-    /// 共享出口上会比 Cubic 抢得更多，所以默认关闭。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub congestion: Option<String>,
     /// Linux 的 `SO_BUSY_POLL`（微秒）；不填或 0 = 关闭。
     ///
     /// 忙轮询能把收包延迟压掉几十微秒，代价是烧 CPU。弱核设备上
@@ -253,7 +247,6 @@ impl Default for Config {
             routes: Vec::new(),
             upnp: true,
             signal_transport: None,
-            congestion: None,
             busy_poll: None,
             network: None,
             forwards: Vec::new(),
@@ -262,10 +255,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 链路调优参数。只有显式写 `congestion = "bbr"` 才开 BBR。
+    /// 链路调优参数。目前只有忙轮询可调；拥塞控制固定 Cubic（见 `tls::LinkTuning`）。
     pub fn link_tuning(&self) -> crate::tls::LinkTuning {
         crate::tls::LinkTuning {
-            bbr: self.congestion.as_deref() == Some("bbr"),
             busy_poll_us: self.busy_poll.unwrap_or(0),
             ..Default::default()
         }

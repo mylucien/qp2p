@@ -46,7 +46,7 @@
 crates/core/src/
   identity.rs    Ed25519 身份、node_id、虚拟地址派生、TLS 证书与钉扎
   config.rs      TOML 配置、取值顺序（命令行 > 文件 > 默认）
-  tls.rs         传输参数（窗口 / MTU / 拥塞控制 / ACK 策略 / 忙轮询）+ 进程级 LinkTuning
+  tls.rs         传输参数（窗口 / MTU / ACK 策略 / 忙轮询）+ 进程级 LinkTuning
   candidate.rs   候选地址：收集、优先级、去重
   stun.rs        STUN Binding 编解码
   stun_watch.rs  STUN 探测调度（换网后重探）
@@ -81,7 +81,7 @@ signal/          单文件 Cloudflare Worker + 本地冒烟测试
 | 启动先试 UPnP | 映射成功就多一个 `upnp` 候选，租约过半续租 | 家用路由器命中率高，省掉打洞的不确定性 |
 | 发送队列按字节计 | 单流 256 KB、全局 32 MB 预算，满则丢新包 | 按包数算时 64 KB 大包与 40 字节 ACK 共用一个上限；`256 流 × 64 包 × 64 KB` 最坏 1 GB，能打死 438 MB 的设备 |
 | 超 MTU 就分片 | 按 IPv4 规则切 8 字节对齐的片，复制原头重算校验和、清 DF | 直接丢包的故障表现是「小包通、大包不通」，用户只会认为"网络时通时不通" |
-| BBR 默认关 | `congestion = cubic`，开了才切 BBR 并打 warn | BBRv1 丢包只进 `Conservation`、每 8 RTT 周期性过冲；共享家庭上行时会挤占同链路 TCP，浅缓冲下反而更差。quinn 自己标注 Experimental |
+| 拥塞控制不开放选项 | 固定 Cubic；曾经提供 `congestion = "bbr"`，0.1.16 实测后整条删除 | 不是「BBR 太强势」这种口味问题，是实测连接每分钟被摘一次：quinn 的 BBR 初始窗口 200 包（240 KB）、`calculate_cwnd` 拿增益和字节数比导致 Startup 窗口无上限、`app_limited` 时永不退出 Startup。零散流量的隧道正好踩满这三条，结果是往对端链路灌爆 → 对端 RTO 退避 8 秒 → 被我们自己的失效判据摘掉 |
 | 收包零拷贝切帧 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 一次 `copy_from_slice`，2000 pps 下就是每秒 2000 次 malloc |
 | 忙轮询默认关 | `busy_poll_us = 0`；Linux 上按配置设 `SO_BUSY_POLL`，失败只记 info | 拿 CPU 换几十微秒延迟，默认打开会让小主机的低功耗核持续升温 |
 
@@ -137,13 +137,21 @@ qp2p1_<network_id>_<secret>
 | 发送队列 | 单流 256 KB / 全局 32 MB | 按字节而非包数，跨流共享一份预算；`Mutex<VecDeque>` + `AtomicUsize` + `Notify`，`Drop for FlowQueue` 兜底归还预算 |
 | MTU 溢出处理 | IPv4 分片 | `ip::fragment()`：载荷 8 字节对齐、偏移 `offset/8`、`MF` 除末片置 1、重算校验和、清 `DF` |
 
-`LinkTuning` 只有三个字段，全部**默认保守**：
+`LinkTuning` 只有两个字段，都**默认保守**：
 
-- `bbr: bool`（默认 `false` → Cubic）。开时打 warn，因为 quinn 把 BBR 标为 Experimental。
 - `ack_threshold: u32`（默认 10）。走 `ack_frequency_config`，由 `peer_supports_ack_frequency()`
-  守卫，老对端收不到这个帧，向后安全。
+  守卫，老对端收不到这个帧，向后安全。`max_ack_delay` 不动。
 - `busy_poll_us: u32`（默认 0）。linux-only `setsockopt(SOL_SOCKET, SO_BUSY_POLL)`，
   失败只 `info`——需要 `CAP_NET_ADMIN` 与 `CONFIG_NET_RX_BUSY_POLL`，缺了也照常工作。
+
+**为什么没有拥塞控制开关**：见决策表「拥塞控制不开放选项」。简单说，quinn 0.11 的
+`BbrConfig` 初始窗口是 `K_MAX_INITIAL_CONGESTION_WINDOW(200) × BASE_DATAGRAM_SIZE = 240 KB`，
+而 `calculate_cwnd()` 里判断是否继续增长写的是
+`self.cwnd_gain < target_window as f32`——拿增益（2.885）和字节数比，恒为真，于是 Startup
+阶段每个 ACK 都 `cwnd += bytes_acked`；同时 `check_if_full_bw_reached()` 在
+`app_limited = 发送缓冲空 && 未被拥塞卡住` 时直接返回，而隧道转发的流量恰好长期就是这个状态，
+永远退不出 Startup。三处叠加 = 窗口无上限 + 丢包不压窗口，对着有损链路就是一轮轮自伤。
+这些都在 quinn 内部，改不了，所以不对外暴露这个选项。
 
 刻意**没做**的两项：FlowTable 换哈希（实测查找只占 3% 的转发耗时，改哈希要动 key
 语义）；`dispatch` 同步化（会阻塞主循环，与懒打洞的 await 语义冲突，等于回到"一条流

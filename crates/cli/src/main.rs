@@ -790,13 +790,6 @@ fn print_config(config: &Config, path: &std::path::Path) {
     );
     println!("STUN     : {}", config.stun.join(", "));
     println!(
-        "拥塞控制 : {}",
-        match config.congestion.as_deref() {
-            Some("bbr") => "bbr（实验性，丢包不退让）",
-            _ => "cubic（默认）",
-        }
-    );
-    println!(
         "忙轮询   : {}",
         match config.busy_poll {
             Some(us) => format!("{us} us"),
@@ -819,7 +812,7 @@ fn print_config(config: &Config, path: &std::path::Path) {
         None => println!("网络     : 未加入（qp2p create / qp2p join）"),
     }
     println!("\n改一项：qp2p config set <项> <值>   撤销：qp2p config unset <项>");
-    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / busy_poll / ip");
+    println!("可用项：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / busy_poll / ip");
 }
 
 fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
@@ -866,13 +859,12 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             }
             config.signal_transport = Some(choice);
         }
-        "congestion" | "cc" => {
-            let choice = value.trim().to_lowercase();
-            if !matches!(choice.as_str(), "cubic" | "bbr") {
-                bail!("拥塞控制只能是 cubic / bbr，你给的是 {value:?}");
-            }
-            config.congestion = Some(choice);
-        }
+        "congestion" | "cc" => bail!(
+            "拥塞控制固定用 Cubic，不再提供选项\n\
+             0.1.16 试过 BBR，实测连接每分钟被摘一次：quinn 的 BBR 初始窗口 200 包、\n\
+             Startup 阶段窗口无上限增长，零散流量下退不出 Startup，会把对端链路灌爆。\n\
+             清掉旧配置里这一行：qp2p config unset congestion"
+        ),
         "busy_poll" | "busy-poll" => {
             let micros: u32 = value
                 .parse()
@@ -910,7 +902,7 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         other => bail!(
             "不认识的配置项：{other}\n\
-             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / congestion / busy_poll / ip"
+             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / busy_poll / ip"
         ),
     }
     Ok(())
@@ -927,7 +919,8 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         "dev" => config.dev = None,
         "stun" => config.stun = Config::default().stun,
         "transport" | "signal_transport" => config.signal_transport = None,
-        "congestion" | "cc" => config.congestion = None,
+        // 已移除的选项：清一下旧配置里的残留键，不报错也不算失败
+        "congestion" | "cc" => {}
         "busy_poll" | "busy-poll" => config.busy_poll = None,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {

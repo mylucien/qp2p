@@ -104,14 +104,6 @@ fn transport(initial_rtt: Option<Duration>) -> quinn::TransportConfig {
     }
 
     let tune = tuning();
-    if tune.bbr {
-        // quinn 的 BBR 是 BBRv1，标注 Experimental。它把丢包当随机噪声，
-        // 只进 Conservation（在途压到约 1 个 BDP），不像 Cubic 那样砍半。
-        // 共享出口（家庭宽带上行）上会比其他 TCP 流抢得更多，也会把
-        // bufferbloat 严重的链路队列周期性推满——所以默认关。
-        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-        tracing::warn!("[tls] 拥塞控制已切到 BBR（实验性）：丢包不退让，共享出口时会影响其他流量");
-    }
     if tune.ack_threshold > 0 {
         let mut ack = quinn::AckFrequencyConfig::default();
         ack.ack_eliciting_threshold(quinn::VarInt::from_u32(tune.ack_threshold));
@@ -252,10 +244,14 @@ impl TlsIdentity {
 /// `transport()` 被 `client_config` / `server_config` 两条路径共用，
 /// 而它们的调用点遍布引擎、测试和 Android 外壳。一个进程只有一个
 /// 有效配置，正好适合全局设置一次。
+///
+/// **没有拥塞控制选项**：曾经提供过 `congestion = "bbr"`，2026-11-22 实测
+/// 在 4G + 家用路由器上会让连接每分钟被自己摘一次。根因在 quinn 的 BBR
+/// 实现（初始窗口 200 包 ≈ 240 KB、Startup 阶段 `cwnd += bytes_acked` 无上限、
+/// `app_limited` 时永远退不出 Startup），不是配置问题，所以整条路径删除，
+/// 固定用 Cubic。详见 DESIGN.md「数据面调优」。
 #[derive(Clone, Copy, Debug)]
 pub struct LinkTuning {
-    /// 用 BBR 代替默认的 Cubic。
-    pub bbr: bool,
     /// 请求对端每 N 个 ack-eliciting 包回一次 ACK；0 表示保持 quinn 默认。
     pub ack_threshold: u32,
     /// Linux 的 `SO_BUSY_POLL`（微秒）；0 表示关闭。
@@ -268,8 +264,6 @@ pub struct LinkTuning {
 impl Default for LinkTuning {
     fn default() -> Self {
         Self {
-            // BBR 是实验性的，而且在共享出口上比其他流抢得更多，默认必须关
-            bbr: false,
             // 放宽 ACK 阈值是纯收益，默认开：每 10 个包回一次，
             // 而 max_ack_delay 保持默认，不拖慢丢包判定
             ack_threshold: 10,

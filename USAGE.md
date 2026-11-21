@@ -346,31 +346,16 @@ qp2p config unset transport     # 回默认（auto）
 - **日志**：长连接建立、断开、空闲休眠断连各打一条 `info`（重复重连失败仍是 `debug`）。
   排查"为什么没连上"先看这三条，再开 `RUST_LOG=debug`。
 
-### 传输调优（拥塞控制 / 忙轮询 / MTU）
+### 传输调优（忙轮询 / MTU）
 
-三个旋钮，**默认值对所有设备都安全**，不确定就别改。都在 `load_config` 时读一次，
+两个旋钮，**默认值对所有设备都安全**，不确定就别改。都在 `load_config` 时读一次，
 改完要重启 `qp2p up`（Android 上是断开再连）才生效。
 
-#### 拥塞控制：`congestion`
-
-```bash
-qp2p config set congestion bbr     # 想试 BBR
-qp2p config set congestion cubic   # 回默认（Cubic）
-qp2p config unset congestion       # 等同 cubic
-qp2p config                         # 看当前值
-```
-
-| 值 | 说明 |
-|---|---|
-| `cubic`（默认） | Linux 默认算法，行为大家都熟；丢包会退让，跟同链路的 TCP 公平共处 |
-| `bbr` | quinn 内置的 BBRv1，**官方标注 Experimental**。丢包时只把在途量压到约 1 个 BDP、不砍窗口，所以高丢包长肥管道上明显更快；换来的代价是**共享上行的场景更强势**——它会周期性（每 8 个 RTT）抬高发送速率试探带宽，同一条家庭宽带上别人的视频/下载可能更卡，浅缓冲路由上反而可能更差 |
-
-这是**每台机器各自**的二选一，不是全网开关；只作用于 qp2p 自己那几条 QUIC 连接，不动系统 `sysctl`，也不影响机器上其它进程。
-
-验收：开 BBR 后 `qp2p up` 的日志里会多一行
-`[tls] 拥塞控制已切到 BBR（实验性）：丢包不退让，共享出口时会影响其他流量`。没这行就是没生效（`qp2p config` 里值没错的话，检查是不是改完没重启）。
-
-**建议**：只在「自己的链路、自己独占上行、丢包明显（>1%）」时开。家里有人在看视频、或者你在上传东西，就留 Cubic。
+> **没有拥塞控制选项**。0.1.16 提供过 `congestion = "bbr"`，实测（4G + 家用路由器）
+> 连接存活只有 1~2 分钟，每次都报「对端 8 秒没有回包」然后重连，换回 Cubic 立刻稳定。
+> 根因在 quinn 的 BBR 实现（初始窗口 200 包、Startup 阶段窗口无上限增长、零散流量下
+> 退不出 Startup），不是配置能修的，因此整条路径已删除，固定用 Cubic。
+> 旧配置里还留着 `congestion` 行的，`qp2p config unset congestion` 清掉即可，留着也会被忽略。
 
 #### 忙轮询：`busy_poll`
 
@@ -413,7 +398,7 @@ qp2p config set routes 192.168.1.0/24,192.168.2.0/24
 qp2p config unset mtu            # 回到默认
 ```
 
-可用项：`worker` `admin_secret` `node_name` `listen` `mtu` `dev` `stun` `routes` `transport` `congestion` `busy_poll` `ip`。
+可用项：`worker` `admin_secret` `node_name` `listen` `mtu` `dev` `stun` `routes` `transport` `busy_poll` `ip`。
 取值顺序：命令行 > 配置文件 > 默认值。想让这次的命令行选择长期生效就加 `--save`：
 
 ```bash
@@ -778,7 +763,7 @@ ls -l ~/.qp2p            # 属主应当是你，而不是 root
 | 连着显示正常，但业务突然不通 | 先看有没有上面那条提示。有 = 正在自动重建；没有 = 按下一节抓日志确认 |
 | 小包 ping 得通、大包不通 | MTU 不匹配。超大包现在会自动分片，仍不通就把两端 `mtu` 都降到 1280 试（见「[大包与 MTU](#大包与-mtu)」） |
 | 日志「包比 MTU 大（1400 > 1280）且无法分片」 | 那个包没有合法 IPv4 头（不是 ICMPv6 隧道就是网卡驱动塞了奇怪的东西），只能丢。偶发一条不用管 |
-| 开了 BBR 之后同一条宽带上的视频变卡 | 预期行为，见「[拥塞控制](#拥塞控制congestion)」；改回 `qp2p config set congestion cubic` |
+| 配置里还有 `congestion = "bbr"` | 这个选项已删除，留着被忽略、不影响运行；`qp2p config unset congestion` 清掉 |
 
 ### 直连为什么会被判定失效
 
