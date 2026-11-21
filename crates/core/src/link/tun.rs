@@ -1024,7 +1024,31 @@ async fn dispatch(
     }
 
     if packet.len() > mtu {
-        bail!("包比 MTU 大（{} > {mtu}），内核本应分片", packet.len());
+        // 正常路径走不到这里：TUN 的 MTU 建的时候就夹到 1424 了。
+        // 但配置被外部改过、或设备带上 GSO 时仍可能出现超大包，
+        // 直接丢的后果是"能 ping 通、大流量全废"，所以切开送出去。
+        let oversized = packet.len();
+        match ip::fragment(&packet, mtu) {
+            Some(pieces) => {
+                let count = pieces.len();
+                for piece in pieces {
+                    // dispatch 是 async 递归，必须装箱才能算出大小
+                    Box::pin(dispatch(
+                        route,
+                        flows,
+                        to_tun,
+                        local,
+                        piece,
+                        mtu,
+                        queue_budget,
+                    ))
+                    .await?;
+                }
+                tracing::debug!("[tun] {oversized} 字节的包超过 MTU {mtu}，已切成 {count} 片");
+                return Ok(());
+            }
+            None => bail!("包比 MTU 大（{oversized} > {mtu}）且无法分片"),
+        }
     }
 
     // 2. 已有流：入队即返回，绝不等网络

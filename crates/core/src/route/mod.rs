@@ -102,6 +102,13 @@ fn mask_of(prefix: u8) -> u32 {
 }
 
 /// 虚拟网卡的配置。
+/// 虚拟网卡 MTU 的上限。
+///
+/// quinn 的 MTU 发现上限默认 1452（以太网 1500 减去 IPv4 20 + UDP 8），
+/// 内层 IP 包再套自己的 20 字节头就是 1424。超过这个值的包在 QUIC 层
+/// 发不出去，只能在这里分片或丢弃。
+pub const MAX_TUN_MTU: u16 = 1424;
+
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     /// 设备名。Linux 上限 15 字节；Windows 上是适配器名，可任意。
@@ -117,6 +124,18 @@ pub struct TunConfig {
 impl TunConfig {
     /// 按 node_id 派生的虚拟地址加上网段，拼出一份配置。
     pub fn for_network(network: Cidr, address: Ipv4Addr, mtu: u16) -> Self {
+        // 大于这个值的包在 QUIC 层发不出去：quinn 的 MTU 发现上限是 1452，
+        // 减去 IPv4 头 20 和 UDP 头 8 就只剩 1424 给内层 IP 包。
+        // 交给内核一个更大的 MTU，它会按 1500 组包，然后每一个满包都在
+        // 这里被分片或丢掉——表现为"能 ping 通、大流量全废"。
+        let mtu = if mtu > MAX_TUN_MTU {
+            tracing::warn!(
+                "[tun] MTU {mtu} 超过隧道上限，已夹到 {MAX_TUN_MTU}（QUIC 的 MTU 发现上限 1452 减 28）"
+            );
+            MAX_TUN_MTU
+        } else {
+            mtu
+        };
         Self {
             name: "qp2p0".to_string(),
             address,

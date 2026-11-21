@@ -103,6 +103,73 @@ pub fn is_echo_request(packet: &IpPacket<'_>) -> bool {
     packet.raw.len() >= ihl + 8 && packet.raw[ihl] == ICMP_ECHO_REQUEST
 }
 
+/// 按 IPv4 规则把一个超过 `mtu` 的包切开，返回每一片的完整报文（含 IP 头）。
+///
+/// 只在"本该不发生"的情况下用到：TUN 的 MTU 建的时候已经夹到 1424，
+/// 内核不会再交来更大的包。但配置被外部改动过、或设备带上 GSO 时仍可能
+/// 出现超大包，直接丢的后果是"能 ping 通、大流量全废"，所以切开送出去。
+///
+/// 以下情况返回 `None`，由调用方决定丢包：
+/// - 不需要分片（`packet.len() <= mtu`）
+/// - 已经是分片（MF 置位或偏移非 0）：再切要重算偏移，而且这种包本该已 ≤ MTU
+/// - `mtu` 装不下一个 8 字节片段（偏移字段以 8 字节为单位，小于这个没法切）
+///
+/// 每片复制原包头（含 options），只改总长度、分片字段和头校验和。
+/// 分片后端口信息丢失，这些片会归到 `(proto, src, dst, 0, 0)` 那条流——
+/// 只影响"配置错误"这个兜底路径，正常流量不会走到。
+pub fn fragment(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
+    if packet.len() <= mtu || packet.first()? >> 4 != 4 {
+        return None;
+    }
+    let ihl = header_len(packet)?;
+
+    let frag = u16::from_be_bytes([packet[6], packet[7]]);
+    // MF 或非零偏移都说明这已经是一片，不能二次切
+    if frag & 0x3fff != 0 {
+        return None;
+    }
+
+    let declared = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    let total = declared.min(packet.len());
+    if total <= ihl {
+        return None;
+    }
+
+    // 除最后一片外，每片载荷必须是 8 的倍数
+    let chunk = ((mtu - ihl) / 8) * 8;
+    if chunk == 0 {
+        return None;
+    }
+
+    let payload = &packet[ihl..total];
+    let mut pieces = Vec::with_capacity(payload.len() / chunk + 1);
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let end = (offset + chunk).min(payload.len());
+        let mut piece = Vec::with_capacity(ihl + (end - offset));
+        piece.extend_from_slice(&packet[..ihl]);
+        piece.extend_from_slice(&payload[offset..end]);
+
+        let more = end < payload.len();
+        // 保留原保留位，清掉 DF（已经分了，再带 DF 会被中间设备丢），
+        // 其余按本片重写
+        let field =
+            (frag & 0x8000) | if more { 0x2000 } else { 0 } | u16::try_from(offset / 8).ok()?;
+        piece[6..8].copy_from_slice(&field.to_be_bytes());
+        let len = u16::try_from(piece.len()).ok()?;
+        piece[2..4].copy_from_slice(&len.to_be_bytes());
+
+        // 长度和分片字段都变了，头校验和必须重算
+        piece[10..12].fill(0);
+        let sum = checksum(&piece[..ihl]);
+        piece[10..12].copy_from_slice(&sum.to_be_bytes());
+
+        pieces.push(piece);
+        offset = end;
+    }
+    Some(pieces)
+}
+
 /// 把 ICMP echo request 翻成 echo reply（交换地址、改类型、重算校验和）。
 ///
 /// 远端不开 `ip_forward` 也能 ping 通，这是判断"连没连上"的第一反应。
@@ -265,5 +332,77 @@ mod tests {
     fn non_echo_is_not_answered() {
         let pkt = tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 1, 2);
         assert!(echo_reply(&parse(&pkt).unwrap()).is_none());
+    }
+
+    // --- 超 MTU 分片 -----------------------------------------------------
+
+    fn big_packet(total: usize, frag_field: u16) -> Vec<u8> {
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        let len = total as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        p[6..8].copy_from_slice(&frag_field.to_be_bytes());
+        p[8] = 64;
+        p[9] = PROTO_UDP;
+        p[12..16].copy_from_slice(&[10, 64, 0, 2]);
+        p[16..20].copy_from_slice(&[10, 64, 0, 9]);
+        let sum = checksum(&p[..IPV4_HEADER_LEN]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn oversized_packet_is_split_on_eight_byte_boundaries() {
+        // DF 置位的 1500 字节包，按 1424 切
+        let pkt = big_packet(1500, 0x4000);
+        let pieces = fragment(&pkt, 1424).expect("1500 超过 1424，应当分片");
+        // 每片载荷 1400（8 的倍数），1480 字节载荷正好两片
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].len(), IPV4_HEADER_LEN + 1400);
+        assert_eq!(pieces[1].len(), IPV4_HEADER_LEN + 80);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([pieces[0][2], pieces[0][3]])),
+            pieces[0].len(),
+            "总长度必须与实际长度一致"
+        );
+
+        let f0 = u16::from_be_bytes([pieces[0][6], pieces[0][7]]);
+        assert_eq!(f0 & 0x2000, 0x2000, "第一片还有后续，MF 要置位");
+        assert_eq!(f0 & 0x1fff, 0, "第一片偏移为 0");
+        assert_eq!(f0 & 0x4000, 0, "分了片就不能再带 DF");
+
+        let f1 = u16::from_be_bytes([pieces[1][6], pieces[1][7]]);
+        assert_eq!(f1 & 0x2000, 0, "最后一片不该再置 MF");
+        assert_eq!(f1 & 0x1fff, 1400 / 8, "第二片偏移按 8 字节为单位");
+
+        // 每片的头校验和都必须能被接收端验过
+        for (i, piece) in pieces.iter().enumerate() {
+            assert_eq!(
+                checksum(&piece[..IPV4_HEADER_LEN]),
+                0,
+                "第 {i} 片的头校验和不对"
+            );
+            // 载荷要首尾相接、字节不变
+            let expect = if i == 0 {
+                &pkt[IPV4_HEADER_LEN..IPV4_HEADER_LEN + 1400]
+            } else {
+                &pkt[IPV4_HEADER_LEN + 1400..]
+            };
+            assert_eq!(&piece[IPV4_HEADER_LEN..], expect);
+        }
+    }
+
+    #[test]
+    fn fragment_declines_when_it_cannot_help() {
+        let small = big_packet(1000, 0);
+        assert!(fragment(&small, 1424).is_none(), "没超限不该分片");
+
+        // 已经是分片：MF 置位
+        let already = big_packet(1500, 0x2000);
+        assert!(fragment(&already, 1424).is_none(), "不能二次分片");
+
+        // MTU 小到装不下一个 8 字节片段
+        let pkt = big_packet(1500, 0);
+        assert!(fragment(&pkt, 24).is_none());
     }
 }
