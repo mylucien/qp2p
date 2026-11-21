@@ -1035,10 +1035,10 @@ async fn dispatch(
     if let Some((_, queue, _)) = flows.get_mut(&key, now) {
         match queue.try_push(packet) {
             Ok(()) => return Ok(()),
-            Err(PushError::Full(_)) => {
+            Err(PushError::Full(dropped)) => {
                 // 队列满说明这条流的写动作跟不上。丢包让内层 TCP 退避重传，
                 // 比让主循环等它强得多。
-                tracing::trace!("[tun] {key:?} 发送队列满，丢包");
+                tracing::trace!("[tun] {key:?} 发送队列满，丢 {} 字节", dropped.len());
                 return Ok(());
             }
             Err(PushError::Closed(back)) => {
@@ -1106,7 +1106,7 @@ struct FlowWriter {
 }
 
 impl FlowWriter {
-    async fn run(mut self) {
+    async fn run(self) {
         // 建流在这里等：配额用尽时只挂住这一条流，主循环照常收包
         let (mut send, mut recv) =
             match tokio::time::timeout(OPEN_TIMEOUT, self.conn.open_bi()).await {
