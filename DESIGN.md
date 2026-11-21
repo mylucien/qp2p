@@ -46,6 +46,7 @@
 crates/core/src/
   identity.rs    Ed25519 身份、node_id、虚拟地址派生、TLS 证书与钉扎
   config.rs      TOML 配置、取值顺序（命令行 > 文件 > 默认）
+  tls.rs         传输参数（窗口 / MTU / 拥塞控制 / ACK 策略 / 忙轮询）+ 进程级 LinkTuning
   candidate.rs   候选地址：收集、优先级、去重
   stun.rs        STUN Binding 编解码
   stun_watch.rs  STUN 探测调度（换网后重探）
@@ -78,6 +79,11 @@ signal/          单文件 Cloudflare Worker + 本地冒烟测试
 | 无中继且诚实 | 打不通就报失败，对称 NAT 明确标注 | 假装成功比失败更难排查 |
 | 多租户横向扩展 | 一个 Worker 多网络，节点不做多归属 | 多归属要引入多地址/多路由/多连接表，收益极小 |
 | 启动先试 UPnP | 映射成功就多一个 `upnp` 候选，租约过半续租 | 家用路由器命中率高，省掉打洞的不确定性 |
+| 发送队列按字节计 | 单流 256 KB、全局 32 MB 预算，满则丢新包 | 按包数算时 64 KB 大包与 40 字节 ACK 共用一个上限；`256 流 × 64 包 × 64 KB` 最坏 1 GB，能打死 438 MB 的设备 |
+| 超 MTU 就分片 | 按 IPv4 规则切 8 字节对齐的片，复制原头重算校验和、清 DF | 直接丢包的故障表现是「小包通、大包不通」，用户只会认为"网络时通时不通" |
+| BBR 默认关 | `congestion = cubic`，开了才切 BBR 并打 warn | BBRv1 丢包只进 `Conservation`、每 8 RTT 周期性过冲；共享家庭上行时会挤占同链路 TCP，浅缓冲下反而更差。quinn 自己标注 Experimental |
+| 收包零拷贝切帧 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 一次 `copy_from_slice`，2000 pps 下就是每秒 2000 次 malloc |
+| 忙轮询默认关 | `busy_poll_us = 0`；Linux 上按配置设 `SO_BUSY_POLL`，失败只记 info | 拿 CPU 换几十微秒延迟，默认打开会让小主机的低功耗核持续升温 |
 
 ## 5. 协议
 
@@ -114,6 +120,34 @@ qp2p1_<network_id>_<secret>
 - 打洞探针复用 QUIC Initial；listener 长时间 accept 并周期性发探针，dialer 只发一条连接、重传交给 QUIC
 - 双方在流上交换 `HELLO`/`ACK`，再做一次带 **TLS 会话导出值** 的 Ed25519 互签
 - 数据面：`u16 len + IP 包`，一条流承载一个 flow 的全部包，双向；TCP 半关闭后 60 秒回收
+
+### 数据面调优
+
+传输参数集中在 `crates/core/src/tls.rs` 的 `transport()`，进程级开关在 `LinkTuning`
+（`OnceLock`，`cli` 启动时 `tls::configure()` 灌入，Android 走默认值）。
+
+| 参数 | 值 | 理由 |
+|---|---|---|
+| `stream_receive_window` | 2 MB | 40 ms RTT 下单流上限约 400 Mbps；1.25 MB 只有 250 Mbps |
+| `receive_window` | 16 MB | **连接级必须有上限**：原来是 `VarInt::MAX`，`256 流 × 2 MB` 理论最坏 512 MB，能打死 256 MB 的设备。按「8 条满窗流」设计，10 个对端最坏 160 MB |
+| `initial_mtu` / `min_mtu` | 1400 / 1200 | PMTUD 被 ICMP 过滤阻断时不会退化到 1200；上限 1424 在 `TunConfig::for_network` 夹紧 |
+| `keep_alive_interval` | 15 秒 | 空闲链路上也要周期性发出**需要对端回应**的 PING，`tun.rs` 的失效判据才有依据，同时兼顾 NAT 映射不被回收 |
+| ACK 频率阈值 | 10 | 收到 10 个包才回一次 ACK，省对端中断；`max_ack_delay` **刻意保持默认**——放宽它会直接抬高本端观测到的 RTT |
+| `initial_rtt` | 20 ms（内网候选）/ 默认 333 ms | 两个私网地址之间的 RTT 不可能几百毫秒，333 ms 会让 PTO 白等 1 秒 |
+| 发送队列 | 单流 256 KB / 全局 32 MB | 按字节而非包数，跨流共享一份预算；`Mutex<VecDeque>` + `AtomicUsize` + `Notify`，`Drop for FlowQueue` 兜底归还预算 |
+| MTU 溢出处理 | IPv4 分片 | `ip::fragment()`：载荷 8 字节对齐、偏移 `offset/8`、`MF` 除末片置 1、重算校验和、清 `DF` |
+
+`LinkTuning` 只有三个字段，全部**默认保守**：
+
+- `bbr: bool`（默认 `false` → Cubic）。开时打 warn，因为 quinn 把 BBR 标为 Experimental。
+- `ack_threshold: u32`（默认 10）。走 `ack_frequency_config`，由 `peer_supports_ack_frequency()`
+  守卫，老对端收不到这个帧，向后安全。
+- `busy_poll_us: u32`（默认 0）。linux-only `setsockopt(SOL_SOCKET, SO_BUSY_POLL)`，
+  失败只 `info`——需要 `CAP_NET_ADMIN` 与 `CONFIG_NET_RX_BUSY_POLL`，缺了也照常工作。
+
+刻意**没做**的两项：FlowTable 换哈希（实测查找只占 3% 的转发耗时，改哈希要动 key
+语义）；`dispatch` 同步化（会阻塞主循环，与懒打洞的 await 语义冲突，等于回到"一条流
+卡死整条隧道"的老问题）。
 
 ## 6. 信令服务的存储与限额
 
