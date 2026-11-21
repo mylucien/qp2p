@@ -821,6 +821,7 @@ struct FlowQueueInner {
 
 /// 入队失败。两种情况都要把包还给调用方：满了直接丢，
 /// 关了要挂到新开的流上，不能凭空少一个包。
+#[derive(Debug)]
 enum PushError {
     Full(Vec<u8>),
     Closed(Vec<u8>),
