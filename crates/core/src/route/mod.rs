@@ -104,9 +104,15 @@ fn mask_of(prefix: u8) -> u32 {
 
 /// 虚拟网卡 MTU 的上限。
 ///
-/// quinn 的 MTU 发现上限默认 1452（以太网 1500 减去 IPv4 20 + UDP 8），
-/// 内层 IP 包再套自己的 20 字节头就是 1424。超过这个值的包在 QUIC 层
-/// 发不出去，只能在这里分片或丢弃。
+/// quinn 的 MTU 发现上限 `upper_bound` 默认 1452，这个数是 **UDP 载荷**
+/// 上限（一个 QUIC 包的总长），不是 IP 包上限——以太网 1500 减 IPv4 头 20
+/// 和 UDP 头 8 之后，剩下的全归 QUIC。1452 里还要装短包头 1 字节、包号
+/// 2~4 字节、AEAD 标签 16 字节、STREAM 帧头 6~8 字节，留给内层 IP 包的
+/// 净空间约 **1423~1425** 字节。
+///
+/// 取 1424 是卡着这个边界定的，再大就装不进一个 QUIC 包。不过所有帧走
+/// 同一条字节流、quinn 会跨包切分，即便某个包号编码长度下差几个字节，
+/// 也只是多一个 STREAM 帧，不影响正确性。
 pub const MAX_TUN_MTU: u16 = 1424;
 
 /// 把 MTU 夹到隧道能承受的上限，超出时打一条 warn。
@@ -118,7 +124,7 @@ pub const MAX_TUN_MTU: u16 = 1424;
 pub fn clamp_mtu(mtu: u16) -> u16 {
     if mtu > MAX_TUN_MTU {
         tracing::warn!(
-            "[tun] MTU {mtu} 超过隧道上限，已夹到 {MAX_TUN_MTU}（QUIC 的 MTU 发现上限 1452 减 28）"
+            "[tun] MTU {mtu} 超过隧道上限，已夹到 {MAX_TUN_MTU}（一个 QUIC 包装得下的最大内层 IP 包）"
         );
         MAX_TUN_MTU
     } else {
