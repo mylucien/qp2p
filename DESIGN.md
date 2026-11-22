@@ -79,10 +79,10 @@ signal/          单文件 Cloudflare Worker + 本地冒烟测试
 | 无中继且诚实 | 打不通就报失败，对称 NAT 明确标注 | 假装成功比失败更难排查 |
 | 多租户横向扩展 | 一个 Worker 多网络，节点不做多归属 | 多归属要引入多地址/多路由/多连接表，收益极小 |
 | 启动先试 UPnP | 映射成功就多一个 `upnp` 候选，租约过半续租 | 家用路由器命中率高，省掉打洞的不确定性 |
-| 发送队列按字节计 | 单流 256 KB、全局 32 MB 预算，满则丢新包 | 按包数算时 64 KB 大包与 40 字节 ACK 共用一个上限；`256 流 × 64 包 × 64 KB` 最坏 1 GB，能打死 438 MB 的设备 |
+| 发送队列按字节计 | 单流 256 KB、全局 32 MB 预算，满则丢新包；队列句柄两端各持一个，谁丢谁关 | 按包数算时 64 KB 大包与 40 字节 ACK 共用一个上限；`256 流 × 64 包 × 64 KB` 最坏 1 GB，能打死 438 MB 的设备。句柄必须带 `Drop`：只用 `Arc` 共享时 writer 退出后流表那份还在，`Drop for FlowQueue` 永远等不到，队列不关 → `dispatch` 等不到 `Closed` → 那条流永久黑洞 |
 | 超 MTU 就分片 | 按 IPv4 规则切 8 字节对齐的片，复制原头重算校验和、清 DF | 直接丢包的故障表现是「小包通、大包不通」，用户只会认为"网络时通时不通" |
 | 拥塞控制不开放选项 | 固定 Cubic；曾经提供 `congestion = "bbr"`，0.1.16 实测后整条删除 | 不是「BBR 太强势」这种口味问题，是实测连接每分钟被摘一次：quinn 的 BBR 初始窗口 200 包（240 KB）、`calculate_cwnd` 拿增益和字节数比导致 Startup 窗口无上限、`app_limited` 时永不退出 Startup。零散流量的隧道正好踩满这三条，结果是往对端链路灌爆 → 对端 RTO 退避 8 秒 → 被我们自己的失效判据摘掉 |
-| 收包零拷贝切帧 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 一次 `copy_from_slice`，2000 pps 下就是每秒 2000 次 malloc |
+| 收包按片读、切片不复制 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 两次 `read_exact`。注意**仍有一次拷贝**：`read_chunk` 的数据要 `extend_from_slice` 进 `BytesMut`；省掉的是逐包 malloc，不是那次 memcpy |
 | 忙轮询默认关 | `busy_poll_us = 0`；Linux 上按配置设 `SO_BUSY_POLL`，失败只记 info | 拿 CPU 换几十微秒延迟，默认打开会让小主机的低功耗核持续升温 |
 
 ## 5. 协议
@@ -113,7 +113,13 @@ qp2p1_<network_id>_<secret>
 ### 事件
 
 `register` 返回节点列表；`/v1/events` 只推「有人要和你打洞」这类时效性事件。
-列表类变化（谁上线了）不走事件，避免每次变化都给全网发通知。
+成员列表的变化（谁在线、有几个）靠 `register` 的返回值和 `peer_online` 广播，
+不做「每次变化给全网发一条」——节点一多就会把事件表刷爆。
+
+`peer_online` 只在三种情况广播：节点从离线变在线、候选地址变了、或客户端在
+换网重报时显式带 `announce: true`。第三种是必须的：新网络的 NAT 映射可能和旧
+的一模一样（端口保留型 NAT），服务端看不出变化，而对端很可能已经因为「在线
+却打不通」进了 5 分钟冷却，只有收到上线通知才会清掉。
 
 ### 打洞与数据面
 
@@ -130,11 +136,13 @@ qp2p1_<network_id>_<secret>
 |---|---|---|
 | `stream_receive_window` | 2 MB | 40 ms RTT 下单流上限约 400 Mbps；1.25 MB 只有 250 Mbps |
 | `receive_window` | 16 MB | **连接级必须有上限**：原来是 `VarInt::MAX`，`256 流 × 2 MB` 理论最坏 512 MB，能打死 256 MB 的设备。按「8 条满窗流」设计，10 个对端最坏 160 MB |
-| `initial_mtu` / `min_mtu` | 1400 / 1200 | PMTUD 被 ICMP 过滤阻断时不会退化到 1200；内层上限 1424 由 `route::clamp_mtu` 在**配置源头**夹紧（见下） |
+| `initial_mtu` / `min_mtu` | 1280 / 1200 | 1280 是 IPv6 最小 MTU，覆盖面最广。用 1400 时，路径实际只支持 1280 的链路（叠 VPN、部分蜂窝）上大包全丢，要等黑洞检测（连续超过 3 次可疑丢包 burst）才退回 `min_mtu`；期间小包仍能通、不会触发 8 秒判死，只是每条新连接都卡几秒。握手包固定 pad 到 1200，不受这个值影响；MTU 发现会自己往上爬到路径 MTU |
 | `keep_alive_interval` | 15 秒 | 空闲链路上也要周期性发出**需要对端回应**的 PING，`tun.rs` 的失效判据才有依据，同时兼顾 NAT 映射不被回收 |
 | ACK 频率阈值 | 10 | 收到 10 个包才回一次 ACK，省对端中断；`max_ack_delay` **刻意保持默认**——放宽它会直接抬高本端观测到的 RTT |
 | `initial_rtt` | 20 ms（内网候选）/ 默认 333 ms | 两个私网地址之间的 RTT 不可能几百毫秒，333 ms 会让 PTO 白等 1 秒 |
-| 发送队列 | 单流 256 KB / 全局 32 MB | 按字节而非包数，跨流共享一份预算；`Mutex<VecDeque>` + `AtomicUsize` + `Notify`，`Drop for FlowQueue` 兜底归还预算 |
+| 发送队列 | 单流 256 KB / 全局 32 MB | 按字节而非包数，跨流共享一份预算；`Mutex<VecDeque>` + `AtomicUsize` + `Notify`。`QueueTx`（流表侧）/ `QueueRx`（writer 侧）各自 `Drop` → `close()`，`run` 从任何路径退出都会关队列 |
+| 流表容量 | 224（对端配额 256） | 流表满会淘汰最旧条目并**立刻** `open_bi`，而对端归还 `MAX_STREAMS` 滞后一个往返；容量等于配额时每次「淘汰 + 重开」都撞配额，挂到 `OPEN_TIMEOUT`（3 秒） |
+| 帧结束边界 | 半个帧头算协议错误 | 只剩 1 字节帧头说明对端算错长度或中途崩了；静默当成正常结束会把截断埋进日志 |
 | MTU 溢出处理 | IPv4 分片 | `ip::fragment()`：载荷 8 字节对齐、偏移 `offset/8`、`MF` 除末片置 1、重算校验和、清 `DF` |
 
 `LinkTuning` 只有两个字段，都**默认保守**：
