@@ -1495,18 +1495,14 @@ impl Session {
                     ws_retry_at = Some(Instant::now() + Duration::from_secs(5));
                 }
                 Wake::Tun(req) => {
-                    // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发。
-                    // 但 pre 标记不能跟着被丢掉：同一对端的"普通唤醒"和"预拨"
-                    // 可能挨着进通道，丢了 pre 这次预拨就白做，还要再等 30 秒冷却。
+                    // **不要排空通道**。每个对端的上游已经有节流：普通唤醒 3 秒、
+                    // 预拨 30 秒、判死重建只触发一次，所以这里不会被打成连发。
+                    // 反过来，一次 `reap_unhealthy` 可能给多个对端都发预拨，
+                    // 排空会把除最后一个之外全丢掉——而那些对端的 30 秒冷却
+                    // 已经记上了，等于它们的先建后断被静默跳过。
                     let mut req = req;
-                    while let Ok(next) = wake_rx.try_recv() {
-                        // ip 取最新（与原来一致），pre 只在同一个对端时继承
-                        req = WakeReq {
-                            ip: next.ip,
-                            pre: next.pre || (req.pre && req.ip == next.ip),
-                        };
-                    }
-                    // 上一轮还没被消费的预拨标记同样只对同一个对端有效
+                    // 上一轮还没被消费的预拨标记只对同一个对端有效：
+                    // `forced` 可能因为信令连错、休眠而多留一轮。
                     if let Some(f) = forced {
                         if f.pre && f.ip == req.ip {
                             req.pre = true;
@@ -1758,8 +1754,11 @@ async fn on_connected(
     // 结果就是预拨白跑一趟、黑洞照旧。
     //
     // 这里能和**对端**的选边结论一致，靠的是 `should_dial` 里"预拨只由
-    // node_id 小的一侧发起"：对端看到的两条连接都是同一个人拨的，选边
-    // 分不出胜负会退回后到顶替，与我们这边的结论相同。改这条要一起改。
+    // node_id 小的一侧发起"。对端看到的新连接一定是小 id 拨的，两种旧连接
+    // 都留新的：
+    // - 旧连接也是小 id 拨的 → 两条同源，选边分不出胜负，退回后到顶替；
+    // - 旧连接是大 id 拨的 → 选边明确判"小 id 拨的那条"赢。
+    // 改预拨的发起方规则时，这两条要一起改。
     let dedupe = punched.dedupe() && !pre;
     let conn = punched.conn;
 
