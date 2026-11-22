@@ -20,6 +20,10 @@ pub struct Options<'a> {
     pub admin_secret: Option<&'a str>,
     /// 这次要执行的迁移步骤；空表示只改代码。
     pub steps: &'a [&'a migrate::Step],
+    /// 线上当前的迁移标签。只要 `steps` 非空就必须带上，否则 CF 报
+    /// 「Actor migration tag precondition failed, got tag '' when expected 'v1'」
+    /// ——它要靠这个确认你看到的就是线上那一版，避免两个人同时升级互相覆盖。
+    pub old_tag: Option<&'a str>,
 }
 
 pub fn metadata(opts: &Options<'_>) -> Value {
@@ -61,7 +65,7 @@ pub fn metadata(opts: &Options<'_>) -> Value {
             .iter()
             .flat_map(|s| s.new_sqlite_classes.iter().copied())
             .collect();
-        meta["migrations"] = json!({
+        let mut migrations = json!({
             "new_tag": opts.steps.last().map(|s| s.tag).unwrap_or(migrate::latest_tag()),
             "steps": [ if classes.is_empty() {
                 json!({})
@@ -69,6 +73,11 @@ pub fn metadata(opts: &Options<'_>) -> Value {
                 json!({ "new_sqlite_classes": classes })
             } ],
         });
+        // 升级时必须声明线上当前标签，CF 用它做前置校验
+        if let Some(old) = opts.old_tag.filter(|t| !t.is_empty()) {
+            migrations["old_tag"] = json!(old);
+        }
+        meta["migrations"] = migrations;
     }
 
     meta
@@ -106,6 +115,7 @@ mod tests {
             d1_id: "db-1",
             admin_secret: Some("s3cret"),
             steps: &[step()],
+            old_tag: None,
         });
         assert!(meta.get("keep_bindings").is_none());
         let bindings = meta["bindings"].as_array().unwrap();
@@ -124,6 +134,7 @@ mod tests {
             d1_id: "db-1",
             admin_secret: None,
             steps: &[],
+            old_tag: Some("v1"),
         });
         assert_eq!(meta["keep_bindings"], json!(["secret_text"]));
         assert!(meta.get("migrations").is_none());
@@ -132,11 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_carries_old_tag() {
+        // 不带 old_tag 时 CF 会报 10079：got tag '' when expected tag is 'v1'
+        let tail = migrate::CHAIN.last().unwrap();
+        let meta = metadata(&Options {
+            d1_id: "db-1",
+            admin_secret: None,
+            steps: &[tail],
+            old_tag: Some("v1"),
+        });
+        assert_eq!(meta["migrations"]["old_tag"], "v1");
+        assert_eq!(meta["migrations"]["new_tag"], tail.tag);
+        assert_eq!(meta["migrations"]["steps"], json!([{}]));
+    }
+
+    #[test]
     fn secret_is_redacted_for_display() {
         let meta = metadata(&Options {
             d1_id: "db-1",
             admin_secret: Some("abcdef"),
             steps: &[],
+            old_tag: None,
         });
         let shown = redacted(&meta);
         let text = shown["bindings"]

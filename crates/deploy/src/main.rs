@@ -211,6 +211,8 @@ async fn cmd_init(args: &Args) -> Result<()> {
         d1_id: &d1,
         admin_secret: Some(&secret),
         steps: &steps,
+        // 首次部署线上还没有标签，CF 要求 old_tag 为空
+        old_tag: None,
     });
 
     if args.dry_run {
@@ -292,6 +294,7 @@ async fn cmd_up(args: &Args) -> Result<()> {
         d1_id: &d1,
         admin_secret: None,
         steps: &steps,
+        old_tag: current.as_deref(),
     });
 
     if args.dry_run {
