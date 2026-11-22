@@ -94,9 +94,15 @@ fn transport(initial_rtt: Option<Duration>) -> quinn::TransportConfig {
     // 按 8 条满窗流设计；每对端一份，10 个对端最坏 160 MB。
     transport.receive_window((16 * 1024 * 1024u32).into());
 
-    // 初始 MTU 1400：PPPoE（1492）和以太网（1500）都能过。
-    // quinn 自己会往上爬到路径 MTU；PMTUD 被 ICMP 过滤阻断时也不会卡在 1200。
-    transport.initial_mtu(1400);
+    // 初始 MTU 1280：IPv6 的最小 MTU，也是多数 VPN / 隧道 / 部分蜂窝网络
+    // 能过的值。用 1400 时，路径实际只支持 1280 的链路上每个大包都会丢，
+    // 要等黑洞检测（连续 3 次可疑丢包 burst）才退回 min_mtu——期间小包
+    // （ACK、PING）仍能通，所以不会触发 8 秒判死，只是吞吐卡几秒，每条
+    // 新连接都要重来一遍。
+    //
+    // quinn 的 MTU 发现会自己往上爬到路径 MTU，1280 只是起步值；握手包
+    // 固定 pad 到 1200，不受这里影响，所以调低不增加连不上的风险。
+    transport.initial_mtu(1280);
     transport.min_mtu(1200);
 
     if let Some(rtt) = initial_rtt {
