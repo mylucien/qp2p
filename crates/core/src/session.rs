@@ -1677,6 +1677,7 @@ async fn dial_round(
                         &format!("{e}"),
                         kind,
                         hopeless,
+                        pre,
                     )
                     .await;
                     return;
@@ -1692,6 +1693,7 @@ async fn dial_round(
                     "对端没有可用地址",
                     FailKind::Other,
                     hopeless,
+                    pre,
                 )
                 .await;
                 return;
@@ -1729,6 +1731,7 @@ async fn dial_round(
                         &format!("{e}"),
                         FailKind::Other,
                         hopeless,
+                        pre,
                     )
                     .await;
                 }
@@ -1838,6 +1841,7 @@ async fn on_connected(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn report_failure(
     peers: &SharedPeers,
     notify: &Notify,
@@ -1846,7 +1850,17 @@ async fn report_failure(
     reason: &str,
     kind: FailKind,
     hopeless: bool,
+    pre: bool,
 ) {
+    // 预拨只是"旧链路可能不行了，先另起一条备用"，失败**不代表这个对端有问题**：
+    // 旧链路可能一直通着。所以这里不能碰 `fails` / `cool_until` / `online` /
+    // `reported`，也不能弹提示——否则一次失败预拨就给健康连接攒失败次数
+    // （6 次进 5 分钟冷却），等旧链路真断时反而拨不出去，还会把"暂时连不上"
+    // 提前播出去、让后面真正的失败不再提示。
+    if pre {
+        tracing::debug!("[session] 预拨 {label} 没有成功（旧连接不受影响）: {reason}");
+        return;
+    }
     let first = {
         let mut table = peers.lock().await;
         match table.get_mut(node_id) {
@@ -2430,6 +2444,57 @@ mod tests {
         let json = r#"{"node_id":"abc","name":"n"}"#;
         let p: PeerInfo = serde_json::from_str(json).unwrap();
         assert!(p.online, "老 Worker 不返回 online：按在线处理，保持旧行为");
+    }
+
+    /// 预拨失败不能给健康连接攒失败次数：旧链路可能一直是通的。
+    /// 回归：以前预拨走的是普通失败路径，6 次就把对端打进 5 分钟冷却，
+    /// 等旧链路真断时反而拨不出去，还会提前播「暂时连不上」。
+    #[tokio::test]
+    async fn pre_dial_failure_does_not_touch_peer_state() {
+        let peers: SharedPeers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut table = peers.lock().await;
+            let mut state = PeerState::from_parts("B".to_string(), None, String::new());
+            state.connected = true;
+            state.attempts = 3;
+            state.fails = COOL_AFTER_FIRST - 1; // 再失败一次就要进冷却
+            state.reported = true;
+            table.insert("bbb".to_string(), state);
+        }
+        let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let notify = {
+            let said = said.clone();
+            Notify::new(move |m: &str| {
+                said.lock().unwrap().push(m.to_string());
+            })
+        };
+
+        report_failure(
+            &peers,
+            &notify,
+            "bbb",
+            "B",
+            "timeout",
+            FailKind::Other,
+            false,
+            true,
+        )
+        .await;
+
+        let table = peers.lock().await;
+        let state = &table["bbb"];
+        assert_eq!(
+            state.fails,
+            COOL_AFTER_FIRST - 1,
+            "预拨失败不能累计失败次数"
+        );
+        assert!(state.cool_until.is_none(), "预拨失败不能触发冷却");
+        assert!(state.online, "预拨失败不能把对端标成离线");
+        assert!(state.reported, "也不能改掉「失败已提示过」的标记");
+        assert!(state.connected, "旧连接的状态完全不动");
+        assert_eq!(state.attempts, 3, "也不能顶掉正常拨号的退避档位");
+        drop(table);
+        assert!(said.lock().unwrap().is_empty(), "预拨失败不该弹用户提示");
     }
 
     #[test]
