@@ -1221,15 +1221,18 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   check("已删网络的令牌立即失效", [401, 403].includes(goneToken.status), goneToken.body);
 
   console.log("\nO. IP 预留与管理面");
+  // 网段必须用自动分配池（10.64~10.127）之外的值：`pickCidr` 按 network_id
+  // 的 sha256 取池内下标，别的网络可能刚好占住 10.99 / 10.100，测试会偶发 409。
+  // 之前用 10.99 + 改成 10.100，就是这个原因在 tag 构建里挂过一次。
   const resvNet = await call("POST", "/v1/admin/networks", {
     admin: secret,
-    body: { name: "resv-test", cidr: "10.99.0.0/16" },
+    body: { name: "resv-test", cidr: "10.201.0.0/16" },
   });
-  check("可以指定网段建网", resvNet.body.network?.cidr === "10.99.0.0/16", resvNet.body.network);
+  check("可以指定网段建网", resvNet.body.network?.cidr === "10.201.0.0/16", resvNet.body.network);
   const rNet = resvNet.body.network.id;
   const rToken = resvNet.body.token;
 
-  const pinnedIp = "10.99.0.50";
+  const pinnedIp = "10.201.0.50";
   const nick = await identity();
   const nickJoin = await call("POST", "/v1/join", {
     token: rToken,
@@ -1303,7 +1306,7 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   });
   check("重连拿回预留地址", nickBack.body.node?.virtual_ip === pinnedIp, nickBack.body.node);
 
-  const manualIp = "10.99.0.77";
+  const manualIp = "10.201.0.77";
   const manual = await call("POST", `/v1/admin/networks/${rNet}/reservations`, {
     admin: secret,
     body: { ip: manualIp, note: "打印机" },
@@ -1323,15 +1326,15 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
 
   const patch = await call("PATCH", `/v1/admin/networks/${rNet}`, {
     admin: secret,
-    body: { cidr: "10.100.0.0/16" },
+    body: { cidr: "10.200.0.0/16" },
   });
-  check("改网段成功", patch.status === 200 && patch.body.network?.cidr === "10.100.0.0/16", patch.body);
+  check("改网段成功", patch.status === 200 && patch.body.network?.cidr === "10.200.0.0/16", patch.body);
   check("网段外的节点重新分配", patch.body.reassigned === 2, patch.body);
 
   const movedNodes = await call("GET", `/v1/admin/networks/${rNet}/nodes`, { admin: secret });
   check(
     "重分配后地址都在新网段",
-    (movedNodes.body.nodes ?? []).every((n) => String(n.virtual_ip).startsWith("10.100.")),
+    (movedNodes.body.nodes ?? []).every((n) => String(n.virtual_ip).startsWith("10.200.")),
     movedNodes.body.nodes,
   );
 
