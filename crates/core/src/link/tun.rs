@@ -1916,18 +1916,14 @@ mod tests {
         let b = crate::engine::Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
             .await
             .expect("绑定 B");
-        // 先落到变量：`&[b.local_addr()]` 这种临时数组在 join! 展开后
-        // 会在 await 之前被丢掉（E0716）。
-        let a_addr = a.local_addr();
-        let b_addr = b.local_addr();
+        // 地址和数组都要先落到变量：`&[b.local_addr()]` 会创建临时数组，
+        // 在 join! 展开后于 await 之前离开作用域（E0716）。
+        let a_addrs = [a.local_addr()];
+        let b_addrs = [b.local_addr()];
         let (dialer, listener) = tokio::join!(
-            a.punch(
-                &[b_addr],
-                crate::peer::Role::Dialer,
-                Duration::from_secs(10)
-            ),
+            a.punch(&b_addrs, crate::peer::Role::Dialer, Duration::from_secs(10)),
             b.punch(
-                &[a_addr],
+                &a_addrs,
                 crate::peer::Role::Listener,
                 Duration::from_secs(10)
             )
