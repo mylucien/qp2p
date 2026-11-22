@@ -85,13 +85,17 @@ use crate::route::{flow::FlowKey, flow::FlowTable, ip, TunLink};
 const KIND_IP: u8 = 2;
 /// 空闲多久回收一条流。
 const FLOW_IDLE: Duration = Duration::from_secs(120);
-/// 同时存在的流上限。
+/// 流表容量（出站方向）。
 ///
-/// 刻意低于 `tls.rs` 里给对端的 `max_concurrent_bidi_streams`（256）：
-/// 自己先到 200 就开始回收空闲流，把余量留给对端发起的方向。
-/// 流表容量。与 `max_concurrent_bidi_streams(256)` 对齐：
-/// 小了就白白浪费对端给的流配额，大了也开不出来。
-const FLOW_CAPACITY: usize = 256;
+/// 必须**低于** `tls.rs` 里给对端的 `max_concurrent_bidi_streams`（256），
+/// 留出约一个往返的余量。理由：流表满了会淘汰最旧的条目并立刻 `open_bi`
+/// 一条新流，而我们对端的流配额要等它处理完 RESET_STREAM 之后才通过
+/// MAX_STREAMS 归还——这个滞后就是一个往返。容量正好等于配额时，每次
+/// 「淘汰 + 重开」都撞配额，`open_bi` 一直挂到 [`OPEN_TIMEOUT`]。
+///
+/// 224 = 256 − 32：比原来按包数算的 200 多留些给突发，又比配额少 32 条
+/// 吸收归还滞后。
+const FLOW_CAPACITY: usize = 224;
 const READ_BUF: usize = 4096;
 
 /// 单条流排队待写的字节上限。满了丢包，让内层 TCP 重传。
