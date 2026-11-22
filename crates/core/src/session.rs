@@ -472,14 +472,21 @@ fn should_dial(
     forced: bool,
     pre: bool,
 ) -> bool {
+    // 预拨只允许常规拨号方（node_id 小的一侧）发起。
+    //
+    // 这一条是一致性的硬要求，不是保守：预拨侧走 `dedupe = false`（后到顶替），
+    // 而对端看到的是"node_id 大的一侧被拨进来的连接"，仍按选边规则判它输。
+    // 两端规则不一致时，双方会各留一条、又各自把对方留的那条关掉 ——
+    // 预拨本来要消掉中断，结果反而亲手制造一次中断 + 一轮重拨。
+    if pre && my_id >= peer_id {
+        return false;
+    }
     // 预拨（先建后断）：表里连着也要再拨一条，旧的等新的建成再关
     if state.connected && !pre {
         return false;
     }
-    if forced || pre {
-        // 有包要发 / 链路疑似黑洞：不等退避、不看在线/冷却，但 2 秒内不重复拨同一个对端。
-        // 预拨也不受下面"node_id 小的一方发起"限制——发现异常的一方必须自己拨，
-        // 否则单向黑洞（只有我们的上行坏了）永远等不到对方动手。
+    if forced {
+        // 有包要发 / 链路疑似黑洞：不等退避、不看在线/冷却，但 2 秒内不重复拨同一个对端
         return !(state.attempts > 0
             && now.duration_since(state.last_try) < Duration::from_secs(2));
     }
@@ -1488,12 +1495,24 @@ impl Session {
                     ws_retry_at = Some(Instant::now() + Duration::from_secs(5));
                 }
                 Wake::Tun(req) => {
-                    // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
-                    while wake_rx.try_recv().is_ok() {}
-                    // 预拨标记不能被后到的普通唤醒冲掉：两者指向同一个对端，
-                    // 但只有 pre=true 才允许在"表里连着"时也拨号
-                    let pre = forced.is_some_and(|f| f.pre) || req.pre;
-                    forced = Some(WakeReq { ip: req.ip, pre });
+                    // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发。
+                    // 但 pre 标记不能跟着被丢掉：同一对端的"普通唤醒"和"预拨"
+                    // 可能挨着进通道，丢了 pre 这次预拨就白做，还要再等 30 秒冷却。
+                    let mut req = req;
+                    while let Ok(next) = wake_rx.try_recv() {
+                        // ip 取最新（与原来一致），pre 只在同一个对端时继承
+                        req = WakeReq {
+                            ip: next.ip,
+                            pre: next.pre || (req.pre && req.ip == next.ip),
+                        };
+                    }
+                    // 上一轮还没被消费的预拨标记同样只对同一个对端有效
+                    if let Some(f) = forced {
+                        if f.pre && f.ip == req.ip {
+                            req.pre = true;
+                        }
+                    }
+                    forced = Some(req);
                     hot_until = Instant::now() + HOT_WINDOW;
                     // 休眠里断开的长连接：一有流量就立刻接回来
                     ws_retry_at = None;
@@ -1615,6 +1634,14 @@ async fn dial_round(
                 continue;
             }
             if !should_dial(state, node_id.as_str(), id, now, forced, pre) {
+                // 预拨被拒最常见的原因就是"我不是 node_id 小的一侧"。
+                // 不解释一句的话，日志里只有 tun 那边的"先拨一条新的试试"，
+                // 后面什么都没有，看起来像预拨坏了。
+                if pre && state.connected && node_id.as_str() >= id.as_str() {
+                    tracing::debug!(
+                        "[session] {id} 疑似黑洞，但预拨只由 node_id 小的一侧发起，等对端动手"
+                    );
+                }
                 continue;
             }
             state.attempts += 1;
@@ -1729,6 +1756,10 @@ async fn on_connected(
     // 预拨的连接**永远**参与"后到顶替"、不走选边：它的目的就是在旧连接
     // 还活着时把它换掉，选边规则可能把它判给旧的那条（比如对方 id 更小），
     // 结果就是预拨白跑一趟、黑洞照旧。
+    //
+    // 这里能和**对端**的选边结论一致，靠的是 `should_dial` 里"预拨只由
+    // node_id 小的一侧发起"：对端看到的两条连接都是同一个人拨的，选边
+    // 分不出胜负会退回后到顶替，与我们这边的结论相同。改这条要一起改。
     let dedupe = punched.dedupe() && !pre;
     let conn = punched.conn;
 
@@ -2277,7 +2308,11 @@ mod tests {
         );
         assert!(
             should_dial(&s, "aaa", "bbb", now + Duration::from_secs(99), true, true),
-            "预拨：连着也要拨，而且不看 id 大小"
+            "预拨：小 id 侧连着也要拨（旧连接等新的建成再关）"
+        );
+        assert!(
+            !should_dial(&s, "bbb", "aaa", now + Duration::from_secs(99), true, true),
+            "预拨只能由常规拨号方发起：大 id 侧走 dedupe=false 会和对端选边打架"
         );
     }
 

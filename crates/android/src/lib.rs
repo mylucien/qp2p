@@ -382,8 +382,9 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     } else {
         qp2p_core::route::clamp_mtu(config.mtu)
     };
-    // 传输参数是进程级的一次性配置：窗口按内存分级（弱机 1 MB、其余 2 MB），
-    // 显式值夹进硬边界。`configure` 只认第一次调用，本进程后续 prepare 不再改。
+    // 传输参数是进程级配置：窗口按内存分级（弱机 1 MB、其余 2 MB），
+    // 显式值夹进硬边界。`configure` 是覆盖语义，本进程每次 prepare 都会重设，
+    // 所以用户改完配置断开重连就能生效（不用杀进程）；只影响之后新建的连接。
     qp2p_core::tls::configure(qp2p_core::tls::LinkTuning {
         stream_window: config
             .window

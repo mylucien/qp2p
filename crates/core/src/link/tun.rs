@@ -160,7 +160,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 ///
 /// 固定 8 秒在 20 ms 的局域链路上太慢（黑洞要多扛 5 秒）；固定 3 秒在高 RTT
 /// 链路上又会误杀——QUIC 的 PTO 本身就是 `3×srtt`，加一次丢包重传就超了。
-/// RTT 未知（握手刚完成、还没有采样）时按上限 8 秒保守处理。
+/// RTT 未知时传 `Duration::ZERO`，`clamp` 会把结果落在**下限 3 秒**——
+/// 这是有意的：没有 RTT 采样说明对端一个包都没回过，本来就该早点判。
+/// 实际也踩不到：握手完成时 `path.rtt` 必有值。
 fn silent_limit(rtt: Duration) -> Duration {
     (rtt * SILENT_RTT_FACTOR).clamp(PEER_SILENT_MIN, PEER_SILENT_MAX)
 }
