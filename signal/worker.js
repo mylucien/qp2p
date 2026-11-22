@@ -15,7 +15,7 @@
  *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
-const VERSION = "2.8.8";
+const VERSION = "2.8.9";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -2008,8 +2008,12 @@ function publicNode(node, now, live = null) {
 ///
 /// 只要还剩一个合法候选，注册就该成功；一个都不剩时返回空数组，由调用方
 /// 按 op 决定是拒绝（register）还是放过（join）。
+///
+/// 被丢掉的候选随注册回包 `dropped_candidates` 返回给客户端：光猫/运营商 NAT
+/// 场景下用户完全看不到它们为什么连不上，服务端 warn 日志也没地方查。
+/// 返回 `null` 只表示**结构性问题**（非数组 / 超限），与「个别项被丢」不同。
 function parseCandidates(raw, clientIp) {
-  if (raw === undefined || raw === null) return [];
+  if (raw === undefined || raw === null) return { candidates: [], dropped: [] };
   if (!Array.isArray(raw) || raw.length > MAX_CANDIDATES) return null;
   const out = [];
   const dropped = [];
@@ -2043,7 +2047,7 @@ function parseCandidates(raw, clientIp) {
         .join(", ")}`,
     );
   }
-  return out;
+  return { candidates: out, dropped };
 }
 
 /// 内网段（含运营商级 NAT 的 100.64/10）。
@@ -3744,10 +3748,12 @@ export class NetworkRoom {
     // 新网络的 NAT 映射可能和旧的一模一样，而对端很可能已经因为「在线却
     // 打不通」进了冷却，不广播就清不掉。只认布尔 true，别的值一律忽略。
     const announce = body.announce === true;
-    const candidates = parseCandidates(body.candidates, clientIp);
-    if (candidates === null) {
+    const parsedCandidates = parseCandidates(body.candidates, clientIp);
+    if (parsedCandidates === null) {
       return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
     }
+    const candidates = parsedCandidates.candidates;
+    const droppedCandidates = parsedCandidates.dropped;
     if (needCandidates && candidates.length === 0) {
       return err(
         400,
@@ -3868,6 +3874,7 @@ export class NetworkRoom {
       node: { node_id: nodeId, virtual_ip: virtualIp, name: record.name },
       peers,
       durable: true,
+      dropped_candidates: droppedCandidates,
       server_ms: now,
     });
   }

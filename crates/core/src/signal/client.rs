@@ -161,6 +161,12 @@ pub struct RegisterReply {
     pub peers: Vec<PeerInfo>,
     #[serde(default)]
     pub durable: bool,
+    /// 服务端过滤掉的候选（回环、保留段、与来源出口 IP 不符的公网地址…）。
+    ///
+    /// 老版本服务端没有这个字段，`serde(default)` 让它读成空；客户端只打日志，
+    /// 不据此改变拨号行为。
+    #[serde(default)]
+    pub dropped_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

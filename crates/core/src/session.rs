@@ -1424,6 +1424,15 @@ impl Session {
                     .await
                 {
                     Ok(reply) => {
+                        // 服务端默默丢掉的候选在这里可见：CGNAT 的 STUN 映射和
+                        // HTTP 出口 IP 不一致时，用户以前只会看到"连不上"。
+                        if !reply.dropped_candidates.is_empty() {
+                            tracing::warn!(
+                                "[session] 服务端丢弃了 {} 个候选：{}（常见原因：出口 IP 与 STUN 映射不一致）",
+                                reply.dropped_candidates.len(),
+                                reply.dropped_candidates.join(", ")
+                            );
+                        }
                         // 送出去了才清：失败时保留，下一轮继续带
                         announce_next = false;
                         let mut table = self.peers.lock().await;

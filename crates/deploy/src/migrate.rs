@@ -28,6 +28,12 @@ pub const CHAIN: &[Step] = &[
         tag: "v2",
         new_sqlite_classes: &[],
     },
+    // v3：注册回包新增 `dropped_candidates`，DO 内的 parseCandidates 改了实现。
+    // 不带新类，只推进标签让 CF 重建 DO 实例，否则已有 DO 继续跑旧代码。
+    Step {
+        tag: "v3",
+        new_sqlite_classes: &[],
+    },
 ];
 
 /// 链条上最新的标签。

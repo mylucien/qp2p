@@ -887,6 +887,12 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     }),
   });
   check("坏候选混在合法里不再整批拒绝", mixed.status === 200 && mixed.body.ok === true, mixed.body);
+  check(
+    "被丢弃的候选回传给客户端可见",
+    Array.isArray(mixed.body.dropped_candidates) &&
+      mixed.body.dropped_candidates.includes("172.46.4.204:51820"),
+    mixed.body.dropped_candidates,
+  );
 
   const peekBob = await call("POST", "/v1/register", {
     token,
@@ -915,7 +921,11 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       tls_fp: "ab".repeat(32),
     }),
   });
-  check("恢复完整候选后注册成功", restore.status === 200, restore.body);
+  check(
+    "恢复完整候选后注册成功且丢弃列表为空",
+    restore.status === 200 && Array.isArray(restore.body.dropped_candidates) && restore.body.dropped_candidates.length === 0,
+    restore.body,
+  );
 
   // 数量超限属于结构性问题，仍然整批拒绝（不静默截断，免得掩盖客户端 bug）
   const tooMany = await call("POST", "/v1/register", {

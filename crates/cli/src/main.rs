@@ -1193,7 +1193,16 @@ async fn cmd_up(args: &[String]) -> Result<()> {
         )
         .await
     {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            if !reply.dropped_candidates.is_empty() {
+                println!(
+                    "· 服务端丢弃了 {} 个候选：{}（常见原因：出口 IP 与 STUN 映射不一致）",
+                    reply.dropped_candidates.len(),
+                    reply.dropped_candidates.join(", ")
+                );
+            }
+            reply
+        }
         Err(e) if qp2p_core::session::token_rejected(&e) => bail!(
             "加入令牌已失效（网络被删除，或管理员执行了 qp2p rotate）。\n\
              找管理员要新令牌，然后重新 qp2p join <新令牌>"
