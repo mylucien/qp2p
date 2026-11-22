@@ -27,8 +27,8 @@ android {
         // 电视盒子大量停在 6.0，所以水位跟着盒子走，不跟着手机走。
         minSdk = 23
         targetSdk = 34
-        versionCode = 19
-        versionName = "0.1.17"
+        versionCode = 20
+        versionName = "0.1.18"
     }
 
     signingConfigs {
