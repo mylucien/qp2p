@@ -15,7 +15,7 @@
  *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
-const VERSION = "2.8.7";
+const VERSION = "2.8.8";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -1998,20 +1998,50 @@ function publicNode(node, now, live = null) {
   };
 }
 
+/// 解析并过滤候选地址。
+///
+/// **结构性问题整批拒绝，单个不可达项只丢弃**。以前是「任一项不合规就整批
+/// 返回 null」，结果是单一坏地址能让一台设备永久注册不上：PPPoE 拨号口经常
+/// 拿到 `172.46/16` 这类既不在 RFC1918（`172.16/12` 只覆盖 16~31）又不等于
+/// 出口 IP 的运营商地址，客户端会把它当 host 候选上报，于是整批 400 →
+/// 客户端退出 → procd 重启 → 每 5 秒一轮死循环（2026-11-22 珠海光猫实测）。
+///
+/// 只要还剩一个合法候选，注册就该成功；一个都不剩时返回空数组，由调用方
+/// 按 op 决定是拒绝（register）还是放过（join）。
 function parseCandidates(raw, clientIp) {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw) || raw.length > MAX_CANDIDATES) return null;
   const out = [];
+  const dropped = [];
   for (const item of raw) {
     // 兼容两种写法："ip:port" 或 {"type":"srflx","addr":"ip:port"}
     const text = (typeof item === "string" ? item : String(item?.addr ?? "")).trim();
-    if (!/^(\d{1,3}(\.\d{1,3}){3}):(\d{1,5})$/.test(text)) return null;
+    if (!/^(\d{1,3}(\.\d{1,3}){3}):(\d{1,5})$/.test(text)) {
+      dropped.push(text);
+      continue;
+    }
     const [ip, portText] = text.split(":");
     const port = Number(portText);
-    if (port < 1 || port > 65535) return null;
-    if (ip.split(".").some((part) => Number(part) > 255 || part === "")) return null;
-    if (!isDialable(ip, clientIp)) return null;
+    if (port < 1 || port > 65535) {
+      dropped.push(text);
+      continue;
+    }
+    if (ip.split(".").some((part) => Number(part) > 255 || part === "")) {
+      dropped.push(text);
+      continue;
+    }
+    if (!isDialable(ip, clientIp)) {
+      dropped.push(text);
+      continue;
+    }
     if (!out.includes(text)) out.push(text);
+  }
+  if (dropped.length > 0) {
+    console.warn(
+      `[signal] 丢弃 ${dropped.length} 个不可达候选（回环/保留段/非出口公网地址）：${dropped
+        .slice(0, 4)
+        .join(", ")}`,
+    );
   }
   return out;
 }
@@ -3719,7 +3749,11 @@ export class NetworkRoom {
       return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
     }
     if (needCandidates && candidates.length === 0) {
-      return err(400, "missing_candidates", "register 至少需要一个候选地址");
+      return err(
+        400,
+        "missing_candidates",
+        "register 至少需要一个候选地址：上报的地址都被过滤了（回环、0.0.0.0、链路本地、组播/保留段，或既不是内网也不是本机出口的公网地址）",
+      );
     }
 
     const now = Date.now();

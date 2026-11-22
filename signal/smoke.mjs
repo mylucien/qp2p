@@ -848,9 +848,11 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
       candidates: ["127.0.0.1:51820"],
     }),
   });
+  // 单个坏项现在是「丢弃」而不是「整批拒绝」，所以全部被丢弃时落到
+  // missing_candidates（一个合法候选都没有），不再是 invalid_candidates
   check(
-    "回环候选被拒",
-    badCandidate.status === 400 && badCandidate.body.error === "invalid_candidates",
+    "回环候选被丢弃后没有可用候选",
+    badCandidate.status === 400 && badCandidate.body.error === "missing_candidates",
     badCandidate.body,
   );
 
@@ -864,9 +866,70 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     }),
   });
   check(
-    "第三方公网候选被拒",
-    thirdParty.status === 400 && thirdParty.body.error === "invalid_candidates",
+    "第三方公网候选被丢弃后没有可用候选",
+    thirdParty.status === 400 && thirdParty.body.error === "missing_candidates",
     thirdParty.body,
+  );
+
+  // 2026-11-22 珠海光猫实测：PPPoE 拨号口拿到 172.46.4.204，既不在
+  // RFC1918 的 172.16/12 里，也不等于出口 IP。旧逻辑下这一个地址就让
+  // 整台设备永久注册不上（400 → 退出 → 重启 → 每 5 秒一轮）。
+  // 现在它只被丢弃，合法候选照旧生效。
+  const mixed = await call("POST", "/v1/register", {
+    token,
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      name: "bob",
+      candidates: ["10.1.2.3:51820", "172.46.4.204:51820"],
+      nat_type: "cone",
+      tls_fp: "ab".repeat(32),
+    }),
+  });
+  check("坏候选混在合法里不再整批拒绝", mixed.status === 200 && mixed.body.ok === true, mixed.body);
+
+  const peekBob = await call("POST", "/v1/register", {
+    token,
+    body: await signed(alice, "register", net, {
+      node_id: alice.nodeId,
+      pubkey: alice.pubkey,
+      candidates,
+    }),
+  });
+  const bobView = peekBob.body.peers?.find((p) => p.node_id === bob.nodeId);
+  check(
+    "被丢弃的候选没有进入节点信息",
+    Boolean(bobView) && !bobView.candidates.includes("172.46.4.204:51820"),
+    bobView,
+  );
+
+  // 恢复 bob 的正常候选，后面 announce 用例依赖它
+  const restore = await call("POST", "/v1/register", {
+    token,
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      name: "bob",
+      candidates,
+      nat_type: "cone",
+      tls_fp: "ab".repeat(32),
+    }),
+  });
+  check("恢复完整候选后注册成功", restore.status === 200, restore.body);
+
+  // 数量超限属于结构性问题，仍然整批拒绝（不静默截断，免得掩盖客户端 bug）
+  const tooMany = await call("POST", "/v1/register", {
+    token,
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      candidates: Array.from({ length: 17 }, (_, i) => `10.0.0.${i + 1}:51820`),
+    }),
+  });
+  check(
+    "候选超过上限仍然整批拒绝",
+    tooMany.status === 400 && tooMany.body.error === "invalid_candidates",
+    tooMany.body,
   );
 
   // 候选没变 + announce：服务端必须再广播一次 peer_online。
