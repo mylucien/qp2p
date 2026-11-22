@@ -78,6 +78,18 @@ const COOL_AFTER_REPEAT: u32 = 2;
 const COOLDOWN_BASE: Duration = Duration::from_secs(300);
 const COOLDOWN_MAX: Duration = Duration::from_secs(1800);
 
+/// 被对端以「重复连接」拒掉之后的退避时长。
+///
+/// 对端的判死阈值最长 8 秒，10 秒足够它先把那条旧连接摘掉；退避期间
+/// 有流量也不会重拨，避免「建好又立刻被关」打成紧环。
+const REFUSED_BACKOFF: Duration = Duration::from_secs(10);
+
+/// 「这条重复连接我不要」的关闭原因。
+///
+/// 两端都是本程序，直接用文本标记：拨号侧据此知道对端还留着另一条，
+/// 不必等一次失败的拨号才知道自己被拒了。
+const CLOSE_DUPLICATE: &[u8] = b"duplicate";
+
 /// 状态输出回调。
 ///
 /// 包一层而不是直接用 `Arc<dyn Fn>`：后者不能直接当函数调，得 `as_ref()`，
@@ -326,6 +338,11 @@ struct PeerState {
     cool_until: Option<Instant>,
     /// 已经冷却过几轮，决定下一次冷却多久
     cool_count: u32,
+    /// 对端以 `duplicate` 拒掉我们刚建的连接后，退避到这个时刻之前不再拨。
+    ///
+    /// 和 `cool_until` 分开记：这不是「打不通」，而是对端还留着自己认为可用的
+    /// 链路，不该攒 `fails`、也不该进冷却。
+    refused_until: Option<Instant>,
 }
 
 impl PeerState {
@@ -353,6 +370,7 @@ impl PeerState {
             fails: 0,
             cool_until: None,
             cool_count: 0,
+            refused_until: None,
         }
     }
 
@@ -366,6 +384,19 @@ impl PeerState {
         self.cool_until.is_some_and(|t| now < t)
     }
 
+    /// 刚被对端以「重复连接」拒过，暂时不拨。
+    fn refused(&self, now: Instant) -> bool {
+        self.refused_until.is_some_and(|t| now < t)
+    }
+
+    /// 记一次「对端说这条是多余的」。
+    ///
+    /// 它不是失败：对端认为旧链路还可用。拨号侧只需要退避一轮，等对端
+    /// 自己判死那条，或者等它先动手。
+    fn note_refused(&mut self, now: Instant) {
+        self.refused_until = Some(now + REFUSED_BACKOFF);
+    }
+
     /// 对端刚上线（或刚恢复）：之前积累的失败、冷却、退避统统作废，立刻重试。
     fn mark_online(&mut self) {
         self.online = true;
@@ -374,6 +405,7 @@ impl PeerState {
         self.cool_until = None;
         self.cool_count = 0;
         self.reported = false;
+        self.refused_until = None;
     }
 
     fn mark_offline(&mut self) {
@@ -391,6 +423,7 @@ impl PeerState {
         self.cool_until = None;
         self.cool_count = 0;
         self.reported = false;
+        self.refused_until = None;
     }
 
     /// 连接关闭回调：只有"关闭的这条就是当前那条"才清状态。
@@ -483,6 +516,11 @@ fn should_dial(
     }
     // 预拨（先建后断）：表里连着也要再拨一条，旧的等新的建成再关
     if state.connected && !pre {
+        return false;
+    }
+    // 刚被对端以「重复连接」拒过：它那边还留着自认为可用的那条，
+    // 这时每次来包都重拨只会重复「建好 → 被关」。退避一轮，等它自己判死。
+    if state.refused(now) {
         return false;
     }
     if forced {
@@ -1793,7 +1831,7 @@ async fn on_connected(
                 // 两端同时重拨，这条是输家。对端会独立算出同一个结论并留下赢家，
                 // 所以这里直接关掉，不碰状态、不报"连接断开"。
                 tracing::info!("[session] 与 {label} 的重复连接让位给另一条，丢弃这条");
-                conn.close(0u32.into(), b"duplicate");
+                conn.close(0u32.into(), CLOSE_DUPLICATE);
                 return;
             }
         }
@@ -1828,14 +1866,32 @@ async fn on_connected(
     let conn_id = conn.stable_id();
     tokio::spawn(async move {
         let reason = conn.closed().await;
+        // 对端主动以 `duplicate` 关掉这条：它那边还留着自认为可用的那条。
+        // 这是 `attach` 判输时我们发给对方的关闭原因，只看对端发回来的这一份，
+        // 不会把本机主动关掉的 `replaced` 误认成「被拒」。
+        let refused = matches!(
+            &reason,
+            quinn::ConnectionError::ApplicationClosed(frame)
+                if frame.reason.as_ref() == CLOSE_DUPLICATE
+        );
         let mut table = peers.lock().await;
         if let Some(state) = table.get_mut(node_id.as_str()) {
+            if refused {
+                // 即使这条已经不是当前连接也要记：对端刚才明确拒绝了我们的重拨。
+                state.note_refused(Instant::now());
+            }
             // 只处理"这条连接还是当前那条"的情况：两端同时判死、各自重拨时，
             // 上一代的 closed() 会在新连接建立之后才返回。
             if !state.drop_connection(conn_id) {
                 tracing::debug!("[session] 与 {label} 的旧连接已关闭（已由新连接接替）: {reason}");
                 return;
             }
+        }
+        if refused {
+            tracing::info!(
+                "[session] 与 {label} 重拨被对端判为重复连接，{:?} 内不再重试",
+                REFUSED_BACKOFF
+            );
         }
         tracing::info!("[session] 与 {label} 的连接断开: {reason}");
     });
@@ -2495,6 +2551,36 @@ mod tests {
         assert_eq!(state.attempts, 3, "也不能顶掉正常拨号的退避档位");
         drop(table);
         assert!(said.lock().unwrap().is_empty(), "预拨失败不该弹用户提示");
+    }
+
+    #[test]
+    fn duplicate_refusal_backs_off_without_counting_a_failure() {
+        let now = Instant::now();
+        let mut s = PeerState::from_parts("B".to_string(), None, String::new());
+        s.note_refused(now);
+
+        // 有流量时的 forced 唤醒也要被挡住：否则每个包都是一轮「建好又被关」
+        assert!(!should_dial(&s, "bbb", "aaa", now, true, false));
+        assert!(!should_dial(&s, "aaa", "bbb", now, false, false));
+
+        // 被拒不是失败，不该进冷却、不该改在线状态
+        assert_eq!(s.fails, 0);
+        assert!(s.cool_until.is_none());
+        assert!(s.online);
+
+        // 退避过后立刻恢复（forced 分支不看冷却）
+        assert!(should_dial(
+            &s,
+            "bbb",
+            "aaa",
+            now + REFUSED_BACKOFF,
+            true,
+            false
+        ));
+
+        // 真连上之后不再背着这个退避
+        s.mark_connected(7);
+        assert!(!s.refused(now));
     }
 
     #[test]

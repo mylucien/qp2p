@@ -135,8 +135,10 @@ pub fn fragment(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
         return None;
     }
 
-    // 除最后一片外，每片载荷必须是 8 的倍数
-    let chunk = ((mtu - ihl) / 8) * 8;
+    // 除最后一片外，每片载荷必须是 8 的倍数。
+    // `mtu` 来自配置/设备，正常有 576 的下限和 1424 的上限，但这里不信任它：
+    // 小于 IP 头长时 `mtu - ihl` 在 debug 下会 panic、release 下回绕成巨值。
+    let chunk = (mtu.saturating_sub(ihl) / 8) * 8;
     if chunk == 0 {
         return None;
     }
@@ -404,5 +406,8 @@ mod tests {
         // MTU 小到装不下一个 8 字节片段
         let pkt = big_packet(1500, 0);
         assert!(fragment(&pkt, 24).is_none());
+        // MTU 比 IP 头还短：以前这里会下溢，debug 构建直接 panic
+        assert!(fragment(&pkt, 10).is_none());
+        assert!(fragment(&pkt, 0).is_none());
     }
 }

@@ -11,7 +11,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use anyhow::{bail, Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 pub mod flow;
 pub mod ip;
@@ -237,34 +237,27 @@ pub fn spawn_io(device: Box<dyn TunDevice>, mtu: u16) -> TunLink {
     std::thread::Builder::new()
         .name("qp2p-tun-read".into())
         .spawn(move || {
-            // 一次分配一大块，之后每个包用 `split_to` 从块尾切出来：
-            // 切出的 `Bytes` 与块共享内存，**每个包不再 malloc 一次**，
-            // 而是每 64 KB（约 43 个满 MTU 的包）分配一次。下游把包读完
-            // 丢掉最后一个引用，整块才释放。
+            // 一块定长 scratch 反复用，交出去的包 copy 成精确大小。
+            //
+            // 曾经用 64 KB 大块 + `split_to` 切包省 malloc：切出的每个 `Bytes`
+            // 都持有整块的引用，而发送队列的额度是按**包长**记的。一条卡住的
+            // 小包流只要每个块里留一个包（别的流把同块的其它包消费掉），
+            // 就能用 256 KB 的记账钉住上百 MB 的物理内存——光猫只有 438 MB。
+            // 而且当时的 `resize(max_pkt, 0)` 每包都 memset 1488 字节，
+            // 所谓"省 malloc"本来就没省下多少。
             let max_pkt = usize::from(mtu) + 64;
-            const READ_CHUNK: usize = 64 * 1024;
-            let mut chunk = BytesMut::with_capacity(READ_CHUNK.max(max_pkt));
+            let mut scratch = vec![0u8; max_pkt];
             loop {
-                // `split_to` 会把前半段切走，剩下的容量不够一个包时就换新块
-                if chunk.capacity() < max_pkt {
-                    chunk = BytesMut::with_capacity(READ_CHUNK.max(max_pkt));
-                }
-                chunk.resize(max_pkt, 0);
-                match reader.read_packet(&mut chunk[..]) {
-                    Ok(0) => {
-                        chunk.clear();
-                        continue;
-                    }
+                match reader.read_packet(&mut scratch[..]) {
+                    Ok(0) => continue,
                     Ok(n) => {
-                        chunk.truncate(n);
-                        let packet = chunk.split_to(n);
                         // 通道容量有限：阻塞着等消费者，别把内核队列丢空
-                        if tx_out.blocking_send(packet.freeze()).is_err() {
+                        let packet = Bytes::copy_from_slice(&scratch[..n]);
+                        if tx_out.blocking_send(packet).is_err() {
                             break;
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        chunk.clear();
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                     Err(e) => {
