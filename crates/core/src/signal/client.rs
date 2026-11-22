@@ -440,6 +440,9 @@ impl SignalClient {
     /// `peer_online`**。用于换网后的重报：新网络的 NAT 映射可能恰好和旧
     /// 的一样（尤其是端口保留型 NAT），而这时候对端很可能已经因为「在线
     /// 却打不通」进了冷却，不广播就清不掉。
+    // 参数看着多，但都是「这一次注册要带什么」的平铺字段，拆结构体只会
+    // 让三个调用点多一层包装。项目里 `answer_punch` 也是同样的处理。
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         identity: &Identity,
