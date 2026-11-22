@@ -136,8 +136,12 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 取 2×[`WRITE_TIMEOUT`] + 一个[`SWEEP_INTERVAL`]：留够一次重试加一轮扫描的余量，
 /// 稀疏流量（失败间隔超过它）也只是把检出推迟到下一次失败，不会漏。
 const STALL_GRACE: Duration = Duration::from_secs(8);
-/// 判死阈值的下限 / 上限。实际值按 RTT 自适应，见 [`silent_limit`]。
-const PEER_SILENT_MIN: Duration = Duration::from_secs(3);
+/// 判死阈值的下限 / 上限。见 [`silent_limit`]。
+///
+/// 下限在 0.1.18 从 3 秒抬回 8 秒：低 RTT 链路上 3 秒会被 4G 切换、WiFi 漫游
+/// 这类 3~5 秒的自身可恢复停顿误杀。当前下限与上限相等，等价于固定 8 秒；
+/// 保留 clamp 结构是为了以后要单独放宽高 RTT 链路时只动上限。
+const PEER_SILENT_MIN: Duration = Duration::from_secs(8);
 const PEER_SILENT_MAX: Duration = Duration::from_secs(8);
 /// 判死阈值 = 10×srtt：给 QUIC 的 PTO 退避留两轮以上余量。
 const SILENT_RTT_FACTOR: u32 = 10;
@@ -156,13 +160,15 @@ const PRE_DIAL_INTERVAL: Duration = Duration::from_secs(30);
 /// 失效扫描周期。2 秒比 5 秒多花不了什么，但直接决定判死的滞后长度。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// 判死阈值：`clamp(10×srtt, 3 秒, 8 秒)`。
+/// 判死阈值：`clamp(10×srtt, 8 秒, 8 秒)`，当前等价于固定 8 秒。
 ///
-/// 固定 8 秒在 20 ms 的局域链路上太慢（黑洞要多扛 5 秒）；固定 3 秒在高 RTT
-/// 链路上又会误杀——QUIC 的 PTO 本身就是 `3×srtt`，加一次丢包重传就超了。
-/// RTT 未知时传 `Duration::ZERO`，`clamp` 会把结果落在**下限 3 秒**——
-/// 这是有意的：没有 RTT 采样说明对端一个包都没回过，本来就该早点判。
-/// 实际也踩不到：握手完成时 `path.rtt` 必有值。
+/// 0.1.17 曾把下限压到 3 秒想加快低 RTT 链路的黑洞恢复，但 3 秒容不下
+/// 4G 切换 / WiFi 漫游造成的 3~5 秒停顿——那种停顿 QUIC 自己会恢复，
+/// 我们却先摘了连接。两端只要有一端摘掉，整条直连就没了，所以阈值必须
+/// 按「两端里较小的那个」算，不能只在一边放宽。
+///
+/// 提速交给 [`suspect_limit`] 的预拨：新连接建成就顶掉旧的，不用等判死。
+/// 预拨失败才走这里的 8 秒兜底，与 0.1.16 及更早版本的行为一致。
 fn silent_limit(rtt: Duration) -> Duration {
     (rtt * SILENT_RTT_FACTOR).clamp(PEER_SILENT_MIN, PEER_SILENT_MAX)
 }
@@ -373,8 +379,8 @@ impl PeerHealth {
         let dead = s
             .unanswered_since_ms
             .is_some_and(|_| unanswered >= silent_limit(rtt).as_millis() as u64);
-        // dead 优先：两者可能落在同一轮（RTT 很大时 suspect 上限 3 秒，
-        // 判死下限 3 秒），这时没必要再预拨，直接重建更快。
+        // dead 优先：现在判死下限 8 秒、怀疑上限 3 秒，两者不会同轮；
+        // 但保留这个顺序，免得以后调阈值时又出现同轮重复动作。
         let suspect = !dead
             && s.unanswered_since_ms
                 .is_some_and(|_| unanswered >= suspect_limit(rtt).as_millis() as u64);
@@ -1692,18 +1698,15 @@ mod tests {
     // 第二版的测试每轮都让 tx 和 rx 一起涨，正好绕开了"tx 先涨、rx 晚一个
     // 扫描周期才涨"这个真实时序，所以两个误杀漏洞都没被发现。
 
-    /// 判死阈值按 RTT 缩放：`clamp(10×srtt, 3s, 8s)`。
+    /// 判死阈值：`clamp(10×srtt, 8s, 8s)`，当前下限=上限。
     #[test]
-    fn silent_limit_scales_with_rtt() {
-        // 20 ms：10×rtt 只有 200 ms，夹到下限 3 秒
+    fn silent_limit_stays_at_eight_seconds() {
+        // 0.1.17 的 3 秒下限会误杀 4G/WiFi 切换，回归：低 RTT 也必须 8 秒
+        assert_eq!(silent_limit(Duration::ZERO), PEER_SILENT_MIN);
         assert_eq!(silent_limit(Duration::from_millis(20)), PEER_SILENT_MIN);
-        // 500 ms：10×rtt = 5 秒，落在区间内
-        assert_eq!(
-            silent_limit(Duration::from_millis(500)),
-            Duration::from_secs(5)
-        );
-        // 1 秒：10×rtt 超上限，夹到 8 秒
+        assert_eq!(silent_limit(Duration::from_millis(500)), PEER_SILENT_MIN);
         assert_eq!(silent_limit(Duration::from_secs(1)), PEER_SILENT_MAX);
+        assert_eq!(PEER_SILENT_MIN, PEER_SILENT_MAX);
     }
 
     /// 怀疑阈值先于判死触发，中间留出预拨的时间窗口。
@@ -1716,7 +1719,7 @@ mod tests {
         );
         assert_eq!(suspect_limit(Duration::from_secs(2)), SUSPECT_MAX);
 
-        // 低 RTT 链路：开表后 1 秒怀疑、3 秒判死，窗口 2 秒
+        // 低 RTT 链路：开表后 1 秒怀疑、8 秒判死，留出 7 秒预拨窗口
         let h = PeerHealth::new();
         let rtt = Duration::from_millis(20);
         assert_eq!(
@@ -1732,8 +1735,10 @@ mod tests {
         );
         let v = h.sample_at(5, 0, rtt, 3_000);
         assert!(v.suspect && !v.dead, "开表后 1 秒：只怀疑，先预拨");
-        let v = h.sample_at(5, 0, rtt, 5_000);
-        assert!(v.dead, "开表后 3 秒：判死");
+        let v = h.sample_at(5, 0, rtt, 7_000);
+        assert!(v.suspect && !v.dead, "开表后 5 秒：仍在预拨窗口内");
+        let v = h.sample_at(5, 0, rtt, 10_000);
+        assert!(v.dead, "开表后 8 秒：判死");
     }
 
     /// 预拨在判死之前就触发，且不会因为 rx 不动而反复重置起点。
@@ -1748,7 +1753,11 @@ mod tests {
             h.sample_at(13, 10, rtt, 4_000).suspect,
             "继续预拨也还是怀疑"
         );
-        assert!(h.sample_at(14, 10, rtt, 5_000).dead, "开表后 3 秒判死");
+        assert!(
+            !h.sample_at(14, 10, rtt, 5_000).dead,
+            "开表后 3 秒还不到判死"
+        );
+        assert!(h.sample_at(15, 10, rtt, 10_000).dead, "开表后 8 秒判死");
     }
 
     /// 涓流：我方零星在发，对端一个包都不回 → 从第一个未回应的包算起 8 秒判死。
