@@ -127,6 +127,11 @@ curl https://p2p.example.com/v1/health     # 匿名只回 {"ok":true}
   `up` 认不出当前迁移标签，要用 `--tag <标签>` 显式指定，别猜。
 - 部署器用 `include_str!` 把 `signal/worker.js` 编进了可执行文件：**正式版部署器内嵌的是
   发版当时的 Worker 源码**，之后改了 Worker 不会自动生效，要用新发布的部署器 `up` 一次。
+- **改了 Worker 里 Durable Object 内的逻辑，必须同时给迁移链加一步**（哪怕不新建类），
+  否则 `up` 只换顶层 `fetch`，已有 DO 实例会继续跑旧代码。2026-11-22 实测过：修好候选
+  校验并 `up` 之后，`/v1/health` 已是新版，但 `/v1/register`（在 `NetworkRoom` 里处理）
+  仍返回旧行为。迁移链在 `crates/deploy/src/migrate.rs`，往 `CHAIN` 尾部追加
+  `Step { tag: "vN+1", new_sqlite_classes: &[] }` 即可。
 
 建网、加入、日常命令与排障见 [USAGE.md](USAGE.md)。
 
