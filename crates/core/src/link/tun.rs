@@ -1343,11 +1343,14 @@ async fn pump_stream(
     // 原来每包两次 read_exact + 一次 vec![0u8; len]。
     let mut buf = BytesMut::with_capacity(READ_BUF);
     loop {
-        // 帧头
+        // 帧头：只有缓冲正好为空时读到 EOF 才算正常结束；剩下 1 个字节
+        // 说明对端在一帧中间把流关了，是协议错误，不能悄悄当成收完了。
         while buf.len() < 2 {
-            // 读到 0 字节就是正常结束：对端把这条流关了
             if !fill(recv, &mut buf).await? {
-                return Ok(());
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                bail!("流在帧头中间结束（只剩 {} 字节）", buf.len());
             }
         }
         let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
@@ -1965,6 +1968,48 @@ mod tests {
             budget.load(Ordering::Relaxed),
             0,
             "关队列要把积压的 64 字节还给全局预算"
+        );
+    }
+
+    /// 流在一帧中间结束时必须报错。
+    ///
+    /// 只剩 1 字节的帧头说明对端算错了长度或中途崩了，属于协议错误。
+    /// 悄悄当成「正常结束」会让截断埋在 trace 日志里，排查时看不到。
+    #[tokio::test]
+    async fn half_frame_header_is_reported() {
+        let a = crate::engine::Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+            .await
+            .expect("绑定 A");
+        let b = crate::engine::Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+            .await
+            .expect("绑定 B");
+        let a_addrs = [a.local_addr()];
+        let b_addrs = [b.local_addr()];
+        let (dialer, listener) = tokio::join!(
+            a.punch(&b_addrs, crate::peer::Role::Dialer, Duration::from_secs(10)),
+            b.punch(
+                &a_addrs,
+                crate::peer::Role::Listener,
+                Duration::from_secs(10)
+            )
+        );
+        let conn = dialer.expect("打洞失败");
+        let peer = listener.expect("listener 打洞失败");
+
+        let (mut send, mut recv) = conn.open_bi().await.expect("开双向流");
+        // 对端要先收到数据，`accept_bi` 才能拿到这条流
+        send.write_all(&[KIND_IP]).await.expect("激活流");
+        let (mut peer_send, _peer_recv) = peer.accept_bi().await.expect("对端接流");
+
+        // 只写半个帧头就关发送端
+        peer_send.write_all(&[0u8]).await.expect("写半个帧头");
+        peer_send.finish().expect("关流");
+
+        let (to_tun, _rx) = mpsc::channel(4);
+        let result = pump_stream(&mut recv, to_tun, Activity::new()).await;
+        assert!(
+            result.is_err(),
+            "半个帧头必须报错，静默收下会掩盖对端的截断"
         );
     }
 }
