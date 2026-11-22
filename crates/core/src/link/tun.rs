@@ -909,9 +909,56 @@ impl FlowQueue {
 }
 
 impl Drop for FlowQueue {
-    /// 兜底归还全局预算：任何删除路径漏调 `close` 都不会让额度永久泄漏。
+    /// 最后一道兜底：所有句柄都没了，队列自然也该关。
+    ///
+    /// 真正起作用的是 [`QueueTx`] / [`QueueRx`] 的 `Drop`——这个 impl 只在
+    /// 两端都把 `Arc` 丢掉之后才跑得到，不能指望它补救漏关的路径。
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// 队列句柄，流表侧。与 writer 侧的 [`QueueRx`] 成对使用。
+///
+/// 两端各持一个，**任何一端丢掉都关队列**——语义和 `mpsc` 的
+/// `Sender`/`Receiver` 一样。这一层不是多余的封装，而是唯一能保证
+/// 「writer 退出 → 队列关闭 → `try_push` 返回 `Closed` → `dispatch` 重开流」
+/// 这条链路成立的东西：
+///
+/// - writer 因写超时、`open_bi` 失败或连接被关而退出时，流表里那份
+///   `Arc<FlowQueue>` 还活着，`Drop for FlowQueue` 永远等不到；
+/// - 队列不关，包就会继续入队，直到 256 KB 上限后变成 `Full` 丢掉，
+///   而 `dispatch` 里唯一的重开流入口是 `PushError::Closed`，永远不触发；
+/// - 积压的字节还不会退还全局预算，持续发送的流每条能占满 256 KB。
+struct QueueTx(Arc<FlowQueue>);
+
+/// 队列句柄，writer 侧。丢掉即关闭，见 [`QueueTx`]。
+struct QueueRx(Arc<FlowQueue>);
+
+impl std::ops::Deref for QueueTx {
+    type Target = FlowQueue;
+    fn deref(&self) -> &FlowQueue {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for QueueRx {
+    type Target = FlowQueue;
+    fn deref(&self) -> &FlowQueue {
+        &self.0
+    }
+}
+
+impl Drop for QueueTx {
+    fn drop(&mut self) {
+        // close 幂等：另一端先关也无所谓
+        self.0.close();
+    }
+}
+
+impl Drop for QueueRx {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -935,7 +982,8 @@ fn reserve(budget: &AtomicUsize, len: usize) -> bool {
 /// 流表的值：连接、发送队列、这条流所属对端的健康度。
 ///
 /// 队列而不是 `SendStream`：写动作交给 [`FlowWriter`]，主循环只入队。
-type FlowValue = (Connection, Arc<FlowQueue>, Arc<PeerHealth>);
+/// 队列句柄带 `Drop`：流表项被删、被淘汰、被 drain 时队列自动关闭。
+type FlowValue = (Connection, QueueTx, Arc<PeerHealth>);
 
 async fn pump(
     route: Route,
@@ -975,10 +1023,10 @@ async fn pump(
                 }
             }
             _ = sweep.tick() => {
-                for (key, (_, queue, _)) in flows.sweep(Instant::now()) {
+                // 值（含 QueueTx）在这里被丢掉，`Drop` 负责关队列、清积压，
+                // writer 收到 None 后自己 reset。不要再手动 close。
+                for (key, _) in flows.sweep(Instant::now()) {
                     tracing::trace!("[tun] 回收空闲流 {key:?}");
-                    // 关队列、清积压，writer 收尾时自己 reset
-                    queue.close();
                 }
                 if let Route::Mesh(links) = &route {
                     links.reap_unhealthy().await;
@@ -987,9 +1035,8 @@ async fn pump(
         }
     }
 
-    for (_, (_, queue, _)) in flows.drain() {
-        queue.close();
-    }
+    // 同上：丢掉的句柄会关掉每条队列，writer 随之收尾。
+    drop(flows.drain());
     Ok(())
 }
 
@@ -1098,7 +1145,8 @@ async fn dispatch(
     let queue = Arc::new(FlowQueue::new(queue_budget.clone()));
     tokio::spawn(
         FlowWriter {
-            queue: queue.clone(),
+            // writer 侧句柄：`run` 结束（无论走哪条路）就丢掉，队列随之关闭
+            queue: QueueRx(queue.clone()),
             health: peer.health.clone(),
             ip: dst,
             conn: peer.conn.clone(),
@@ -1108,9 +1156,11 @@ async fn dispatch(
 
     let _ = queue.try_push(packet);
 
-    if let Some((old, (_, old_queue, _))) = flows.insert(key, (peer.conn, queue, peer.health), now)
+    if let Some((old, (_, old_queue, _))) =
+        flows.insert(key, (peer.conn, QueueTx(queue), peer.health), now)
     {
-        old_queue.close();
+        // 淘汰的句柄丢掉即关队列，旧 writer 收到 None 后自己 reset
+        drop(old_queue);
         tracing::debug!("[tun] 流表满，淘汰 {old:?}");
     }
     Ok(())
@@ -1120,12 +1170,15 @@ async fn dispatch(
 ///
 /// 它跑在独立任务里，所以 `write_all` 挂起时只挂住它自己。写帧超时或出错，
 /// 就把这条流 `reset` 掉——内层 TCP 会因为收不到 ACK 重传，主循环下一次
-/// `try_send` 会发现队列已关，立刻重开一条新流接上。
+/// `try_push` 会拿到 [`PushError::Closed`]，立刻重开一条新流接上。
+///
+/// 「队列已关」由 [`QueueRx`] 的 `Drop` 保证：`run` 消耗 `self`，不管从
+/// 哪条路返回（建流失败、写帧超时、队列被流表关掉），句柄都会丢掉。
 ///
 /// 注意它**不判连接死活**：本地写失败说明不了对端还在不在，摘连接是
 /// [`MeshLinks::reap_unhealthy`] 按 QUIC 的对端回包计数决定的。
 struct FlowWriter {
-    queue: Arc<FlowQueue>,
+    queue: QueueRx,
     health: Arc<PeerHealth>,
     ip: Ipv4Addr,
     conn: Connection,
@@ -1817,5 +1870,97 @@ mod tests {
         // 关掉之后 recv 立刻返回 None，不会挂住
         q.close();
         assert!(q.recv().await.is_none(), "close 之后 recv 返回 None");
+    }
+
+    // --- 队列的生命周期：丢句柄即关闭 ------------------------------------
+
+    /// 两端任意一侧丢掉句柄，队列都算关。
+    ///
+    /// 这条测试钉的是 v0.1.16+189 引入的回归：队列改成 `Arc` 共享后，
+    /// 流表和 writer 各持一份，谁都不丢 → 永不关闭 → 写不出去了也继续收包。
+    #[test]
+    fn dropping_either_side_closes_the_queue() {
+        // 流表侧先丢：writer 会收到 None
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = Arc::new(FlowQueue::new(budget.clone()));
+        q.try_push(vec![0u8; 100]).expect("入队");
+        assert_eq!(budget.load(Ordering::Relaxed), 100);
+        drop(QueueTx(q.clone()));
+        assert!(
+            matches!(q.try_push(vec![0u8; 8]), Err(PushError::Closed(_))),
+            "丢掉 QueueTx 之后必须 Closed"
+        );
+        assert_eq!(budget.load(Ordering::Relaxed), 0, "关队列要归还积压额度");
+
+        // writer 侧丢：这是 writer 退出的等价场景，流表必须收到 Closed
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = Arc::new(FlowQueue::new(budget.clone()));
+        q.try_push(vec![0u8; 64]).expect("入队");
+        drop(QueueRx(q.clone()));
+        assert!(
+            matches!(q.try_push(vec![0u8; 8]), Err(PushError::Closed(_))),
+            "丢掉 QueueRx 之后必须 Closed，否则 dispatch 永远不会重开流"
+        );
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    /// writer 因连接不可用而退出后，流表侧的下一次入队必须拿到 `Closed`。
+    ///
+    /// 用一条真回环连接：先 `close` 再起 writer，`open_bi` 立刻失败，
+    /// `run` 从「建流失败」这条路返回——这正是原来漏掉 `close()` 的路径之一。
+    #[tokio::test]
+    async fn writer_exit_closes_the_queue() {
+        let a = crate::engine::Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+            .await
+            .expect("绑定 A");
+        let b = crate::engine::Engine::bind("127.0.0.1:0".parse().unwrap(), &[])
+            .await
+            .expect("绑定 B");
+        let (dialer, listener) = tokio::join!(
+            a.punch(
+                &[b.local_addr()],
+                crate::peer::Role::Dialer,
+                Duration::from_secs(10)
+            ),
+            b.punch(
+                &[a.local_addr()],
+                crate::peer::Role::Listener,
+                Duration::from_secs(10)
+            )
+        );
+        let conn = dialer.expect("打洞失败");
+        let _listener = listener.expect("listener 打洞失败");
+
+        let budget = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(FlowQueue::new(budget.clone()));
+        // 先塞一个包占住额度：关队列时必须把它退回来
+        queue.try_push(vec![0u8; 64]).expect("入队");
+        assert_eq!(budget.load(Ordering::Relaxed), 64);
+
+        conn.close(0u32.into(), b"test");
+        let writer = tokio::spawn(
+            FlowWriter {
+                queue: QueueRx(queue.clone()),
+                health: Arc::new(PeerHealth::new()),
+                ip: Ipv4Addr::new(10, 78, 0, 2),
+                conn: conn.clone(),
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer 必须退出：连接关了还留在 recv 上就是泄漏一个任务")
+            .expect("writer 不该 panic");
+
+        match queue.try_push(vec![0u8; 8]) {
+            Err(PushError::Closed(p)) => assert_eq!(p.len(), 8, "包要原样退回"),
+            Err(PushError::Full(_)) => panic!("队列必须已关闭，不能只是满"),
+            Ok(()) => panic!("writer 退出后队列必须关闭，否则这条流就是永久黑洞"),
+        }
+        assert_eq!(
+            budget.load(Ordering::Relaxed),
+            0,
+            "关队列要把积压的 64 字节还给全局预算"
+        );
     }
 }
