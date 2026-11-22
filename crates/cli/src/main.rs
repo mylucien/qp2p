@@ -796,6 +796,17 @@ fn print_config(config: &Config, path: &std::path::Path) {
             None => "关（默认）".to_string(),
         }
     );
+    let stream_window = config.stream_window();
+    println!(
+        "流窗口   : {} 字节（{}，总 {} 字节）",
+        stream_window,
+        if config.window.is_some() {
+            "手动"
+        } else {
+            "auto 按内存"
+        },
+        stream_window.saturating_mul(qp2p_core::tls::TOTAL_WINDOW_FACTOR)
+    );
     match &config.network {
         Some(net) => {
             println!(
@@ -880,6 +891,29 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
             }
             config.busy_poll = if micros == 0 { None } else { Some(micros) };
         }
+        "window" | "stream_window" => {
+            let text = value.trim().to_lowercase();
+            if matches!(text.as_str(), "auto" | "default") {
+                config.window = None;
+            } else {
+                let bytes: u32 = text
+                    .parse()
+                    .with_context(|| format!("window 不是字节数或 auto：{value}"))?;
+                if bytes < qp2p_core::tls::WINDOW_MIN {
+                    bail!(
+                        "窗口太小（{bytes} 字节），至少 {}",
+                        qp2p_core::tls::WINDOW_MIN
+                    );
+                }
+                if bytes > qp2p_core::tls::WINDOW_MAX {
+                    bail!(
+                        "窗口太大（{bytes} 字节），最多 {}（再大弱设备扛不住）",
+                        qp2p_core::tls::WINDOW_MAX
+                    );
+                }
+                config.window = Some(bytes);
+            }
+        }
         "routes" | "route" => {
             let list = split_list(value);
             for raw in &list {
@@ -908,7 +942,7 @@ fn set_config(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         other => bail!(
             "不认识的配置项：{other}\n\
-             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / busy_poll / ip"
+             可用：worker / admin_secret / node_name / listen / mtu / dev / stun / routes / busy_poll / window / ip"
         ),
     }
     Ok(())
@@ -928,6 +962,7 @@ fn unset_config(config: &mut Config, key: &str) -> Result<()> {
         // 已移除的选项：清一下旧配置里的残留键，不报错也不算失败
         "congestion" | "cc" => {}
         "busy_poll" | "busy-poll" => config.busy_poll = None,
+        "window" | "stream_window" => config.window = None,
         "routes" | "route" => config.routes.clear(),
         "ip" | "virtual_ip" => {
             if let Some(network) = config.network.as_mut() {

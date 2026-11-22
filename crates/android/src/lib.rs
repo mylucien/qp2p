@@ -173,6 +173,9 @@ pub struct StartConfig {
     /// 信令传输：`auto`（默认）/ `ws` / `poll`。
     #[serde(default)]
     pub signal_transport: Option<String>,
+    /// 单流接收窗口（字节）。不填 = auto：按物理内存分级（< 1 GB 用 1 MB）。
+    #[serde(default)]
+    pub window: Option<u32>,
     /// 局域网共享：远端经本机虚拟地址访问内网目标。
     ///
     /// 每条可以是 `{"listen": 10080, "target": "192.168.1.1:80"}`（指定虚拟端口），
@@ -379,6 +382,16 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
     } else {
         qp2p_core::route::clamp_mtu(config.mtu)
     };
+    // 传输参数是进程级的一次性配置：窗口按内存分级（弱机 1 MB、其余 2 MB），
+    // 显式值夹进硬边界。`configure` 只认第一次调用，本进程后续 prepare 不再改。
+    qp2p_core::tls::configure(qp2p_core::tls::LinkTuning {
+        stream_window: config
+            .window
+            .map_or_else(qp2p_core::tls::auto_stream_window, |bytes| {
+                bytes.clamp(qp2p_core::tls::WINDOW_MIN, qp2p_core::tls::WINDOW_MAX)
+            }),
+        ..Default::default()
+    });
     // 保持在线时不设超时：会话里 `idle_timeout = None` 既不会断开直连，
     // 也不会进入休眠，长连接自然一直挂着。关掉时才按选定的档位休眠。
     let idle = idle_timeout(config.keep_online, config.idle_secs);

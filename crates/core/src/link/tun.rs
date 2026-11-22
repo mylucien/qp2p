@@ -34,7 +34,8 @@
 //! 不新增任何探测包，判据只看 **QUIC 自己的统计**：
 //!
 //! - 我方发出了**需要对方回应**的帧（`frame_tx.stream + frame_tx.ping` 在涨），
-//!   而对端连续 [`PEER_SILENT`] 一个 UDP 包都没回（`udp_rx` 不动）→ 链路黑洞。
+//!   而对端连续 `silent_limit(rtt)` 这么久一个 UDP 包都没回（`udp_rx` 不动）
+//!   → 链路黑洞。到 `suspect_limit(rtt)` 时先预拨一条新的，旧的先别断。
 //! - 流级只做"废掉这一条流"，不判连接死活：单帧写超过 [`WRITE_TIMEOUT`] 就
 //!   `reset`，主循环换一条新流继续；连续 [`STALL_TIMEOUT`] 每一次写都失败才兜底
 //!   判死（对端 ACK 但不消费，连接级流控窗口关死）。
@@ -68,7 +69,9 @@
 //! 一条判据都不触发，全靠 QUIC 默认的 30 秒 idle timeout 收场。那个判据还会
 //! 误杀：6 秒抖动就能凑够 3 条超时流，把本来能自愈的连接掐掉。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -133,13 +136,42 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 取 2×[`WRITE_TIMEOUT`] + 一个[`SWEEP_INTERVAL`]：留够一次重试加一轮扫描的余量，
 /// 稀疏流量（失败间隔超过它）也只是把检出推迟到下一次失败，不会漏。
 const STALL_GRACE: Duration = Duration::from_secs(8);
-/// 我方发出了需要回应的帧，对端却这么久没有任何 UDP 回包 → 判死。
+/// 判死阈值的下限 / 上限。实际值按 RTT 自适应，见 [`silent_limit`]。
+const PEER_SILENT_MIN: Duration = Duration::from_secs(3);
+const PEER_SILENT_MAX: Duration = Duration::from_secs(8);
+/// 判死阈值 = 10×srtt：给 QUIC 的 PTO 退避留两轮以上余量。
+const SILENT_RTT_FACTOR: u32 = 10;
+
+/// 怀疑阈值：到这个点先拨一条新的，**旧的先留着**（先建后断）。
 ///
-/// 8 秒：够 QUIC 在丢包重传、路径切换（WiFi↔4G）里缓过来，又能把黑洞的
-/// 发现时间压到「8 秒 + 一个扫描周期」。
-const PEER_SILENT: Duration = Duration::from_secs(8);
+/// 比判死阈值小一截，留出打洞的时间窗口。下限 1 秒是因为低 RTT 链路上
+/// 单个丢包的 PTO 约 200~600 ms，再激进就会天天误触。
+const SUSPECT_MIN: Duration = Duration::from_secs(1);
+const SUSPECT_MAX: Duration = Duration::from_secs(3);
+const SUSPECT_RTT_FACTOR: u32 = 6;
+
+/// 同一个对端两次预拨的最小间隔。打洞本身要几秒，更密只是白烧 CPU 与流量。
+const PRE_DIAL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 失效扫描周期。2 秒比 5 秒多花不了什么，但直接决定判死的滞后长度。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 判死阈值：`clamp(10×srtt, 3 秒, 8 秒)`。
+///
+/// 固定 8 秒在 20 ms 的局域链路上太慢（黑洞要多扛 5 秒）；固定 3 秒在高 RTT
+/// 链路上又会误杀——QUIC 的 PTO 本身就是 `3×srtt`，加一次丢包重传就超了。
+/// RTT 未知（握手刚完成、还没有采样）时按上限 8 秒保守处理。
+fn silent_limit(rtt: Duration) -> Duration {
+    (rtt * SILENT_RTT_FACTOR).clamp(PEER_SILENT_MIN, PEER_SILENT_MAX)
+}
+
+/// 怀疑阈值：`clamp(6×srtt, 1 秒, 3 秒)`。
+///
+/// 到点只叫会话循环预拨一条新连接，**不动旧连接**，所以误触的代价只是
+/// 一次多余打洞；真正的判死仍走 [`silent_limit`]。
+fn suspect_limit(rtt: Duration) -> Duration {
+    (rtt * SUSPECT_RTT_FACTOR).clamp(SUSPECT_MIN, SUSPECT_MAX)
+}
 
 /// 数据面活跃度：收到/发出任何包就打一个时间戳。
 ///
@@ -180,7 +212,7 @@ impl Activity {
 /// 判据两层，**连接死活只认"对端有没有回包"**：
 ///
 /// - 连接级（唯一可信信号）：我方发出了需要对方回应的帧，对端连续
-///   [`PEER_SILENT`] 没回任何 UDP 包 → 黑洞。数据来自 `conn.stats()`，不额外
+///   `silent_limit(rtt)` 没回任何 UDP 包 → 黑洞。数据来自 `conn.stats()`，不额外
 ///   发探测包。
 /// - 流级（只废流，不判连接）：单帧写超过 [`WRITE_TIMEOUT`] 就换一条流；
 ///   连续 [`STALL_TIMEOUT`] 每一次写都失败才兜底判死（对端 ACK 但不消费）。
@@ -237,6 +269,16 @@ struct Silence {
     started: bool,
 }
 
+/// 一轮采样的结论。
+///
+/// 拆成两级是为了**先建后断**：`suspect` 只触发预拨，旧连接继续用；
+/// `dead` 才摘表关连接、走原来那套重拨。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Verdict {
+    suspect: bool,
+    dead: bool,
+}
+
 impl PeerHealth {
     fn new() -> Self {
         Self {
@@ -289,13 +331,13 @@ impl PeerHealth {
     ///
     /// `rx` = `conn.stats().udp_rx.datagrams`，对端任何回包（含纯 ACK）都算活着。
     ///
-    /// 返回 true = 判定失效。
-    fn observe(&self, tx: u64, rx: u64) -> bool {
-        self.observe_at(tx, rx, self.now_ms())
+    /// `rtt` = `conn.stats().path.rtt`，两个阈值都按它缩放。
+    fn sample(&self, tx: u64, rx: u64, rtt: Duration) -> Verdict {
+        self.sample_at(tx, rx, rtt, self.now_ms())
     }
 
-    /// 同 [`Self::observe`]，但时间戳由调用方给（单测用假时间，免得真等 8 秒）。
-    fn observe_at(&self, tx: u64, rx: u64, now_ms: u64) -> bool {
+    /// 同 [`Self::sample`]，但时间戳由调用方给（单测用假时间，免得真等 8 秒）。
+    fn sample_at(&self, tx: u64, rx: u64, rtt: Duration, now_ms: u64) -> Verdict {
         let mut s = self.silence.lock().unwrap_or_else(|e| e.into_inner());
         if !s.started {
             // 首次采样只建基线：握手阶段的帧数已经很多，拿来判死会当场误杀
@@ -305,7 +347,7 @@ impl PeerHealth {
                 unanswered_since_ms: None,
                 started: true,
             };
-            return false;
+            return Verdict::default();
         }
         let rx_grew = rx > s.rx;
         let tx_grew = tx > s.tx;
@@ -322,10 +364,25 @@ impl PeerHealth {
             s.unanswered_since_ms = Some(now_ms);
         }
 
-        match s.unanswered_since_ms {
-            Some(t) => now_ms.saturating_sub(t) >= PEER_SILENT.as_millis() as u64,
-            None => false,
-        }
+        let unanswered = s
+            .unanswered_since_ms
+            .map(|t| now_ms.saturating_sub(t))
+            .unwrap_or(0);
+        let dead = s
+            .unanswered_since_ms
+            .is_some_and(|_| unanswered >= silent_limit(rtt).as_millis() as u64);
+        // dead 优先：两者可能落在同一轮（RTT 很大时 suspect 上限 3 秒，
+        // 判死下限 3 秒），这时没必要再预拨，直接重建更快。
+        let suspect = !dead
+            && s.unanswered_since_ms
+                .is_some_and(|_| unanswered >= suspect_limit(rtt).as_millis() as u64);
+        Verdict { suspect, dead }
+    }
+
+    /// 单测用的固定阈值版本：RTT 按上限处理，等价于老版本的"8 秒判死"。
+    #[cfg(test)]
+    fn observe_at(&self, tx: u64, rx: u64, now_ms: u64) -> bool {
+        self.sample_at(tx, rx, PEER_SILENT_MAX, now_ms).dead
     }
 
     /// 连续写失败超过 [`STALL_TIMEOUT`]：每一条流都写不动，内层重传也没用。
@@ -438,20 +495,34 @@ impl Notice {
     }
 }
 
+/// 数据面发给会话循环的唤醒请求。
+#[derive(Debug, Clone, Copy)]
+pub struct WakeReq {
+    /// 目标虚拟地址
+    pub ip: Ipv4Addr,
+    /// 预拨（先建后断）：表里已经连着也要拨一条新的，旧的等新连接建成再关
+    pub pre: bool,
+}
+
 /// 多对端连接表：目标虚拟地址 → 已建立的直连。
 ///
 /// 组网时一台机器同时和多个节点相连，内核把一个包交给 TUN 之后，
 /// 我们只能靠**目标地址**判断该从哪条连接发出去。
 pub struct MeshLinks {
-    peers: RwLock<HashMap<Ipv4Addr, MeshPeer>>,
+    peers: RwLock<FxHashMap<Ipv4Addr, MeshPeer>>,
     to_tun: mpsc::Sender<Bytes>,
     /// 目标没有直连时，把对端虚拟地址丢进来，让会话循环立刻去打通它
-    wake: RwLock<Option<mpsc::Sender<Ipv4Addr>>>,
+    wake: RwLock<Option<mpsc::Sender<WakeReq>>>,
     activity: Activity,
     /// 每个对端上一次被唤醒的时刻（毫秒）；3 秒冷却，避免持续丢包把信令打成洪水。
     /// 按目的地址分开记：冷却不该被别的对端用掉。
     started: Instant,
-    last_wake: Arc<std::sync::Mutex<HashMap<Ipv4Addr, u64>>>,
+    last_wake: Arc<std::sync::Mutex<FxHashMap<Ipv4Addr, u64>>>,
+    /// 每个对端上一次预拨的时刻（毫秒）；[`PRE_DIAL_INTERVAL`] 冷却。
+    ///
+    /// 和 `last_wake` 分开记：预拨是"链路看着要死，先建一条备用"，节流窗口
+    /// 比普通唤醒长得多，混用会让持续丢包把预拨节流位一直占着。
+    pre_dial: Arc<std::sync::Mutex<FxHashMap<Ipv4Addr, u64>>>,
     /// 允许对端经本机访问的目标（局域网出口）；空 = 拒绝一切端口映射请求
     allowed: Arc<Vec<SocketAddr>>,
     /// 用户可见提示（"直连已失效，正在重建"）。会话层注入，没注入就只写日志。
@@ -463,19 +534,20 @@ impl MeshLinks {
     /// 端口映射流（`KIND_TCP`）——安卓当局域网出口就是靠它。
     pub fn new(to_tun: mpsc::Sender<Bytes>, allowed: Vec<SocketAddr>) -> Arc<Self> {
         Arc::new(Self {
-            peers: RwLock::new(HashMap::new()),
+            peers: RwLock::new(FxHashMap::default()),
             to_tun,
             wake: RwLock::new(None),
             activity: Activity::new(),
             started: Instant::now(),
-            last_wake: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            last_wake: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
+            pre_dial: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             allowed: Arc::new(allowed),
             notice: OnceLock::new(),
         })
     }
 
     /// 会话循环启动时挂上唤醒通道。没挂之前丢包就是丢包，行为和以前一致。
-    pub async fn set_wake(&self, tx: mpsc::Sender<Ipv4Addr>) {
+    pub async fn set_wake(&self, tx: mpsc::Sender<WakeReq>) {
         *self.wake.write().await = Some(tx);
     }
 
@@ -516,7 +588,7 @@ impl MeshLinks {
         }
         let guard = self.wake.read().await;
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.try_send(ip);
+            let _ = tx.try_send(WakeReq { ip, pre: false });
         }
     }
 
@@ -530,7 +602,36 @@ impl MeshLinks {
         }
         let guard = self.wake.read().await;
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.try_send(ip);
+            let _ = tx.try_send(WakeReq { ip, pre: false });
+        }
+    }
+
+    /// 链路可能已经黑洞：叫会话循环**预拨**一条新连接，旧连接先留着。
+    ///
+    /// 这是先建后断的入口。预拨失败/超时不影响旧连接——它仍由
+    /// [`Self::reap_unhealthy`] 按判死阈值处理，所以最坏情况与没有预拨时相同。
+    async fn request_pre_dial(&self, ip: Ipv4Addr) {
+        let now = self.started.elapsed().as_millis() as u64;
+        {
+            let Ok(mut last) = self.pre_dial.lock() else {
+                return;
+            };
+            let interval = PRE_DIAL_INTERVAL.as_millis() as u64;
+            if let Some(prev) = last.get(&ip) {
+                if now.saturating_sub(*prev) < interval {
+                    return;
+                }
+            }
+            last.insert(ip, now);
+            // 表别无限长：过了两倍冷却期的记录没有意义
+            if last.len() > 4096 {
+                last.retain(|_, at| now.saturating_sub(*at) < interval * 2);
+            }
+        }
+        tracing::debug!("[tun] {ip} 连续没有回包，先拨一条新的试试");
+        let guard = self.wake.read().await;
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.try_send(WakeReq { ip, pre: true });
         }
     }
 
@@ -684,6 +785,7 @@ impl MeshLinks {
     /// 依赖主循环还活着——所以必须先有"主循环不许等网络"的改造，否则主循环
     /// 自己卡住，这个扫描再也不会跑。
     pub async fn reap_unhealthy(&self) {
+        let mut suspect = Vec::new();
         let unhealthy: Vec<(Ipv4Addr, Connection, &'static str)> = {
             let peers = self.peers.read().await;
             peers
@@ -695,10 +797,18 @@ impl MeshLinks {
                     // 连接级判据：我方发了需回应的帧、对端一个包都没回。
                     // 只算 stream + ping：纯 ACK 不需要对端回应，算进去会误杀
                     let stats = p.conn.stats();
-                    if p.health
-                        .observe(needing_reply(&stats), stats.udp_rx.datagrams)
-                    {
-                        return Some((*ip, p.conn.clone(), "对端 8 秒没有回包"));
+                    let verdict = p.health.sample(
+                        needing_reply(&stats),
+                        stats.udp_rx.datagrams,
+                        stats.path.rtt,
+                    );
+                    if verdict.dead {
+                        return Some((*ip, p.conn.clone(), "对端长时间没有回包"));
+                    }
+                    if verdict.suspect {
+                        // 先建后断：只预拨，不摘表。新连接建成会顶掉这一条，
+                        // 预拨失败则等判死阈值到了再按老路重建。
+                        suspect.push(*ip);
                     }
                     // 兜底：对端在 ACK 但不消费，每一条流都写不动
                     if p.health.write_failing() {
@@ -708,6 +818,10 @@ impl MeshLinks {
                 })
                 .collect()
         };
+        // 读锁必须先放掉：request_pre_dial 会拿 wake 锁并 try_send
+        for ip in suspect {
+            self.request_pre_dial(ip).await;
+        }
         for (ip, conn, reason) in unhealthy {
             let first = {
                 let peers = self.peers.read().await;
@@ -778,7 +892,7 @@ pub async fn run(conn: Connection, link: TunLink, local: Ipv4Addr) -> Result<()>
 /// 远端不开 `ip_forward` 也能 ping 通，这是用户判断"连没连上"的第一反应。
 pub async fn run_mesh(
     links: Arc<MeshLinks>,
-    from_tun: mpsc::Receiver<Vec<u8>>,
+    from_tun: mpsc::Receiver<Bytes>,
     local: Ipv4Addr,
     mtu: u16,
 ) -> Result<()> {
@@ -829,7 +943,7 @@ struct FlowQueue {
 }
 
 struct FlowQueueInner {
-    packets: VecDeque<Vec<u8>>,
+    packets: VecDeque<Bytes>,
     bytes: usize,
     closed: bool,
 }
@@ -838,8 +952,8 @@ struct FlowQueueInner {
 /// 关了要挂到新开的流上，不能凭空少一个包。
 #[derive(Debug)]
 enum PushError {
-    Full(Vec<u8>),
-    Closed(Vec<u8>),
+    Full(Bytes),
+    Closed(Bytes),
 }
 
 impl FlowQueue {
@@ -856,7 +970,7 @@ impl FlowQueue {
     }
 
     /// 非阻塞入队。绝不在主循环里等：队列满就让内层 TCP 重传。
-    fn try_push(&self, packet: Vec<u8>) -> Result<(), PushError> {
+    fn try_push(&self, packet: Bytes) -> Result<(), PushError> {
         let len = packet.len();
         // 先占全局额度：满了连队列锁都不用拿
         if !reserve(&self.budget, len) {
@@ -1035,7 +1149,7 @@ type FlowValue = (Connection, QueueTx, Arc<PeerHealth>);
 
 async fn pump(
     route: Route,
-    mut from_tun: mpsc::Receiver<Vec<u8>>,
+    mut from_tun: mpsc::Receiver<Bytes>,
     to_tun: mpsc::Sender<Bytes>,
     local: Ipv4Addr,
     mtu: usize,
@@ -1093,7 +1207,7 @@ async fn dispatch(
     flows: &mut FlowTable<FlowValue>,
     to_tun: &mpsc::Sender<Bytes>,
     local: Ipv4Addr,
-    mut packet: Vec<u8>,
+    mut packet: Bytes,
     mtu: usize,
     queue_budget: &Arc<AtomicUsize>,
 ) -> Result<()> {
@@ -1129,13 +1243,14 @@ async fn dispatch(
             Some(pieces) => {
                 let count = pieces.len();
                 for piece in pieces {
-                    // dispatch 是 async 递归，必须装箱才能算出大小
+                    // dispatch 是 async 递归，必须装箱才能算出大小。
+                    // 分片本来就要新分配，这里转成 Bytes 只挪所有权。
                     Box::pin(dispatch(
                         route,
                         flows,
                         to_tun,
                         local,
-                        piece,
+                        Bytes::from(piece),
                         mtu,
                         queue_budget,
                     ))
@@ -1574,6 +1689,65 @@ mod tests {
     // 第二版的测试每轮都让 tx 和 rx 一起涨，正好绕开了"tx 先涨、rx 晚一个
     // 扫描周期才涨"这个真实时序，所以两个误杀漏洞都没被发现。
 
+    /// 判死阈值按 RTT 缩放：`clamp(10×srtt, 3s, 8s)`。
+    #[test]
+    fn silent_limit_scales_with_rtt() {
+        // 20 ms：10×rtt 只有 200 ms，夹到下限 3 秒
+        assert_eq!(silent_limit(Duration::from_millis(20)), PEER_SILENT_MIN);
+        // 500 ms：10×rtt = 5 秒，落在区间内
+        assert_eq!(
+            silent_limit(Duration::from_millis(500)),
+            Duration::from_secs(5)
+        );
+        // 1 秒：10×rtt 超上限，夹到 8 秒
+        assert_eq!(silent_limit(Duration::from_secs(1)), PEER_SILENT_MAX);
+    }
+
+    /// 怀疑阈值先于判死触发，中间留出预拨的时间窗口。
+    #[test]
+    fn suspect_fires_before_dead() {
+        assert_eq!(suspect_limit(Duration::from_millis(20)), SUSPECT_MIN);
+        assert_eq!(
+            suspect_limit(Duration::from_millis(200)),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(suspect_limit(Duration::from_secs(2)), SUSPECT_MAX);
+
+        // 低 RTT 链路：开表后 1 秒怀疑、3 秒判死，窗口 2 秒
+        let h = PeerHealth::new();
+        let rtt = Duration::from_millis(20);
+        assert_eq!(
+            h.sample_at(0, 0, rtt, 0),
+            Verdict::default(),
+            "首轮只建基线"
+        );
+        // t=2s：我方发了数据帧、对端没回 → 从这一刻开表
+        assert_eq!(
+            h.sample_at(5, 0, rtt, 2_000),
+            Verdict::default(),
+            "刚开表，一秒都没到"
+        );
+        let v = h.sample_at(5, 0, rtt, 3_000);
+        assert!(v.suspect && !v.dead, "开表后 1 秒：只怀疑，先预拨");
+        let v = h.sample_at(5, 0, rtt, 5_000);
+        assert!(v.dead, "开表后 3 秒：判死");
+    }
+
+    /// 预拨在判死之前就触发，且不会因为 rx 不动而反复重置起点。
+    #[test]
+    fn pre_dial_keeps_the_original_deadline() {
+        let h = PeerHealth::new();
+        let rtt = Duration::from_millis(20);
+        assert_eq!(h.sample_at(10, 10, rtt, 0), Verdict::default());
+        assert!(!h.sample_at(11, 10, rtt, 2_000).suspect);
+        assert!(h.sample_at(12, 10, rtt, 3_000).suspect, "开表后 1 秒");
+        assert!(
+            h.sample_at(13, 10, rtt, 4_000).suspect,
+            "继续预拨也还是怀疑"
+        );
+        assert!(h.sample_at(14, 10, rtt, 5_000).dead, "开表后 3 秒判死");
+    }
+
     /// 涓流：我方零星在发，对端一个包都不回 → 从第一个未回应的包算起 8 秒判死。
     #[test]
     fn silence_while_sending_kills_the_link() {
@@ -1879,7 +2053,7 @@ mod tests {
         let budget = Arc::new(AtomicUsize::new(0));
         let q = FlowQueue::new(budget.clone());
         // 2048 字节 × 128 个正好 256 KB；再多一个就该被拒
-        let packet = vec![0u8; 2048];
+        let packet = Bytes::from(vec![0u8; 2048]);
         for i in 0..128 {
             assert!(q.try_push(packet.clone()).is_ok(), "第 {i} 个不该被拒");
         }
@@ -1899,7 +2073,7 @@ mod tests {
         // 一直推到全局 32 MB 满为止，验证的是"总额度会被别的流吃掉"
         let q1 = FlowQueue::new(budget.clone());
         let q2 = FlowQueue::new(budget.clone());
-        let packet = vec![0u8; 64 * 1024];
+        let packet = Bytes::from(vec![0u8; 64 * 1024]);
         for _ in 0..4 {
             assert!(q1.try_push(packet.clone()).is_ok());
         }
@@ -1925,7 +2099,7 @@ mod tests {
         };
         // 让 writer 先进入等待，再入队，验证 notify 不丢
         tokio::task::yield_now().await;
-        q.try_push(vec![7u8; 100]).expect("入队");
+        q.try_push(Bytes::from(vec![7u8; 100])).expect("入队");
         assert_eq!(budget.load(Ordering::Relaxed), 100, "排队中要占额度");
 
         let packet = writer
@@ -1946,9 +2120,9 @@ mod tests {
     fn drain_into_takes_the_whole_queue_as_one_buffer() {
         let budget = Arc::new(AtomicUsize::new(0));
         let q = FlowQueue::new(budget.clone());
-        q.try_push(vec![1u8; 100]).expect("入队");
-        q.try_push(vec![2u8; 200]).expect("入队");
-        q.try_push(vec![3u8; 300]).expect("入队");
+        q.try_push(Bytes::from(vec![1u8; 100])).expect("入队");
+        q.try_push(Bytes::from(vec![2u8; 200])).expect("入队");
+        q.try_push(Bytes::from(vec![3u8; 300])).expect("入队");
         assert_eq!(budget.load(Ordering::Relaxed), 600);
 
         let mut out = Vec::new();
@@ -1972,8 +2146,8 @@ mod tests {
     fn drain_into_stops_at_the_batch_limit() {
         let budget = Arc::new(AtomicUsize::new(0));
         let q = FlowQueue::new(budget.clone());
-        q.try_push(vec![0u8; 100]).expect("入队");
-        q.try_push(vec![0u8; 100]).expect("入队");
+        q.try_push(Bytes::from(vec![0u8; 100])).expect("入队");
+        q.try_push(Bytes::from(vec![0u8; 100])).expect("入队");
 
         let mut out = Vec::new();
         // 上限比一个包小：只取一个就该停（软上限，允许单帧超出）
@@ -1995,11 +2169,14 @@ mod tests {
         // 流表侧先丢：writer 会收到 None
         let budget = Arc::new(AtomicUsize::new(0));
         let q = Arc::new(FlowQueue::new(budget.clone()));
-        q.try_push(vec![0u8; 100]).expect("入队");
+        q.try_push(Bytes::from(vec![0u8; 100])).expect("入队");
         assert_eq!(budget.load(Ordering::Relaxed), 100);
         drop(QueueTx(q.clone()));
         assert!(
-            matches!(q.try_push(vec![0u8; 8]), Err(PushError::Closed(_))),
+            matches!(
+                q.try_push(Bytes::from(vec![0u8; 8])),
+                Err(PushError::Closed(_))
+            ),
             "丢掉 QueueTx 之后必须 Closed"
         );
         assert_eq!(budget.load(Ordering::Relaxed), 0, "关队列要归还积压额度");
@@ -2007,10 +2184,13 @@ mod tests {
         // writer 侧丢：这是 writer 退出的等价场景，流表必须收到 Closed
         let budget = Arc::new(AtomicUsize::new(0));
         let q = Arc::new(FlowQueue::new(budget.clone()));
-        q.try_push(vec![0u8; 64]).expect("入队");
+        q.try_push(Bytes::from(vec![0u8; 64])).expect("入队");
         drop(QueueRx(q.clone()));
         assert!(
-            matches!(q.try_push(vec![0u8; 8]), Err(PushError::Closed(_))),
+            matches!(
+                q.try_push(Bytes::from(vec![0u8; 8])),
+                Err(PushError::Closed(_))
+            ),
             "丢掉 QueueRx 之后必须 Closed，否则 dispatch 永远不会重开流"
         );
         assert_eq!(budget.load(Ordering::Relaxed), 0);
@@ -2046,7 +2226,7 @@ mod tests {
         let budget = Arc::new(AtomicUsize::new(0));
         let queue = Arc::new(FlowQueue::new(budget.clone()));
         // 先塞一个包占住额度：关队列时必须把它退回来
-        queue.try_push(vec![0u8; 64]).expect("入队");
+        queue.try_push(Bytes::from(vec![0u8; 64])).expect("入队");
         assert_eq!(budget.load(Ordering::Relaxed), 64);
 
         conn.close(0u32.into(), b"test");
@@ -2064,7 +2244,7 @@ mod tests {
             .expect("writer 必须退出：连接关了还留在 recv 上就是泄漏一个任务")
             .expect("writer 不该 panic");
 
-        match queue.try_push(vec![0u8; 8]) {
+        match queue.try_push(Bytes::from(vec![0u8; 8])) {
             Err(PushError::Closed(p)) => assert_eq!(p.len(), 8, "包要原样退回"),
             Err(PushError::Full(_)) => panic!("队列必须已关闭，不能只是满"),
             Ok(()) => panic!("writer 退出后队列必须关闭，否则这条流就是永久黑洞"),

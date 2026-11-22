@@ -11,7 +11,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 pub mod flow;
 pub mod ip;
@@ -220,7 +220,7 @@ fn write_into_tun(device: &dyn TunDevice, packet: &[u8]) {
 /// 开两个专用线程最省事，也避免为每个平台写一遍 epoll/IOCP。
 pub struct TunLink {
     /// 从内核收到的包（要发往对端）。
-    pub from_tun: mpsc::Receiver<Vec<u8>>,
+    pub from_tun: mpsc::Receiver<Bytes>,
     /// 要写进内核的包（从对端收到的）。
     pub to_tun: mpsc::Sender<Bytes>,
     pub mtu: usize,
@@ -228,7 +228,7 @@ pub struct TunLink {
 
 pub fn spawn_io(device: Box<dyn TunDevice>, mtu: u16) -> TunLink {
     // 容量取 MTU 量级的几倍：太小会频繁阻塞读线程，太大等于把内核的丢包挪到用户态
-    let (tx_out, from_tun) = mpsc::channel::<Vec<u8>>(512);
+    let (tx_out, from_tun) = mpsc::channel::<Bytes>(512);
     let (to_tun, mut rx_in) = mpsc::channel::<Bytes>(512);
 
     let device: std::sync::Arc<dyn TunDevice> = std::sync::Arc::from(device);
@@ -237,17 +237,34 @@ pub fn spawn_io(device: Box<dyn TunDevice>, mtu: u16) -> TunLink {
     std::thread::Builder::new()
         .name("qp2p-tun-read".into())
         .spawn(move || {
-            let mut buf = vec![0u8; usize::from(mtu) + 64];
+            // 一次分配一大块，之后每个包用 `split_to` 从块尾切出来：
+            // 切出的 `Bytes` 与块共享内存，**每个包不再 malloc 一次**，
+            // 而是每 64 KB（约 43 个满 MTU 的包）分配一次。下游把包读完
+            // 丢掉最后一个引用，整块才释放。
+            let max_pkt = usize::from(mtu) + 64;
+            const READ_CHUNK: usize = 64 * 1024;
+            let mut chunk = BytesMut::with_capacity(READ_CHUNK.max(max_pkt));
             loop {
-                match reader.read_packet(&mut buf) {
-                    Ok(0) => continue,
+                // `split_to` 会把前半段切走，剩下的容量不够一个包时就换新块
+                if chunk.capacity() < max_pkt {
+                    chunk = BytesMut::with_capacity(READ_CHUNK.max(max_pkt));
+                }
+                chunk.resize(max_pkt, 0);
+                match reader.read_packet(&mut chunk[..]) {
+                    Ok(0) => {
+                        chunk.clear();
+                        continue;
+                    }
                     Ok(n) => {
+                        chunk.truncate(n);
+                        let packet = chunk.split_to(n);
                         // 通道容量有限：阻塞着等消费者，别把内核队列丢空
-                        if tx_out.blocking_send(buf[..n].to_vec()).is_err() {
+                        if tx_out.blocking_send(packet.freeze()).is_err() {
                             break;
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        chunk.clear();
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                     Err(e) => {

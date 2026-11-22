@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::engine::Engine;
 use crate::identity::{Identity, NodeId};
-use crate::link::tun::{Attach, MeshLinks};
+use crate::link::tun::{Attach, MeshLinks, WakeReq};
 use crate::peer::punch::Punched;
 use crate::peer::Role;
 use crate::route::Cidr;
@@ -175,7 +175,7 @@ enum WsFeed {
 /// 等下一轮时被什么叫醒的。
 enum Wake {
     Tick,
-    Tun(Ipv4Addr),
+    Tun(WakeReq),
     /// 来了一条 WS 消息。**必须把它带回去**：`recv()` 已经从队列里取走了，
     /// 不处理就等于丢事件（曾经在这里丢过一次）。
     Ws(WsFeed),
@@ -464,12 +464,22 @@ fn fail_kind(error: &anyhow::Error) -> FailKind {
 }
 
 /// 是否该主动对这个对端发起一轮拨号。
-fn should_dial(state: &PeerState, my_id: &str, peer_id: &str, now: Instant, forced: bool) -> bool {
-    if state.connected {
+fn should_dial(
+    state: &PeerState,
+    my_id: &str,
+    peer_id: &str,
+    now: Instant,
+    forced: bool,
+    pre: bool,
+) -> bool {
+    // 预拨（先建后断）：表里连着也要再拨一条，旧的等新的建成再关
+    if state.connected && !pre {
         return false;
     }
-    if forced {
-        // 有包要发：不等退避、不看在线/冷却，但 2 秒内不重复拨同一个对端
+    if forced || pre {
+        // 有包要发 / 链路疑似黑洞：不等退避、不看在线/冷却，但 2 秒内不重复拨同一个对端。
+        // 预拨也不受下面"node_id 小的一方发起"限制——发现异常的一方必须自己拨，
+        // 否则单向黑洞（只有我们的上行坏了）永远等不到对方动手。
         return !(state.attempts > 0
             && now.duration_since(state.last_try) < Duration::from_secs(2));
     }
@@ -890,14 +900,14 @@ impl Session {
 
         // TUN 收到"目标没连上"的包时会往这里塞一个虚拟地址：
         // 立刻针对这个对端拨号，不用等下一轮定时器
-        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<Ipv4Addr>(16);
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<WakeReq>(16);
         if let Some(mesh) = self.mesh.as_ref() {
             mesh.set_wake(wake_tx).await;
             // 数据面判定直连失效时（A 方案），要能直接告诉用户一句
             let notify = self.notify.clone();
             mesh.set_notice(move |message| notify.say(message));
         }
-        let mut forced: Option<Ipv4Addr> = None;
+        let mut forced: Option<WakeReq> = None;
         // 空闲断链之后进入休眠：不主动拨号、也不高频轮询，等 TUN 里有包再来叫醒
         let mut sleeping = false;
         // 上一轮是否有直连：用来识别"原本连着、现在全断了"（多半是换网）
@@ -1452,7 +1462,7 @@ impl Session {
                 Some(run) => {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => Wake::Tick,
-                        Some(ip) = wake_rx.recv() => Wake::Tun(ip),
+                        Some(req) = wake_rx.recv() => Wake::Tun(req),
                         item = run.rx.recv() => match item {
                             Some(item) => Wake::Ws(item),
                             None => Wake::WsDead,
@@ -1462,7 +1472,7 @@ impl Session {
                 None => {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => Wake::Tick,
-                        Some(ip) = wake_rx.recv() => Wake::Tun(ip),
+                        Some(req) = wake_rx.recv() => Wake::Tun(req),
                     }
                 }
             };
@@ -1477,10 +1487,13 @@ impl Session {
                     ws_early = None;
                     ws_retry_at = Some(Instant::now() + Duration::from_secs(5));
                 }
-                Wake::Tun(ip) => {
+                Wake::Tun(req) => {
                     // 一串包会连发很多次唤醒，只处理最新一个，别把轮询打成连发
                     while wake_rx.try_recv().is_ok() {}
-                    forced = Some(ip);
+                    // 预拨标记不能被后到的普通唤醒冲掉：两者指向同一个对端，
+                    // 但只有 pre=true 才允许在"表里连着"时也拨号
+                    let pre = forced.is_some_and(|f| f.pre) || req.pre;
+                    forced = Some(WakeReq { ip: req.ip, pre });
                     hot_until = Instant::now() + HOT_WINDOW;
                     // 休眠里断开的长连接：一有流量就立刻接回来
                     ws_retry_at = None;
@@ -1521,16 +1534,22 @@ async fn answer_punch(
         (state.connected, state.virtual_ip)
     };
     if connected {
-        // 表里说"连着"，但本机可能已经把这条直连摘掉了（判死过就摘表 + 关连接）。
-        // 那种情况下必须应答：对端正等着我们，不应答它只能等自己的超时。
+        // 表里说"连着"也照办，两种情形都必须应答：
+        // - 本机已经把那条直连摘掉了（判死过就摘表 + 关连接），对端正等着；
+        // - 对端在做**预拨**（它那边怀疑黑洞，先建一条新的）。拒绝应答等于让
+        //   先建后断永远失败——单向黑洞时，发现问题的是它那一侧。
+        //
+        // 多建出来的重复连接由 `attach` 收口：预拨带 `dedupe=false`，后到顶替；
+        // 正常重拨按 id 规则只留一条，不会来回抖。
         let alive = match (mesh.as_ref(), known_ip) {
             (Some(mesh), Some(ip)) => mesh.contains(ip).await,
-            _ => true,
+            _ => false,
         };
         if alive {
-            return;
+            tracing::debug!("[session] {label} 已连着还要重打洞，按先建后断处理");
+        } else {
+            tracing::info!("[session] {label} 请求重新打洞（本机已摘掉那条直连），照它说的办");
         }
-        tracing::info!("[session] {label} 请求重新打洞（本机已摘掉那条直连），照它说的办");
     }
 
     // 从这里到函数结束都算"在途打洞"：`on_connected` 里的 attach 也要在
@@ -1576,19 +1595,20 @@ async fn dial_round(
     mesh: &Option<Arc<MeshLinks>>,
     notify: &Notify,
     punching: &Arc<AtomicUsize>,
-    force: Option<Ipv4Addr>,
+    force: Option<WakeReq>,
     my_symmetric: bool,
 ) {
+    let pre = force.is_some_and(|f| f.pre);
     let targets: Vec<(String, String, bool)> = {
         let mut table = peers.lock().await;
         let now = Instant::now();
         let mut out = Vec::new();
         for (id, state) in table.iter_mut() {
-            let forced = force.is_some() && state.virtual_ip == force;
+            let forced = force.is_some_and(|f| Some(f.ip) == state.virtual_ip);
             if force.is_some() && !forced {
                 continue;
             }
-            if !should_dial(state, node_id.as_str(), id, now, forced) {
+            if !should_dial(state, node_id.as_str(), id, now, forced, pre) {
                 continue;
             }
             state.attempts += 1;
@@ -1666,7 +1686,10 @@ async fn dial_round(
 
             match result {
                 Ok(punched) => {
-                    on_connected(&peers, &mesh, &notify, &my_id, target, label, ip, punched).await
+                    on_connected(
+                        &peers, &mesh, &notify, &my_id, target, label, ip, punched, pre,
+                    )
+                    .await
                 }
                 Err(e) => {
                     report_failure(
@@ -1695,8 +1718,12 @@ async fn on_connected(
     label: String,
     ip: Option<Ipv4Addr>,
     punched: Punched,
+    pre: bool,
 ) {
-    let dedupe = punched.dedupe();
+    // 预拨的连接**永远**参与"后到顶替"、不走选边：它的目的就是在旧连接
+    // 还活着时把它换掉，选边规则可能把它判给旧的那条（比如对方 id 更小），
+    // 结果就是预拨白跑一趟、黑洞照旧。
+    let dedupe = punched.dedupe() && !pre;
     let conn = punched.conn;
 
     // 1. 先只解析地址，不改状态：选边输了的话这条连接整个丢弃，
@@ -2178,21 +2205,37 @@ mod tests {
     fn dial_skips_offline_cooling_and_listener_side() {
         let now = Instant::now();
         let mut s = state(0);
-        assert!(should_dial(&s, "aaa", "bbb", now, false), "我小，我拨");
-        assert!(!should_dial(&s, "bbb", "aaa", now, false), "我大，等对方拨");
+        assert!(
+            should_dial(&s, "aaa", "bbb", now, false, false),
+            "我小，我拨"
+        );
+        assert!(
+            !should_dial(&s, "bbb", "aaa", now, false, false),
+            "我大，等对方拨"
+        );
 
         s.online = false;
-        assert!(!should_dial(&s, "aaa", "bbb", now, false), "离线不盲连");
-        assert!(should_dial(&s, "aaa", "bbb", now, true), "但有包要发时照连");
+        assert!(
+            !should_dial(&s, "aaa", "bbb", now, false, false),
+            "离线不盲连"
+        );
+        assert!(
+            should_dial(&s, "aaa", "bbb", now, true, false),
+            "但有包要发时照连"
+        );
 
         s.online = true;
         s.cool_until = Some(now + Duration::from_secs(60));
-        assert!(!should_dial(&s, "aaa", "bbb", now, false), "冷却中不打扰");
+        assert!(
+            !should_dial(&s, "aaa", "bbb", now, false, false),
+            "冷却中不打扰"
+        );
         assert!(should_dial(
             &s,
             "aaa",
             "bbb",
             now + Duration::from_secs(61),
+            false,
             false
         ));
     }
@@ -2202,22 +2245,34 @@ mod tests {
         let now = Instant::now();
         let mut s = state(2);
         s.last_try = now;
-        assert!(!should_dial(&s, "aaa", "bbb", now, false), "退避期内");
+        assert!(
+            !should_dial(&s, "aaa", "bbb", now, false, false),
+            "退避期内"
+        );
         assert!(should_dial(
             &s,
             "aaa",
             "bbb",
             now + Duration::from_secs(21),
+            false,
             false
         ));
         s.connected = true;
-        assert!(!should_dial(
-            &s,
-            "aaa",
-            "bbb",
-            now + Duration::from_secs(99),
-            false
-        ));
+        assert!(
+            !should_dial(
+                &s,
+                "aaa",
+                "bbb",
+                now + Duration::from_secs(99),
+                false,
+                false
+            ),
+            "连着就不拨"
+        );
+        assert!(
+            should_dial(&s, "aaa", "bbb", now + Duration::from_secs(99), true, true),
+            "预拨：连着也要拨，而且不看 id 大小"
+        );
     }
 
     // ---------- 失败与冷却 ----------

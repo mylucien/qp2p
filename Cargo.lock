@@ -880,6 +880,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "reqwest",
+ "rustc-hash",
  "rustls",
  "serde",
  "serde_json",

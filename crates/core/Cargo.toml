@@ -28,6 +28,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
+rustc-hash.workspace = true
 
 # Android 上不能编这个：它落到 `getifaddrs`，而该符号是 API 24（Android 7.0）
 # 才引入的。链接期查不出来，运行期在 6.0 上 dlopen 直接失败，整个 so 加载不起来。

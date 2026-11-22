@@ -3,7 +3,7 @@
 //! TUN 模式下每个新连接开一条流，之后双向复用；空闲久了回收，
 //! 否则长跑的进程会把流配额吃光（quinn 默认 256 条）。
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ struct Entry<V> {
 
 /// 带空闲回收和容量上限的流表。
 pub struct FlowTable<V> {
-    entries: HashMap<FlowKey, Entry<V>>,
+    entries: FxHashMap<FlowKey, Entry<V>>,
     idle: Duration,
     capacity: usize,
 }
@@ -45,7 +45,7 @@ pub struct FlowTable<V> {
 impl<V> FlowTable<V> {
     pub fn new(idle: Duration, capacity: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
             idle,
             capacity: capacity.max(1),
         }

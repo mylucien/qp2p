@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -81,18 +81,45 @@ fn prefer_chacha(provider: &mut rustls::crypto::CryptoProvider) {
 /// 局域网直连的真实 RTT 只有 1~10 ms，用 333 ms 起步会让初始 pacing 和
 /// PTO 都过于保守，建连后头几百毫秒跑不满。第一个 RTT 样本到手后
 /// quinn 会自己校正，所以这个值只影响建连初期。
+/// 单流接收窗口的默认值与硬边界。
+///
+/// 单位是字节，语义是"愿意为这一条流缓冲多少"，不是预分配——
+/// QUIC 只在真的有数据在途时才占内存。
+pub const WINDOW_DEFAULT: u32 = 2 * 1024 * 1024;
+/// 弱设备（物理内存 < 1 GB）用这一档：光猫、老手机。
+pub const WINDOW_SMALL: u32 = 1024 * 1024;
+pub const WINDOW_MIN: u32 = 64 * 1024;
+pub const WINDOW_MAX: u32 = 32 * 1024 * 1024;
+/// 连接级总窗口 = 单流 × 这个倍数（原来 2 MB / 16 MB 就是这个比例）。
+pub const TOTAL_WINDOW_FACTOR: u32 = 8;
+
+/// 按物理内存挑默认窗口。
+///
+/// 只有 Linux / Android 读得到内存总量；Windows 一律按大档（桌面机极少 < 1 GB）。
+/// 外壳（Android JNI、测试）没有 `Config` 时用这个函数，规则与
+/// `Config::stream_window()` 完全一致。
+pub fn auto_stream_window() -> u32 {
+    match crate::config::total_memory_mb() {
+        Some(mb) if mb < 1024 => WINDOW_SMALL,
+        _ => WINDOW_DEFAULT,
+    }
+}
+
 fn transport(initial_rtt: Option<Duration>) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_concurrent_bidi_streams(256u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
 
-    // 单流 2 MB：40 ms RTT 下单流上限从 250 Mbps 提到 400 Mbps。
+    // 窗口大小现在由 `LinkTuning::stream_window` 决定：默认按设备内存分级
+    // （< 1 GB 用 1 MB，其余 2 MB），也可以 `qp2p config set window <字节>` 覆盖。
     // 这是"愿意为这条流缓冲多少"，不是预分配，空闲时不占内存。
-    transport.stream_receive_window((2 * 1024 * 1024u32).into());
-    // 连接级总上限 16 MB：兜住 256 条流的理论最坏值（256 × 2 MB = 512 MB）。
-    // 按 8 条满窗流设计；每对端一份，10 个对端最坏 160 MB。
-    transport.receive_window((16 * 1024 * 1024u32).into());
+    let tune = tuning();
+    let stream_window = tune.stream_window.clamp(WINDOW_MIN, WINDOW_MAX);
+    transport.stream_receive_window(stream_window.into());
+    // 连接级总上限按单流的 8 倍：兜住 8 条满窗流。每对端一份，
+    // 10 个对端最坏 160 MB（默认 2 MB 档）。
+    transport.receive_window(stream_window.saturating_mul(TOTAL_WINDOW_FACTOR).into());
 
     // 初始 MTU 1280：IPv6 的最小 MTU，也是多数 VPN / 隧道 / 部分蜂窝网络
     // 能过的值。用 1400 时，路径实际只支持 1280 的链路上每个大包都会丢，
@@ -109,7 +136,6 @@ fn transport(initial_rtt: Option<Duration>) -> quinn::TransportConfig {
         transport.initial_rtt(rtt);
     }
 
-    let tune = tuning();
     if tune.ack_threshold > 0 {
         let mut ack = quinn::AckFrequencyConfig::default();
         ack.ack_eliciting_threshold(quinn::VarInt::from_u32(tune.ack_threshold));
@@ -249,7 +275,7 @@ impl TlsIdentity {
 /// 放在进程级全局槽里，是为了不把配置一路穿到每个 TLS 构造函数——
 /// `transport()` 被 `client_config` / `server_config` 两条路径共用，
 /// 而它们的调用点遍布引擎、测试和 Android 外壳。一个进程只有一个
-/// 有效配置，正好适合全局设置一次。
+/// 有效配置，启动时（或 Android 每次 `prepare`）设一次即可。
 ///
 /// **没有拥塞控制选项**：曾经提供过 `congestion = "bbr"`，2026-11-22 实测
 /// 在 4G + 家用路由器上会让连接每分钟被自己摘一次。根因在 quinn 的 BBR
@@ -265,6 +291,12 @@ pub struct LinkTuning {
     /// 收包在中断上下文之外忙轮询，能把唤醒延迟压掉几十微秒。
     /// 代价是烧 CPU，弱核上可能反而更慢，所以默认关。
     pub busy_poll_us: u32,
+    /// 单流接收窗口（字节）。连接级总窗口取它的 [`TOTAL_WINDOW_FACTOR`] 倍。
+    ///
+    /// 默认值由 `Config::stream_window()` 按物理内存算：< 1 GB 用
+    /// [`WINDOW_SMALL`]，否则 [`WINDOW_DEFAULT`]。这里是进程级兜底，
+    /// 直接构造 `LinkTuning` 的地方（测试、Android 外壳）拿到的是默认档。
+    pub stream_window: u32,
 }
 
 impl Default for LinkTuning {
@@ -275,19 +307,29 @@ impl Default for LinkTuning {
             ack_threshold: 10,
             // 忙轮询要显式配置才开
             busy_poll_us: 0,
+            stream_window: WINDOW_DEFAULT,
         }
     }
 }
 
-static TUNING: OnceLock<LinkTuning> = OnceLock::new();
+/// 进程级调优参数。
+///
+/// 用 `RwLock` 而不是 `OnceLock`：Android 的进程是常驻的，用户改完配置
+/// 重新连接时 `prepare` 会再调一次 [`configure`]，`OnceLock` 会让新值
+/// 永远进不来（表现为"改了窗口/忙轮询没反应，必须杀进程"）。
+static TUNING: std::sync::RwLock<Option<LinkTuning>> = std::sync::RwLock::new(None);
 
-/// 设置链路调优。重复调用只有第一次生效——配置在进程生命周期内不变。
+/// 设置链路调优。后一次覆盖前一次，只影响**之后新建**的连接——
+/// 已建立的连接沿用建连时的 transport 参数。
 pub fn configure(tuning: LinkTuning) {
-    let _ = TUNING.set(tuning);
+    *TUNING.write().unwrap_or_else(|e| e.into_inner()) = Some(tuning);
 }
 
 fn tuning() -> LinkTuning {
-    TUNING.get().copied().unwrap_or_default()
+    TUNING
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_default()
 }
 
 /// 当前生效的链路调优。没调用过 [`configure`] 时就是默认值。

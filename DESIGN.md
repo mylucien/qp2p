@@ -82,9 +82,12 @@ signal/          单文件 Cloudflare Worker + 本地冒烟测试
 | 发送队列按字节计 | 单流 256 KB、全局 32 MB 预算，满则丢新包；队列句柄两端各持一个，谁丢谁关 | 按包数算时 64 KB 大包与 40 字节 ACK 共用一个上限；`256 流 × 64 包 × 64 KB` 最坏 1 GB，能打死 438 MB 的设备。句柄必须带 `Drop`：只用 `Arc` 共享时 writer 退出后流表那份还在，`Drop for FlowQueue` 永远等不到，队列不关 → `dispatch` 等不到 `Closed` → 那条流永久黑洞 |
 | 超 MTU 就分片 | 按 IPv4 规则切 8 字节对齐的片，复制原头重算校验和、清 DF | 直接丢包的故障表现是「小包通、大包不通」，用户只会认为"网络时通时不通" |
 | 拥塞控制不开放选项 | 固定 Cubic；曾经提供 `congestion = "bbr"`，0.1.16 实测后整条删除 | 不是「BBR 太强势」这种口味问题，是实测连接每分钟被摘一次：quinn 的 BBR 初始窗口 200 包（240 KB）、`calculate_cwnd` 拿增益和字节数比导致 Startup 窗口无上限、`app_limited` 时永不退出 Startup。零散流量的隧道正好踩满这三条，结果是往对端链路灌爆 → 对端 RTO 退避 8 秒 → 被我们自己的失效判据摘掉 |
-| 收包按片读、切片不复制 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 两次 `read_exact`。注意**仍有一次拷贝**：`read_chunk` 的数据要 `extend_from_slice` 进 `BytesMut`；省掉的是逐包 malloc，不是那次 memcpy |
+| 收包按片读、切片不复制 | 两个方向都用 `BytesMut` 大块 + `split_to().freeze()`，通道传 `Bytes`：QUIC → TUN 走 `read_chunk`，TUN → QUIC 按 64 KB 块读、每包从块尾切 | 原来每帧一次 `Vec` 分配 + 两次 `read_exact`，TUN 读侧还是 `buf[..n].to_vec()`。注意**仍有一次拷贝**：`read_chunk` 的数据要 `extend_from_slice` 进 `BytesMut`；省掉的是逐包 malloc，不是那次 memcpy |
 | 发送侧批量写 | 取到第一个包后把队列里**已经排好**的包一次排空，多帧拼进同一个缓冲（≤64 KB），一次 `write_all`、一个超时 | 每包单独写要付三笔账：队列锁、`tokio::time::timeout` 的定时器注册、一次 `poll_write`；高包率下比拷贝本身还贵。只取不等，所以不会为攒批增加延迟；QUIC 流本来就是字节流，多帧拼一次写与逐帧写在线路上完全等价 |
 | 忙轮询默认关 | `busy_poll_us = 0`；Linux 上按配置设 `SO_BUSY_POLL`，失败只记 info | 拿 CPU 换几十微秒延迟，默认打开会让小主机的低功耗核持续升温 |
+| 判死阈值按 RTT 自适应 | `silent_limit = clamp(10×srtt, 3s, 8s)`，`suspect_limit = clamp(6×srtt, 1s, 3s)`；RTT 未知按上限 8 秒 | 固定 8 秒在 20 ms 的局域链路上要多扛 5 秒；固定 3 秒在高 RTT 链路上会误杀——QUIC 的 PTO 本身就是 `3×srtt`，加一次丢包重传就超了 |
+| 先建后断 | 到怀疑阈值只发一次"预拨"（30 秒冷却），旧连接继续承载；新连接建成后以 `dedupe=false` 后到顶替，预拨失败仍按判死阈值走原重建 | 一次真实黑洞的感知是"8 秒检测 + 1~3 秒重拨"；预拨来得及就接近 0 中断。预拨不能参与选边：选边可能把它判给旧的那条，白跑一趟。`answer_punch` 因此不再因为"表里连着"拒绝应答——单向黑洞时发现问题的是对端 |
+| 接收窗口按内存分级 | `window` 配置项：不填 = auto，物理内存 < 1 GB 用单流 1 MB / 总 8 MB，否则 2 MB / 16 MB；显式值夹在 64 KB~32 MB | 438 MB 的光猫和 32 GB 的 PC 不该用同一个窗口。窗口是"愿意缓冲多少"而非预分配，但慢速对端会把数据压在路上，弱设备仍要收紧 |
 
 ## 5. 协议
 

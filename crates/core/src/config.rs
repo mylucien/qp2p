@@ -85,6 +85,13 @@ pub struct Config {
     /// 开了可能反而更慢，所以必须显式配置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_poll: Option<u32>,
+    /// 单流接收窗口（字节）。不填 = auto：按物理内存分级。
+    ///
+    /// auto 规则：< 1 GB 用 1 MB（光猫、老手机），否则 2 MB。
+    /// 连接级总窗口统一取 `TOTAL_WINDOW_FACTOR` 倍。想要更高单流吞吐
+    /// （跨洲高 BDP 链路）就显式调大，代价是慢速对端可能堆更多数据在途。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
     #[serde(default, rename = "forward")]
@@ -248,9 +255,28 @@ impl Default for Config {
             upnp: true,
             signal_transport: None,
             busy_poll: None,
+            window: None,
             network: None,
             forwards: Vec::new(),
         }
+    }
+}
+
+/// 物理内存总量（MB）。读不到返回 `None`，调用方按大档处理。
+///
+/// 只有 Linux / Android 读 `/proc/meminfo`；Windows 不为此额外引 API
+/// （桌面机极少 < 1 GB，按大档走就是正确选择）。
+pub(crate) fn total_memory_mb() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb / 1024)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
     }
 }
 
@@ -259,8 +285,20 @@ impl Config {
     pub fn link_tuning(&self) -> crate::tls::LinkTuning {
         crate::tls::LinkTuning {
             busy_poll_us: self.busy_poll.unwrap_or(0),
+            stream_window: self.stream_window(),
             ..Default::default()
         }
+    }
+
+    /// 单流接收窗口：显式配置优先，否则按物理内存分级。
+    ///
+    /// 显式值也要夹进 [`crate::tls::WINDOW_MIN`] / [`crate::tls::WINDOW_MAX`]：
+    /// 配置文件可以被手改，超过 32 MB 的单流窗口在弱设备上会把内存吃光。
+    pub fn stream_window(&self) -> u32 {
+        if let Some(bytes) = self.window {
+            return bytes.clamp(crate::tls::WINDOW_MIN, crate::tls::WINDOW_MAX);
+        }
+        crate::tls::auto_stream_window()
     }
 
     pub fn from_toml(source: &str) -> Result<Self, ConfigError> {
