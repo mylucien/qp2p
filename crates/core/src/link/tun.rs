@@ -248,7 +248,7 @@ const NO_FAIL: u64 = u64::MAX;
 /// 对端必须回 ACK。**不**算 `acks`：QUIC 不对纯 ACK 回 ACK，算进去就会在
 /// "我方只回了延迟 ACK"的时刻开出一张永远等不到回应的表，8 秒后误杀健康连接。
 ///
-/// 抽成函数是为了能测：`observe_at` 的单测喂的是数字，测不到"取哪个计数"。
+/// 抽成函数是为了能测：`sample_at` 的单测喂的是数字，测不到"取哪个计数"。
 fn needing_reply(stats: &quinn::ConnectionStats) -> u64 {
     stats.frame_tx.stream + stats.frame_tx.ping
 }
@@ -805,14 +805,15 @@ impl MeshLinks {
                     if verdict.dead {
                         return Some((*ip, p.conn.clone(), "对端长时间没有回包"));
                     }
+                    // 兜底：对端在 ACK 但不消费，每一条流都写不动。
+                    // 放在预拨之前判断：这条要直接重建，预拨纯属白跑。
+                    if p.health.write_failing() {
+                        return Some((*ip, p.conn.clone(), "连续 30 秒每次写都失败"));
+                    }
                     if verdict.suspect {
                         // 先建后断：只预拨，不摘表。新连接建成会顶掉这一条，
                         // 预拨失败则等判死阈值到了再按老路重建。
                         suspect.push(*ip);
-                    }
-                    // 兜底：对端在 ACK 但不消费，每一条流都写不动
-                    if p.health.write_failing() {
-                        return Some((*ip, p.conn.clone(), "连续 30 秒每次写都失败"));
                     }
                     None
                 })
@@ -1030,7 +1031,7 @@ impl FlowQueue {
     }
 
     /// 取一个包；队列空了就等，直到有新包或队列被关。
-    async fn recv(&self) -> Option<Vec<u8>> {
+    async fn recv(&self) -> Option<Bytes> {
         loop {
             // 先创建 future 再检查队列：即使 push 落在"检查为空"之后，
             // `notify_one` 存下的 permit 也会让这次 await 立刻返回。
@@ -1063,7 +1064,7 @@ impl FlowQueue {
             inner.bytes = 0;
             std::mem::take(&mut inner.packets)
         };
-        let freed: usize = packets.iter().map(Vec::len).sum();
+        let freed: usize = packets.iter().map(Bytes::len).sum();
         self.budget.fetch_sub(freed, Ordering::Relaxed);
         drop(packets);
         self.notify.notify_one();

@@ -1579,7 +1579,13 @@ async fn answer_punch(
     };
 
     match result {
-        Ok(punched) => on_connected(&peers, &mesh, &notify, &my_id, from, label, ip, punched).await,
+        // 这条是对端拨进来的，不是本机预拨：选边照常参与
+        Ok(punched) => {
+            on_connected(
+                &peers, &mesh, &notify, &my_id, from, label, ip, punched, false,
+            )
+            .await
+        }
         Err(e) => tracing::debug!("[session] 应答 {label} 的打洞失败: {e}"),
     }
 }
