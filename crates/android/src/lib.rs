@@ -436,6 +436,8 @@ pub fn prepare(config: StartConfig) -> Result<PreparedInfo> {
                 &candidates,
                 nat,
                 wanted_ip,
+                // 安卓的换网重报走 session 主循环，这里只是首次注册
+                false,
             )
             .await
             .context("向信令服务器注册失败（令牌过期或网络已删除？）")?;

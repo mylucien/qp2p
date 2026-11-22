@@ -869,6 +869,23 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
     thirdParty.body,
   );
 
+  // 候选没变 + announce：服务端必须再广播一次 peer_online。
+  // 换网后新网络的 NAT 映射可能和旧的一模一样（端口保留型 NAT），而这时
+  // 对端很可能已经因为「在线却打不通」进了冷却，不广播就清不掉。
+  const announceAgain = await call("POST", "/v1/register", {
+    token,
+    body: await signed(bob, "register", net, {
+      node_id: bob.nodeId,
+      pubkey: bob.pubkey,
+      name: "bob",
+      candidates,
+      nat_type: "cone",
+      tls_fp: "ab".repeat(32),
+      announce: true,
+    }),
+  });
+  check("带 announce 的重复注册成功", announceAgain.status === 200, announceAgain.body);
+
   const rejoin = await call("POST", "/v1/join", {
     token,
     body: await signed(alice, "join", net, { node_id: alice.nodeId, pubkey: alice.pubkey }),
@@ -954,6 +971,11 @@ async function runSuite(label, env, expectedStorage, clientIp, opts = {}) {
   check(
     "bob 能读到自己注册时的上线广播",
     presence.some((e) => e.node_id === bob.nodeId && e.candidates?.length > 0),
+    presence,
+  );
+  check(
+    "announce 让候选没变时也广播一次上线",
+    presence.filter((e) => e.node_id === bob.nodeId).length >= 2,
     presence,
   );
   check("返回游标", typeof firstPull.body.cursor === "number" && firstPull.body.cursor > 0, firstPull.body.cursor);

@@ -435,6 +435,11 @@ impl SignalClient {
     // ---- 数据面 ---------------------------------------------------------
 
     /// 注册（或刷新）本节点，返回服务端分配的虚拟地址和当前成员列表。
+    ///
+    /// `announce` 为 true 时请求服务端**即使候选地址没变也广播一次
+    /// `peer_online`**。用于换网后的重报：新网络的 NAT 映射可能恰好和旧
+    /// 的一样（尤其是端口保留型 NAT），而这时候对端很可能已经因为「在线
+    /// 却打不通」进了冷却，不广播就清不掉。
     pub async fn register(
         &self,
         identity: &Identity,
@@ -443,6 +448,7 @@ impl SignalClient {
         candidates: &[String],
         nat_type: &str,
         virtual_ip: Option<std::net::Ipv4Addr>,
+        announce: bool,
     ) -> Result<RegisterReply> {
         let node_id = identity.node_id();
         let mut body = Map::new();
@@ -461,6 +467,10 @@ impl SignalClient {
         // 只在用户明确指定时带上：不指定就由服务端分配并在重连后保持不变
         if let Some(ip) = virtual_ip {
             body.insert("virtual_ip".into(), Value::String(ip.to_string()));
+        }
+        // 只在需要时带：服务端据此在候选没变时也广播一次 peer_online
+        if announce {
+            body.insert("announce".into(), Value::Bool(true));
         }
 
         let value = self

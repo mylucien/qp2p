@@ -1146,7 +1146,16 @@ async fn cmd_up(args: &[String]) -> Result<()> {
     // 每次都带上：服务端会校验并原样保留，用户改配置后也能立刻切过去。
     let wanted_ip: Option<Ipv4Addr> = network.virtual_ip.as_deref().and_then(|s| s.parse().ok());
     let reply = match client
-        .register(&identity, &name, &tls_fp, &candidates, nat_type, wanted_ip)
+        .register(
+            &identity,
+            &name,
+            &tls_fp,
+            &candidates,
+            nat_type,
+            wanted_ip,
+            // 一次性 join 没有"换网重报"的语义，不需要强制广播
+            false,
+        )
         .await
     {
         Ok(reply) => reply,

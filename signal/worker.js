@@ -15,7 +15,7 @@
  *   只粘代码、不绑 DO 的话，所有业务接口都会返回 503 并提示缺 ROOM。
  */
 
-const VERSION = "2.8.6";
+const VERSION = "2.8.7";
 const TOKEN_PREFIX = "qp2p1_";
 
 const OFFLINE_MS = 150_000; // 超过这个时间没心跳视为离线
@@ -3710,6 +3710,10 @@ export class NetworkRoom {
 
     // cf-connecting-ip 由边缘写入并覆盖客户端自带的同名头，可以当来源信任
     const clientIp = request.headers.get("cf-connecting-ip") ?? null;
+    // 客户端要求「候选没变也广播一次 peer_online」。只有换网重报才带：
+    // 新网络的 NAT 映射可能和旧的一模一样，而对端很可能已经因为「在线却
+    // 打不通」进了冷却，不广播就清不掉。只认布尔 true，别的值一律忽略。
+    const announce = body.announce === true;
     const candidates = parseCandidates(body.candidates, clientIp);
     if (candidates === null) {
       return err(400, "invalid_candidates", `候选地址必须是合法 ip:port，最多 ${MAX_CANDIDATES} 个`);
@@ -3812,7 +3816,9 @@ export class NetworkRoom {
     const idx = this.socketIndex();
     const wasOnline = existing !== null && this.livenessWith(existing, now, idx).online;
     const moved = existing !== null && existing.candidates !== record.candidates;
-    if ((!wasOnline || moved) && safeParseArray(record.candidates).length > 0) {
+    // announce：客户端主动要求"这次也算上线一次"，覆盖「在线 + 候选没变」
+    // 这种服务端看不出来、但对端确实需要知道的情况（见上面 announce 的说明）
+    if ((!wasOnline || moved || announce) && safeParseArray(record.candidates).length > 0) {
       this.emit(BROADCAST, "peer_online", publicNode(record, now));
     }
 

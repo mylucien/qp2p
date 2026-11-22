@@ -904,6 +904,10 @@ impl Session {
         let mut had_links = false;
         // select 用来唤醒循环的那条 WS 消息，下一轮开头必须先处理掉
         let mut ws_early: Option<WsFeed> = None;
+        // 下一次注册要不要请求服务端强制广播 peer_online。
+        // 只在换网重报时置位，注册成功后才清——失败时保留，否则换网
+        // 那次重报丢了，对端的冷却要等自然到期才解除。
+        let mut announce_next = false;
 
         while !self.stop.load(Ordering::Relaxed) {
             // 本轮是否需要马上重新登记（事件、STUN 观测都可能置位）
@@ -1315,6 +1319,10 @@ impl Session {
                             if plan.switch_detected {
                                 self.notify
                                     .say("· 网络可能变了：已重新探测公网地址，正在重报");
+                                // 新网络的映射可能和旧的一模一样（端口保留型 NAT），
+                                // 候选没变服务端就不会广播；而对端很可能已经因为
+                                // 「在线却打不通」进了冷却，必须让它收到一次上线通知。
+                                announce_next = true;
                             }
                             // 换了端口就必须立刻上报，否则对端还拿着旧地址打空炮
                             force_register = true;
@@ -1349,10 +1357,20 @@ impl Session {
                     )
                 };
                 match client
-                    .register(&identity, &name, &fp, &candidates, nat, wanted_ip)
+                    .register(
+                        &identity,
+                        &name,
+                        &fp,
+                        &candidates,
+                        nat,
+                        wanted_ip,
+                        announce_next,
+                    )
                     .await
                 {
                     Ok(reply) => {
+                        // 送出去了才清：失败时保留，下一轮继续带
+                        announce_next = false;
                         let mut table = self.peers.lock().await;
                         if apply_peer_list(&mut table, &reply.peers).new_online {
                             hot_until = Instant::now() + HOT_WINDOW;
