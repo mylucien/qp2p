@@ -22,8 +22,9 @@
 //!
 //! - 主循环只做「查表 + `try_send` 入队」，队列满了就丢包（内层 TCP 会重传），
 //!   绝不等待网络；只有新建流时需要 `open_bi`，带 [`OPEN_TIMEOUT`] 上限。
-//! - 每条流一个 [`FlowWriter`] 任务，负责真正写帧，每帧带 [`WRITE_TIMEOUT`]。
-//!   写不动就 `reset` 这条流，不影响别人。
+//! - 每条流一个 [`FlowWriter`] 任务，负责真正写帧：取到第一个包后把队列里
+//!   已经排好的包一起拼进同一个缓冲（最多 [`WRITE_BATCH_BYTES`]），一次
+//!   `write_all`、一个 [`WRITE_TIMEOUT`]。写不动就 `reset` 这条流，不影响别人。
 //!
 //! 接收方向同理：`to_tun` 用 `try_send`。接收侧一旦反压，QUIC 流控窗口
 //! 就不再前进，反压会顺着流控传导到**对端**的发送循环——两个方向一起卡死。
@@ -109,6 +110,15 @@ const FLOW_QUEUE_BYTES: usize = 256 * 1024;
 const FLOW_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// 一帧写出去的上限。超过说明这条流的发送窗口已经不动了。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 一次 `write_all` 最多拼这么多字节。
+///
+/// 每个包单独写要付三笔账：队列锁、`tokio::time::timeout` 的定时器注册、
+/// 一次 `poll_write`。高包率下这三笔加起来比拷贝本身还贵。攒成一批只付一次。
+///
+/// 关键是**只取已经在队列里的包、不等待**——为了攒批而等待会直接增加延迟，
+/// 那就本末倒置了。64 KB 在 1 Gbps 上 0.5 ms 就能写出，小到不会让
+/// [`WRITE_TIMEOUT`] 的语义失真。
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
 /// 新建双向流的上限。正常路径瞬时返回，只有流配额用尽才会等。
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// 连续写失败这么久 → 整条连接的流控停死（兜底，正常判据是下面那条）。
@@ -871,6 +881,40 @@ impl FlowQueue {
         Ok(())
     }
 
+    /// 一次拿锁，把队列里**已经排好**的包追加到 `out`，返回取出的包数。
+    ///
+    /// 帧格式与 [`push_frame`] 一致（`[u16 长度][IP 包]`），所以这样拼出来
+    /// 的缓冲本身就是一个合法的多帧字节流，对端逐帧读走的东西与「每包一次
+    /// write_all」完全相同。
+    ///
+    /// 拿一次锁、一次归还预算，是这条路径相对「逐包 `try_pop`」的主要收益；
+    /// `limit` 只是软上限：最后取到的那一个包可能让它略微超出。
+    ///
+    /// 队列已关或为空都返回 `0`——两种情况对调用方的处理一样：手里
+    /// 那个包照写，下一轮 `recv()` 会看到 `None` 正常收尾。
+    fn drain_into(&self, out: &mut Vec<u8>, limit: usize) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            return 0;
+        }
+        let mut taken = 0usize;
+        let mut freed = 0usize;
+        while out.len() < limit {
+            let Some(packet) = inner.packets.pop_front() else {
+                break;
+            };
+            inner.bytes -= packet.len();
+            freed += packet.len();
+            taken += 1;
+            push_frame(out, &packet);
+        }
+        drop(inner);
+        if freed > 0 {
+            self.budget.fetch_sub(freed, Ordering::Relaxed);
+        }
+        taken
+    }
+
     /// 取一个包；队列空了就等，直到有新包或队列被关。
     async fn recv(&self) -> Option<Vec<u8>> {
         loop {
@@ -1226,24 +1270,40 @@ impl FlowWriter {
             }
         }
 
-        // 复用同一个缓冲：每次 write_frame 只做 clear + 两次 extend，
-        // 不再为每个包单独分配一次
+        // 复用同一个缓冲，稳态不再分配。容量会随批量涨到 WRITE_BATCH_BYTES
+        // 附近——只有真正跑大流量的流才会涨，小流仍停在初始值。
         let mut frame = Vec::with_capacity(2048);
         while !broken {
             let Some(packet) = self.queue.recv().await else {
                 break;
             };
-            let written =
-                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut send, &mut frame, &packet))
-                    .await;
+
+            // 第一个包已经在手上，顺手把队列里**已经排好**的其余包一次取走。
+            // 只取不等，所以不会为了攒批增加延迟；帧是字节流，多帧拼一次写
+            // 与逐帧写在线路上完全等价。
+            frame.clear();
+            push_frame(&mut frame, &packet);
+            let batched = self.queue.drain_into(&mut frame, WRITE_BATCH_BYTES);
+
+            let bytes = frame.len();
+            let written = tokio::time::timeout(WRITE_TIMEOUT, send.write_all(&frame)).await;
             match written {
-                Ok(Ok(())) => self.health.note_write_ok(),
+                Ok(Ok(())) => {
+                    self.health.note_write_ok();
+                    if batched > 0 {
+                        tracing::trace!(
+                            "[tun] {} 合并 {} 个包一次写（{bytes} 字节）",
+                            self.ip,
+                            batched + 1
+                        );
+                    }
+                }
                 Ok(Err(e)) => {
-                    tracing::debug!("[tun] {} 写帧失败: {e:#}", self.ip);
+                    tracing::debug!("[tun] {} 写 {bytes} 字节失败: {e:#}", self.ip);
                     broken = true;
                 }
                 Err(_) => {
-                    tracing::debug!("[tun] {} 写帧超时（{WRITE_TIMEOUT:?}）", self.ip);
+                    tracing::debug!("[tun] {} 写 {bytes} 字节超时（{WRITE_TIMEOUT:?}）", self.ip);
                     broken = true;
                 }
             }
@@ -1270,16 +1330,17 @@ impl FlowWriter {
     }
 }
 
-async fn write_frame(send: &mut SendStream, frame: &mut Vec<u8>, packet: &[u8]) -> Result<()> {
-    let len = u16::try_from(packet.len()).context("单个 IP 包超过 64KB")?;
-    // 合成一次 write_all：拆成两次会各自推进一次 send 状态机，
-    // 每包多一次 poll_write，而且中途可能各返回一次 Pending。
-    frame.clear();
-    frame.reserve(2 + packet.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(packet);
-    send.write_all(frame).await?;
-    Ok(())
+/// 把一个包按线上格式追加到批量缓冲：`[u16 长度][IP 包]`。
+///
+/// 超过 `u16` 的包不可能出现——TUN 读缓冲只有 `MTU + 64` 字节，分片也不会
+/// 放大——真出现了也只丢这一个包：判整条流死没有意义，内层会重传。
+fn push_frame(out: &mut Vec<u8>, packet: &[u8]) {
+    let Ok(len) = u16::try_from(packet.len()) else {
+        tracing::warn!("[tun] 丢弃超长包（{} 字节）", packet.len());
+        return;
+    };
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(packet);
 }
 
 /// 接收方向：对端每开一条流就是一个新 flow。
@@ -1877,6 +1938,50 @@ mod tests {
         // 关掉之后 recv 立刻返回 None，不会挂住
         q.close();
         assert!(q.recv().await.is_none(), "close 之后 recv 返回 None");
+    }
+
+    // --- 批量取包：一次拿锁取走整批 ---------------------------------------
+
+    #[test]
+    fn drain_into_takes_the_whole_queue_as_one_buffer() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = FlowQueue::new(budget.clone());
+        q.try_push(vec![1u8; 100]).expect("入队");
+        q.try_push(vec![2u8; 200]).expect("入队");
+        q.try_push(vec![3u8; 300]).expect("入队");
+        assert_eq!(budget.load(Ordering::Relaxed), 600);
+
+        let mut out = Vec::new();
+        let taken = q.drain_into(&mut out, WRITE_BATCH_BYTES);
+
+        assert_eq!(taken, 3, "三个包应当一次取完");
+        assert_eq!(budget.load(Ordering::Relaxed), 0, "整批弹出后额度归零");
+        // 每帧 = [u16 大端长度][载荷]，三帧首尾相接
+        assert_eq!(out.len(), 600 + 2 * 3);
+        assert_eq!(&out[0..2], &(100u16).to_be_bytes());
+        assert_eq!(&out[2..102], vec![1u8; 100].as_slice());
+        assert_eq!(&out[102..104], &(200u16).to_be_bytes());
+        assert_eq!(&out[304..306], &(300u16).to_be_bytes());
+        assert_eq!(&out[306..606], vec![3u8; 300].as_slice());
+
+        // 已经空了：再取一次拿不到东西，也不会挂
+        assert_eq!(q.drain_into(&mut out, WRITE_BATCH_BYTES), 0);
+    }
+
+    #[test]
+    fn drain_into_stops_at_the_batch_limit() {
+        let budget = Arc::new(AtomicUsize::new(0));
+        let q = FlowQueue::new(budget.clone());
+        q.try_push(vec![0u8; 100]).expect("入队");
+        q.try_push(vec![0u8; 100]).expect("入队");
+
+        let mut out = Vec::new();
+        // 上限比一个包小：只取一个就该停（软上限，允许单帧超出）
+        let taken = q.drain_into(&mut out, 50);
+
+        assert_eq!(taken, 1, "超出上限后不能再取");
+        assert_eq!(out.len(), 102);
+        assert_eq!(budget.load(Ordering::Relaxed), 100, "没取的仍占着额度");
     }
 
     // --- 队列的生命周期：丢句柄即关闭 ------------------------------------

@@ -83,6 +83,7 @@ signal/          单文件 Cloudflare Worker + 本地冒烟测试
 | 超 MTU 就分片 | 按 IPv4 规则切 8 字节对齐的片，复制原头重算校验和、清 DF | 直接丢包的故障表现是「小包通、大包不通」，用户只会认为"网络时通时不通" |
 | 拥塞控制不开放选项 | 固定 Cubic；曾经提供 `congestion = "bbr"`，0.1.16 实测后整条删除 | 不是「BBR 太强势」这种口味问题，是实测连接每分钟被摘一次：quinn 的 BBR 初始窗口 200 包（240 KB）、`calculate_cwnd` 拿增益和字节数比导致 Startup 窗口无上限、`app_limited` 时永不退出 Startup。零散流量的隧道正好踩满这三条，结果是往对端链路灌爆 → 对端 RTO 退避 8 秒 → 被我们自己的失效判据摘掉 |
 | 收包按片读、切片不复制 | `read_chunk` + `BytesMut` + `split_to().freeze()`，`to_tun` 传 `Bytes` | 原来每帧一次 `Vec` 分配 + 两次 `read_exact`。注意**仍有一次拷贝**：`read_chunk` 的数据要 `extend_from_slice` 进 `BytesMut`；省掉的是逐包 malloc，不是那次 memcpy |
+| 发送侧批量写 | 取到第一个包后把队列里**已经排好**的包一次排空，多帧拼进同一个缓冲（≤64 KB），一次 `write_all`、一个超时 | 每包单独写要付三笔账：队列锁、`tokio::time::timeout` 的定时器注册、一次 `poll_write`；高包率下比拷贝本身还贵。只取不等，所以不会为攒批增加延迟；QUIC 流本来就是字节流，多帧拼一次写与逐帧写在线路上完全等价 |
 | 忙轮询默认关 | `busy_poll_us = 0`；Linux 上按配置设 `SO_BUSY_POLL`，失败只记 info | 拿 CPU 换几十微秒延迟，默认打开会让小主机的低功耗核持续升温 |
 
 ## 5. 协议
@@ -141,6 +142,7 @@ qp2p1_<network_id>_<secret>
 | ACK 频率阈值 | 10 | 收到 10 个包才回一次 ACK，省对端中断；`max_ack_delay` **刻意保持默认**——放宽它会直接抬高本端观测到的 RTT |
 | `initial_rtt` | 20 ms（内网候选）/ 默认 333 ms | 两个私网地址之间的 RTT 不可能几百毫秒，333 ms 会让 PTO 白等 1 秒 |
 | 发送队列 | 单流 256 KB / 全局 32 MB | 按字节而非包数，跨流共享一份预算；`Mutex<VecDeque>` + `AtomicUsize` + `Notify`。`QueueTx`（流表侧）/ `QueueRx`（writer 侧）各自 `Drop` → `close()`，`run` 从任何路径退出都会关队列 |
+| 发送批量 | 每次 `write_all` ≤ 64 KB | 排空队列时一次拿锁、一次归还预算；缓冲随批量尺寸增长并复用，小流仍停在 2 KB 初始容量。超时则整批复用流的 `reset` 语义，对端本来就会丢弃半条流 |
 | 流表容量 | 224（对端配额 256） | 流表满会淘汰最旧条目并**立刻** `open_bi`，而对端归还 `MAX_STREAMS` 滞后一个往返；容量等于配额时每次「淘汰 + 重开」都撞配额，挂到 `OPEN_TIMEOUT`（3 秒） |
 | 帧结束边界 | 半个帧头算协议错误 | 只剩 1 字节帧头说明对端算错长度或中途崩了；静默当成正常结束会把截断埋进日志 |
 | MTU 溢出处理 | IPv4 分片 | `ip::fragment()`：载荷 8 字节对齐、偏移 `offset/8`、`MF` 除末片置 1、重算校验和、清 `DF` |
